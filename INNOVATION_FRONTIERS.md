@@ -18,7 +18,12 @@ This shift creates significant opportunities for systems architects to build spe
 
 ## Three Major Innovation Frontiers
 
+*Each frontier represents a broken assumption, not just new technology. This is architectural thinking, not trend chasing.*
+
 ### 1. NVMe and Tiered Memory Systems
+
+#### What Assumption Broke?
+The binary model: "data is either fast (DRAM) or slow (disk)" no longer reflects hardware reality. NVMe and PMEM created a performance spectrum, but databases still think in binary terms.
 
 #### The Problem
 Traditional cache databases like Redis operate on a binary model: data is either in DRAM or it's not. They don't intelligently leverage the middle ground of NVMe SSDs and persistent memory.
@@ -35,6 +40,17 @@ Traditional cache databases like Redis operate on a binary model: data is either
 - Transparent tier migration without application awareness
 - Smart prefetching to hide tier transition latency
 
+**Design Goal**: Optimize for *predictable latency bands*, not absolute speed.
+
+#### Cost/Latency Model
+
+| Tier | Latency | Cost/GB | Intended Use |
+|------|---------|---------|-------------|
+| DRAM | ~100ns | $$$$ | Hot, mutable data |
+| PMEM | ~300ns | $$$ | Warm, stable data |
+| NVMe | ~20µs | $$ | Read-heavy, append-only |
+| HDD | ~5ms | $ | Cold archival |
+
 #### Key Challenges
 - Predicting access patterns accurately
 - Managing tier transition overhead
@@ -43,7 +59,10 @@ Traditional cache databases like Redis operate on a binary model: data is either
 
 ---
 
-### 2. AI-Driven Eviction: The "Smart" Cache
+### 2. Intent-Aware Eviction (AI-Assisted, Not AI-Dependent)
+
+#### What Assumption Broke?
+The assumption that "recency predicts future access" (LRU) breaks down when access patterns have structure—temporal rhythms, correlations, business logic. Treating all cache misses as equal information loss is naive.
 
 #### The Problem
 Most caches use LRU (Least Recently Used) eviction—simple but naive. LRU doesn't understand:
@@ -71,8 +90,11 @@ User A logs in → System predicts:
 #### Technical Approach
 - Lightweight models (inference <100μs)
 - Online learning from cache hits/misses
-- Fallback to LRU when predictions fail
+- **AI-driven eviction is advisory, not authoritative**
+- Fallback to LRU when predictions fail (graceful degradation)
 - A/B testing framework for model evaluation
+
+**Critical Design Constraint**: Incorrect predictions must degrade to LRU-like behavior, not catastrophic cache thrashing.
 
 #### Key Challenges
 - Model inference overhead
@@ -83,6 +105,9 @@ User A logs in → System predicts:
 ---
 
 ### 3. Shared-Log & Serverless Architectures
+
+#### What Assumption Broke?
+The "one big server with local cache" model evaporated. Cloud architectures distribute compute across thousands of ephemeral nodes, but cache consistency protocols still assume stable, long-lived processes.
 
 #### The Problem
 Modern cloud deployments don't use single servers—they use thousands of ephemeral containers or Lambda functions. Traditional caches struggle with:
@@ -98,6 +123,8 @@ Modern cloud deployments don't use single servers—they use thousands of epheme
 - Eliminate serialization overhead
 - Sub-microsecond cross-server access
 - Consistency guarantees without traditional locking
+
+**Reality Check**: RDMA-based shared memory is treated as an *optional acceleration layer*, not a required deployment model. The system must function without RDMA, with RDMA as an evolution path.
 
 #### The Holy Grail
 A cache system where:
@@ -139,6 +166,21 @@ Redis storing a 128-byte string:
 - **Total**: ~208 bytes (62% overhead!)
 
 ### The Slab Innovation
+
+#### Core Invariant
+
+**Invariant: All objects within a slab share the same lifecycle and eviction boundary.**
+
+This is the foundational insight. Everything else follows:
+- O(1) deletion (flip one bit)
+- No compaction needed
+- No garbage collection
+- Write amplification = 1
+- Perfect cache locality
+
+#### Why Redis Cannot Easily Adopt This
+
+Redis cannot easily adopt lifetime-aligned slabs because its object model assumes *independent key eviction* and *arbitrary object lifetimes*. Retrofitting slab-aligned eviction would require fundamental changes to Redis's LRU implementation and memory manager.
 
 #### Core Concept
 Design a specialized allocator that packs small objects into contiguous "Slabs" that match CPU cache line sizes (typically 64 bytes) and page sizes (4KB).
@@ -196,34 +238,50 @@ Design a specialized allocator that packs small objects into contiguous "Slabs" 
 
 ## Implementation Roadmap
 
-### Phase 1: Core Slab Allocator
-- [ ] Fixed-size slab implementation (4KB pages)
-- [ ] Bitmap-based allocation tracking
-- [ ] Cache line alignment verification
-- [ ] Benchmarks vs. standard allocators
+**Sequencing Philosophy**: Validate the core innovation (slab allocator) first, then prove tier movement before adding caching layers. This mirrors how real systems mature.
 
-### Phase 2: Hash Table Integration
+### Phase 1: Core Slab Allocator
+*This is the product. Everything else is a means, not the end.*
+
+- [ ] Fixed-size slab implementation (4KB pages)
+- [ ] Bitmap-based allocation tracking (fast bitwise operations)
+- [ ] Cache line alignment verification
+- [ ] **Baseline benchmark**: 1M 128-byte objects in standard malloc
+- [ ] **Slab benchmark**: Same workload, measure memory overhead improvement
+- [ ] Benchmarks vs. standard allocators (jemalloc, tcmalloc)
+
+### Phase 2: Tiered Slab Pools
+*Validate tier movement early. This is the hardware innovation frontier.*
+
+- [ ] DRAM slab pool (hot tier)
+- [ ] NVMe slab pool via mmap (warm tier)
+- [ ] Automatic promotion/demotion based on access count
+- [ ] Performance characterization per tier
+- [ ] Latency histograms across tier transitions
+
+### Phase 3: Hash Table Integration
+*Hash tables are infrastructure, not innovation. Add after core validation.*
+
 - [ ] Slab-aware hash table structure
-- [ ] Lock-free concurrent access
+- [ ] Per-bucket locking for concurrency
 - [ ] Eviction policy (LRU within slabs)
 - [ ] Benchmarks vs. Redis for small objects
 
-### Phase 3: Tiered Memory
-- [ ] DRAM slab pool (hot tier)
-- [ ] NVMe slab pool (warm tier)
-- [ ] Automatic promotion/demotion
-- [ ] Performance characterization
+### Phase 4: Intent-Aware Optimization
+*AI assistance, not dependency. Advisory predictions with LRU fallback.*
 
-### Phase 4: AI-Driven Optimization
-- [ ] Access pattern logging
-- [ ] Lightweight prediction model
-- [ ] Pre-fetching implementation
-- [ ] A/B testing framework
+- [ ] Access pattern logging framework
+- [ ] Lightweight prediction model (<100μs inference)
+- [ ] Pre-fetching implementation with confidence thresholds
+- [ ] A/B testing framework (model vs. LRU baseline)
+- [ ] Graceful degradation verification
 
-### Phase 5: Distributed Support
+### Phase 5: Distributed Support (Optional)
+*Evolution, not requirement. RDMA as acceleration layer.*
+
 - [ ] Shared memory slab pools
-- [ ] RDMA integration (optional)
-- [ ] Consistency protocols
+- [ ] RDMA integration (optional acceleration)
+- [ ] Consistency protocols for distributed updates
 - [ ] Multi-node benchmarks
 
 ---

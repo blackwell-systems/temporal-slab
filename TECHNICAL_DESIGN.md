@@ -6,6 +6,19 @@ ZNS-Slab is a specialized cache-based database optimized for sub-4KB objects, de
 
 ---
 
+## Non-Goals
+
+This system explicitly does **not** aim to be:
+
+1. **General-purpose database replacement** - ZNS-Slab is a cache, not a durable data store
+2. **Complex query language** - Key-value operations only; no SQL, no aggregations
+3. **Full transactional semantics** - No multi-key transactions, no distributed commits
+4. **Universal workload support** - Optimized for small objects only (sub-4KB)
+
+**Why This Matters**: These constraints are deliberate. They enable the specialization that makes ZNS-Slab faster than general-purpose systems. This is not a limitation—it's architectural leverage.
+
+---
+
 ## Design Principles
 
 1. **Cache-First Architecture**: Optimize for CPU L1/L2 cache hits above all else
@@ -303,13 +316,14 @@ func (h *LFUHeap) EvictLFU() *CacheEntry {
 }
 ```
 
-### Phase 3: AI-Driven Prediction
+### Phase 3: Intent-Aware Prediction
 
 ```go
 type PredictiveCache struct {
     model        *LightweightModel
     history      *AccessLog
     confidence   float32
+    fallbackLRU  *EvictionManager  // CRITICAL: Graceful degradation
 }
 
 // Predict probability of access in next N seconds
@@ -318,12 +332,20 @@ func (pc *PredictiveCache) PredictAccess(key string, horizon time.Duration) floa
     return pc.model.Predict(features)
 }
 
-// Proactive prefetch
+// Proactive prefetch with safety net
 func (pc *PredictiveCache) PrefetchCandidates() []*CacheEntry {
     candidates := pc.model.TopKPredictions(100)
-    return filterByConfidence(candidates, 0.8) // 80% confidence threshold
+    highConfidence := filterByConfidence(candidates, 0.8)
+    
+    // If model confidence is low, fall back to LRU
+    if len(highConfidence) < 10 {
+        return pc.fallbackLRU.GetCandidates()
+    }
+    return highConfidence
 }
 ```
+
+**Critical Design Constraint**: AI-driven eviction is *advisory, not authoritative*. Incorrect predictions degrade gracefully to LRU behavior, not cache thrashing.
 
 ---
 
@@ -352,6 +374,8 @@ func (pc *PredictiveCache) PrefetchCandidates() []*CacheEntry {
 | 128B object overhead | 62% | 3% | 20x better |
 | Objects per GB | 4M | 32M | 8x density |
 | Fragmentation | High | Near-zero | 10x better |
+
+**Workload Assumptions**: Benchmarks assume fixed-size objects, uniform access distribution, and pre-allocated slabs. Real-world performance will vary based on access patterns and key distribution.
 
 ---
 
@@ -406,6 +430,17 @@ func BenchmarkGet(b *testing.B) {
 │              ~10TB capacity             │
 └─────────────────────────────────────────┘
 ```
+
+**Design Goal**: ZNS-Slab optimizes for *predictable latency bands*, not absolute speed.
+
+### Cost/Latency Model
+
+| Tier | Latency | Cost/GB | Intended Use |
+|------|---------|---------|-------------|
+| DRAM | ~100ns | $$$$ | Hot, mutable data |
+| PMEM | ~300ns | $$$ | Warm, stable data |
+| NVMe | ~20µs | $$ | Read-heavy, append-only |
+| HDD | ~5ms | $ | Cold archival |
 
 ### Promotion/Demotion Logic
 
