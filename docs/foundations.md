@@ -2,6 +2,37 @@
 
 This document builds the theoretical foundation for temporal-slab from first principles, defining each concept before using it to explain the next. It assumes no prior knowledge of memory allocator internals.
 
+## Table of Contents
+
+**Operating System Concepts**
+- [Page](#page)
+- [Virtual Memory vs Physical Memory](#virtual-memory-vs-physical-memory)
+- [Resident Set Size (RSS)](#resident-set-size-rss)
+
+**Allocator Fundamentals**
+- [Memory Allocator](#memory-allocator)
+- [Spatial Fragmentation](#spatial-fragmentation)
+- [Temporal Fragmentation](#temporal-fragmentation)
+- [Fragmentation as Entropy](#fragmentation-as-entropy)
+
+**Slab Allocation Model**
+- [Lifetime Affinity](#lifetime-affinity)
+- [Slab](#slab)
+- [Size Class](#size-class)
+- [Internal Fragmentation](#internal-fragmentation)
+- [Slab Lifecycle](#slab-lifecycle)
+
+**Implementation Techniques**
+- [Lock-Free Allocation](#lock-free-allocation)
+- [Bounded RSS Through Conservative Recycling](#bounded-rss-through-conservative-recycling)
+- [Slab Cache](#slab-cache)
+- [Refusal to Unmap](#refusal-to-unmap)
+- [O(1) Deterministic Class Selection](#o1-deterministic-class-selection)
+
+**API Design**
+- [Handle-Based API vs Malloc-Style API](#handle-based-api-vs-malloc-style-api)
+- [What You Should Understand Now](#what-you-should-understand-now)
+
 ---
 
 ## Page
