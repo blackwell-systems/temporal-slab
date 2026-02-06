@@ -198,7 +198,11 @@ static void unmap_one_page(void* p) {
 
 /* ------------------------------ Atomic bitmap ops ------------------------------ */
 
-static uint32_t slab_alloc_slot_atomic(Slab* s) {
+/*
+  Returns slot index (0..object_count-1) on success, UINT32_MAX on failure.
+  If out_prev_fc is non-NULL, stores previous free_count (for transition detection).
+*/
+static uint32_t slab_alloc_slot_atomic(Slab* s, uint32_t* out_prev_fc) {
   _Atomic uint32_t* bm = slab_bitmap_ptr(s);
   const uint32_t words = slab_bitmap_words(s->object_count);
 
@@ -212,10 +216,11 @@ static uint32_t slab_alloc_slot_atomic(Slab* s) {
       if (w == words - 1u) {
         uint32_t valid_bits = s->object_count - (w * 32u);
         if (valid_bits < 32u) {
-          uint32_t valid_mask = (valid_bits == 32u) ? 0xFFFFFFFFu : ((1u << valid_bits) - 1u);
+          uint32_t valid_mask = (1u << valid_bits) - 1u;
           free_mask &= valid_mask;
           if (free_mask == 0u) break;
         }
+        /* If valid_bits == 32, all 32 bits are valid - no masking needed */
       }
 
       uint32_t bit = ctz32(free_mask);
@@ -226,7 +231,9 @@ static uint32_t slab_alloc_slot_atomic(Slab* s) {
               &bm[w], &x, desired,
               memory_order_acq_rel,
               memory_order_relaxed)) {
-        atomic_fetch_sub_explicit(&s->free_count, 1u, memory_order_relaxed);
+        /* Precise transition detection: return previous free_count */
+        uint32_t prev_fc = atomic_fetch_sub_explicit(&s->free_count, 1u, memory_order_relaxed);
+        if (out_prev_fc) *out_prev_fc = prev_fc;
         return w * 32u + bit;
       }
     }
@@ -235,7 +242,11 @@ static uint32_t slab_alloc_slot_atomic(Slab* s) {
   return UINT32_MAX;
 }
 
-static bool slab_free_slot_atomic(Slab* s, uint32_t idx) {
+/*
+  Returns true on success, false if slot was already free.
+  If out_prev_fc is non-NULL, stores previous free_count (for 0->1 transition detection).
+*/
+static bool slab_free_slot_atomic(Slab* s, uint32_t idx, uint32_t* out_prev_fc) {
   if (idx >= s->object_count) return false;
 
   _Atomic uint32_t* bm = slab_bitmap_ptr(s);
@@ -245,14 +256,16 @@ static bool slab_free_slot_atomic(Slab* s, uint32_t idx) {
 
   while (1) {
     uint32_t x = atomic_load_explicit(&bm[w], memory_order_relaxed);
-    if ((x & mask) == 0u) return false;
+    if ((x & mask) == 0u) return false; /* already free */
 
     uint32_t desired = x & ~mask;
     if (atomic_compare_exchange_weak_explicit(
             &bm[w], &x, desired,
             memory_order_acq_rel,
             memory_order_relaxed)) {
-      atomic_fetch_add_explicit(&s->free_count, 1u, memory_order_relaxed);
+      /* Precise transition detection: return previous free_count */
+      uint32_t prev_fc = atomic_fetch_add_explicit(&s->free_count, 1u, memory_order_relaxed);
+      if (out_prev_fc) *out_prev_fc = prev_fc;
       return true;
     }
   }
@@ -346,27 +359,24 @@ static void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
   Slab* cur = atomic_load_explicit(&sc->current_partial, memory_order_acquire);
   
   if (cur && cur->magic == SLAB_MAGIC) {
-    uint32_t idx = slab_alloc_slot_atomic(cur);
+    uint32_t prev_fc = 0;
+    uint32_t idx = slab_alloc_slot_atomic(cur, &prev_fc);
     
     if (idx != UINT32_MAX) {
-      /* Success! Check if we just filled it */
-      uint32_t fc = atomic_load_explicit(&cur->free_count, memory_order_relaxed);
-      
-      if (fc == 0) {
-        /* Slab is now full - move PARTIAL->FULL and null current_partial */
+      /* Precise transition detection: check if WE caused 1->0 */
+      if (prev_fc == 1) {
+        /* Slab is now full - move PARTIAL->FULL and publish new current */
         pthread_mutex_lock(&sc->lock);
         if (cur->list_id == SLAB_LIST_PARTIAL) {
           list_remove(&sc->partial, cur);
           cur->list_id = SLAB_LIST_FULL;
           list_push_back(&sc->full, cur);
+          
+          /* Publish next partial slab to reduce slow-path contention */
+          Slab* next = sc->partial.head;
+          atomic_store_explicit(&sc->current_partial, next, memory_order_release);
         }
         pthread_mutex_unlock(&sc->lock);
-        
-        /* Try to null current_partial if it still points to this slab */
-        Slab* expected = cur;
-        atomic_compare_exchange_strong_explicit(
-          &sc->current_partial, &expected, NULL,
-          memory_order_release, memory_order_relaxed);
       }
       
       void* p = slab_slot_ptr(cur, idx);
@@ -385,63 +395,65 @@ static void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
       memory_order_release, memory_order_relaxed);
   }
 
-  /* Slow path: need mutex to pick/create slab */
-  pthread_mutex_lock(&sc->lock);
-
-  Slab* s = sc->partial.head;
-  if (!s) {
-    s = new_slab(sc->object_size);
-    if (!s) {
-      pthread_mutex_unlock(&sc->lock);
-      return NULL;
-    }
-    s->list_id = SLAB_LIST_PARTIAL;
-    list_push_back(&sc->partial, s);
-    sc->total_slabs++;
-  }
-
-  /* Publish to current_partial (release) */
-  atomic_store_explicit(&sc->current_partial, s, memory_order_release);
-
-  pthread_mutex_unlock(&sc->lock);
-
-  /* Now allocate from published slab */
-  uint32_t idx = slab_alloc_slot_atomic(s);
-  if (idx == UINT32_MAX) {
-    /* Extremely rare: slab filled between publish and our alloc */
-    return alloc_obj(a, size, out); /* Retry */
-  }
-
-  /* Check if we filled it */
-  uint32_t fc = atomic_load_explicit(&s->free_count, memory_order_relaxed);
-  if (fc == 0) {
+  /* Slow path: need mutex to pick/create slab (use loop, not recursion) */
+  for (;;) {
     pthread_mutex_lock(&sc->lock);
-    if (s->list_id == SLAB_LIST_PARTIAL) {
-      list_remove(&sc->partial, s);
-      s->list_id = SLAB_LIST_FULL;
-      list_push_back(&sc->full, s);
+
+    Slab* s = sc->partial.head;
+    if (!s) {
+      s = new_slab(sc->object_size);
+      if (!s) {
+        pthread_mutex_unlock(&sc->lock);
+        return NULL;
+      }
+      s->list_id = SLAB_LIST_PARTIAL;
+      list_push_back(&sc->partial, s);
+      sc->total_slabs++;
     }
+
+    /* Publish to current_partial (release) */
+    atomic_store_explicit(&sc->current_partial, s, memory_order_release);
+
     pthread_mutex_unlock(&sc->lock);
 
-    Slab* expected = s;
-    atomic_compare_exchange_strong_explicit(
-      &sc->current_partial, &expected, NULL,
-      memory_order_release, memory_order_relaxed);
-  }
+    /* Now allocate from published slab */
+    uint32_t prev_fc = 0;
+    uint32_t idx = slab_alloc_slot_atomic(s, &prev_fc);
+    
+    if (idx == UINT32_MAX) {
+      /* Rare: slab filled between publish and our alloc - retry loop */
+      continue;
+    }
 
-  void* p = slab_slot_ptr(s, idx);
-  if (out) {
-    out->slab = s;
-    out->slot = idx;
-    out->size_class = (uint32_t)ci;
+    /* Check if we caused 1->0 transition */
+    if (prev_fc == 1) {
+      pthread_mutex_lock(&sc->lock);
+      if (s->list_id == SLAB_LIST_PARTIAL) {
+        list_remove(&sc->partial, s);
+        s->list_id = SLAB_LIST_FULL;
+        list_push_back(&sc->full, s);
+        
+        /* Publish next partial if available */
+        Slab* next = sc->partial.head;
+        atomic_store_explicit(&sc->current_partial, next, memory_order_release);
+      }
+      pthread_mutex_unlock(&sc->lock);
+    }
+
+    void* p = slab_slot_ptr(s, idx);
+    if (out) {
+      out->slab = s;
+      out->slot = idx;
+      out->size_class = (uint32_t)ci;
+    }
+    return p;
   }
-  return p;
 }
 
 /*
   Phase 1.5 Free Strategy:
-    - CAS-clear bitmap bit
-    - If free_count became 1 (was 0), move FULL->PARTIAL
+    - CAS-clear bitmap bit (returns previous free_count)
+    - If we caused 0->1 transition, move FULL->PARTIAL
 */
 static bool free_obj(SlabAllocator* a, SlabHandle h) {
   if (!h.slab) return false;
@@ -451,22 +463,19 @@ static bool free_obj(SlabAllocator* a, SlabHandle h) {
   Slab* s = h.slab;
   if (s->magic != SLAB_MAGIC) return false;
 
-  /* Free the slot and get new free_count */
-  uint32_t old_fc = atomic_load_explicit(&s->free_count, memory_order_relaxed);
-  
-  if (!slab_free_slot_atomic(s, h.slot)) return false;
+  /* Precise transition detection: get previous free_count from fetch_add */
+  uint32_t prev_fc = 0;
+  if (!slab_free_slot_atomic(s, h.slot, &prev_fc)) return false;
 
-  uint32_t new_fc = atomic_load_explicit(&s->free_count, memory_order_relaxed);
-
-  /* Transition from full (0) to not-full (1) */
-  if (old_fc == 0 && new_fc == 1) {
+  /* Check if WE caused 0->1 transition (slab was full, now has space) */
+  if (prev_fc == 0) {
     pthread_mutex_lock(&sc->lock);
     if (s->list_id == SLAB_LIST_FULL) {
       list_remove(&sc->full, s);
       s->list_id = SLAB_LIST_PARTIAL;
       list_push_back(&sc->partial, s);
       
-      /* Optionally publish as current_partial if NULL */
+      /* Publish as current_partial if NULL (reduce slow-path trips) */
       Slab* expected = NULL;
       atomic_compare_exchange_strong_explicit(
         &sc->current_partial, &expected, s,
