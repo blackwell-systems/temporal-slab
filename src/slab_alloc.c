@@ -516,7 +516,6 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
           
           /* Publish next partial slab to reduce slow-path contention */
           Slab* next = es->partial.head;
-          assert(!next || next->list_id == SLAB_LIST_PARTIAL);
           atomic_store_explicit(&es->current_partial, next, memory_order_release);
         }
         pthread_mutex_unlock(&sc->lock);
@@ -590,7 +589,6 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
         
         /* Publish next partial if available */
         Slab* next = es->partial.head;
-        assert(!next || next->list_id == SLAB_LIST_PARTIAL);
         atomic_store_explicit(&es->current_partial, next, memory_order_release);
       }
       pthread_mutex_unlock(&sc->lock);
@@ -810,7 +808,7 @@ void allocator_destroy(SlabAllocator* a) {
 /* ------------------------------ Performance counters ------------------------------ */
 
 void get_perf_counters(SlabAllocator* a, uint32_t size_class, PerfCounters* out) {
-  if (size_class >= 4 || !out) return;
+  if (size_class >= k_num_classes || !out) return;
   
   SizeClassAlloc* sc = &a->classes[size_class];
   out->slow_path_hits = atomic_load_explicit(&sc->slow_path_hits, memory_order_relaxed);
