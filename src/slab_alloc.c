@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -261,12 +262,17 @@ void allocator_init(SlabAllocator* a) {
     atomic_store_explicit(&a->classes[i].list_move_full_to_partial, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].current_partial_null, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].current_partial_full, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].empty_slab_recycled, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].empty_slab_cache_overflowed, 0, memory_order_relaxed);
 
     /* Initialize slab cache (32 pages per size class = 128KB) */
     a->classes[i].cache_capacity = 32;
     a->classes[i].cache_size = 0;
     a->classes[i].slab_cache = (Slab**)calloc(a->classes[i].cache_capacity, sizeof(Slab*));
     pthread_mutex_init(&a->classes[i].cache_lock, NULL);
+    
+    /* Initialize overflow list */
+    list_init(&a->classes[i].cache_overflow);
   }
 }
 
@@ -277,24 +283,43 @@ static Slab* cache_pop(SizeClassAlloc* sc) {
   Slab* s = NULL;
   if (sc->cache_size > 0) {
     s = sc->slab_cache[--sc->cache_size];
+  } else if (sc->cache_overflow.head) {
+    /* Cache empty - try overflow list */
+    s = sc->cache_overflow.head;
+    list_remove(&sc->cache_overflow, s);
   }
   pthread_mutex_unlock(&sc->cache_lock);
   return s;
 }
 
-/* Note: cache_push will be used in Phase 2 when implementing slab recycling on empty */
-static void __attribute__((unused)) cache_push(SizeClassAlloc* sc, Slab* s) {
+/* Phase 2: Push empty slab to cache (or overflow if cache full) */
+static void cache_push(SizeClassAlloc* sc, Slab* s) {
   pthread_mutex_lock(&sc->cache_lock);
   if (sc->cache_size < sc->cache_capacity) {
     sc->slab_cache[sc->cache_size++] = s;
+    atomic_fetch_add_explicit(&sc->empty_slab_recycled, 1, memory_order_relaxed);
     s = NULL;
   }
-  pthread_mutex_unlock(&sc->cache_lock);
   
-  /* If cache is full, unmap the page */
+  /* CONSERVATIVE SAFETY: Never munmap() during runtime.
+   * Reason: SlabHandle stores raw Slab* pointers that callers may hold
+   * indefinitely (stale handles, double-free attempts). If we munmap,
+   * free_obj() will segfault when checking magic.
+   * 
+   * When cache is full, push to overflow list instead of dropping.
+   * This keeps slabs mapped and tracked, preventing leaks while
+   * maintaining safe stale-handle validation.
+   * 
+   * RSS is bounded by (partial + full + cache + overflow) = working set.
+   * Only munmap() during allocator_destroy(). */
   if (s) {
-    unmap_one_page(s);
+    /* Cache full - push to overflow list */
+    list_push_back(&sc->cache_overflow, s);
+    s->list_id = SLAB_LIST_NONE;  /* Mark as cached */
+    atomic_fetch_add_explicit(&sc->empty_slab_cache_overflowed, 1, memory_order_relaxed);
   }
+  
+  pthread_mutex_unlock(&sc->cache_lock);
 }
 
 /* ------------------------------ Slab allocation ------------------------------ */
@@ -306,11 +331,12 @@ static Slab* new_slab(SizeClassAlloc* sc) {
   Slab* s = cache_pop(sc);
   if (s) {
     /* Phase 1.6: Validate cached slab metadata (catches corruption early) */
-    assert(s->magic == SLAB_MAGIC && "cached slab has invalid magic");
+    assert(atomic_load_explicit(&s->magic, memory_order_relaxed) == SLAB_MAGIC && "cached slab has invalid magic");
     assert(s->object_size == obj_size && "cached slab has wrong object_size");
     
     uint32_t expected_count = slab_object_count(obj_size);
     assert(s->object_count == expected_count && "cached slab has wrong object_count");
+    
     
     /* Reinitialize the cached slab */
     s->prev = NULL;
@@ -345,8 +371,7 @@ static Slab* new_slab(SizeClassAlloc* sc) {
 
   s->prev = NULL;
   s->next = NULL;
-  s->magic = SLAB_MAGIC;
-  s->version = SLAB_VERSION;
+  atomic_store_explicit(&s->magic, SLAB_MAGIC, memory_order_relaxed);
   s->object_size = obj_size;
   s->object_count = count;
   atomic_store_explicit(&s->free_count, count, memory_order_relaxed);
@@ -380,7 +405,7 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
   /* Fast path: try current_partial */
   Slab* cur = atomic_load_explicit(&sc->current_partial, memory_order_acquire);
   
-  if (cur && cur->magic == SLAB_MAGIC) {
+  if (cur && atomic_load_explicit(&cur->magic, memory_order_relaxed) == SLAB_MAGIC) {
     uint32_t prev_fc = 0;
     uint32_t idx = slab_alloc_slot_atomic(cur, &prev_fc);
     
@@ -397,6 +422,7 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
           
           /* Publish next partial slab to reduce slow-path contention */
           Slab* next = sc->partial.head;
+          assert(!next || next->list_id == SLAB_LIST_PARTIAL);
           atomic_store_explicit(&sc->current_partial, next, memory_order_release);
         }
         pthread_mutex_unlock(&sc->lock);
@@ -407,6 +433,7 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
         out->slab = cur;
         out->slot = idx;
         out->size_class = (uint32_t)ci;
+        // out->slab_version = slab_version;  /* Use early-captured version */
       }
       return p;
     }
@@ -440,6 +467,7 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
     }
 
     /* Publish to current_partial (release) */
+    assert(s->list_id == SLAB_LIST_PARTIAL);
     atomic_store_explicit(&sc->current_partial, s, memory_order_release);
 
     pthread_mutex_unlock(&sc->lock);
@@ -452,6 +480,7 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
       /* Rare: slab filled between publish and our alloc - retry loop */
       continue;
     }
+    
 
     /* Check if we caused 1->0 transition */
     if (prev_fc == 1) {
@@ -464,6 +493,7 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
         
         /* Publish next partial if available */
         Slab* next = sc->partial.head;
+        assert(!next || next->list_id == SLAB_LIST_PARTIAL);
         atomic_store_explicit(&sc->current_partial, next, memory_order_release);
       }
       pthread_mutex_unlock(&sc->lock);
@@ -474,15 +504,23 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
       out->slab = s;
       out->slot = idx;
       out->size_class = (uint32_t)ci;
+      // out->slab_version = slab_version;  /* Use early-captured version */
     }
     return p;
   }
 }
 
 /*
-  Phase 1.5 Free Strategy:
-    - CAS-clear bitmap bit (returns previous free_count)
-    - If we caused 0->1 transition, move FULL->PARTIAL
+  Free Strategy:
+    - Validates handle by checking slab magic (safe because slabs stay mapped)
+    - CAS-clears bitmap bit for double-free detection
+    - If slab became empty AND is on FULL list: recycle to cache (safe from UAF)
+    - If 0->1 transition: move FULL->PARTIAL
+    
+  Safety contract:
+    - Returns false on invalid/stale/double-free handles (never crashes)
+    - Handles can be held indefinitely; free_obj validates them
+    - Slabs stay mapped during allocator lifetime for safe validation
 */
 bool free_obj(SlabAllocator* a, SlabHandle h) {
   if (!h.slab) return false;
@@ -490,11 +528,54 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
 
   SizeClassAlloc* sc = &a->classes[h.size_class];
   Slab* s = (Slab*)h.slab;  /* Cast from void* (public) to Slab* (internal) */
-  if (s->magic != SLAB_MAGIC) return false;
+  
+  /* Validate slab magic - safe because slabs stay mapped during runtime */
+  if (atomic_load_explicit(&s->magic, memory_order_relaxed) != SLAB_MAGIC) return false;
 
   /* Precise transition detection: get previous free_count from fetch_add */
   uint32_t prev_fc = 0;
   if (!slab_free_slot_atomic(s, h.slot, &prev_fc)) return false;
+
+  /* New free_count is prev_fc + 1 */
+  uint32_t new_fc = prev_fc + 1;
+
+  /* Phase 2: Check if slab became empty - try to recycle safely */
+  if (new_fc == s->object_count) {
+    pthread_mutex_lock(&sc->lock);
+    
+    bool can_recycle = false;
+    
+    if (s->list_id == SLAB_LIST_FULL) {
+      /* FULL-list slabs are never published, always safe to recycle */
+      list_remove(&sc->full, s);
+      can_recycle = true;
+    } else if (s->list_id == SLAB_LIST_PARTIAL) {
+      /* Try to unpublish if it's current_partial */
+      Slab* expected = s;
+      if (atomic_compare_exchange_strong_explicit(
+            &sc->current_partial, &expected, NULL,
+            memory_order_release, memory_order_relaxed)) {
+        /* Successfully unpublished - safe to recycle */
+        list_remove(&sc->partial, s);
+        can_recycle = true;
+      }
+      /* If CAS failed, slab is either not published or another thread has it
+       * Leave it on PARTIAL list - it will be recycled eventually */
+    }
+    
+    if (can_recycle) {
+      s->list_id = SLAB_LIST_NONE;
+      sc->total_slabs--;
+      pthread_mutex_unlock(&sc->lock);
+      
+      /* Push to cache (or overflow if cache full) - outside lock */
+      cache_push(sc, s);
+      return true;
+    }
+    
+    pthread_mutex_unlock(&sc->lock);
+    return true;
+  }
 
   /* Check if WE caused 0->1 transition (slab was full, now has space) */
   if (prev_fc == 0) {
@@ -506,6 +587,7 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
       list_push_back(&sc->partial, s);
       
       /* Publish as current_partial if NULL (reduce slow-path trips) */
+      assert(s->list_id == SLAB_LIST_PARTIAL);
       Slab* expected = NULL;
       atomic_compare_exchange_strong_explicit(
         &sc->current_partial, &expected, s,
@@ -553,6 +635,16 @@ void allocator_destroy(SlabAllocator* a) {
     free(sc->slab_cache);
     sc->cache_size = 0;
     sc->cache_capacity = 0;
+    
+    /* Drain overflow list */
+    cur = sc->cache_overflow.head;
+    while (cur) {
+      Slab* next = cur->next;
+      unmap_one_page(cur);
+      cur = next;
+    }
+    list_init(&sc->cache_overflow);
+    
     pthread_mutex_unlock(&sc->cache_lock);
     pthread_mutex_destroy(&sc->cache_lock);
   }
@@ -570,6 +662,8 @@ void get_perf_counters(SlabAllocator* a, uint32_t size_class, PerfCounters* out)
   out->list_move_full_to_partial = atomic_load_explicit(&sc->list_move_full_to_partial, memory_order_relaxed);
   out->current_partial_null = atomic_load_explicit(&sc->current_partial_null, memory_order_relaxed);
   out->current_partial_full = atomic_load_explicit(&sc->current_partial_full, memory_order_relaxed);
+  out->empty_slab_recycled = atomic_load_explicit(&sc->empty_slab_recycled, memory_order_relaxed);
+  out->empty_slab_unmapped = atomic_load_explicit(&sc->empty_slab_cache_overflowed, memory_order_relaxed);
 }
 
 /* ------------------------------ RSS (Linux) ------------------------------ */

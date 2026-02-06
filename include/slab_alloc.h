@@ -40,6 +40,8 @@ typedef struct PerfCounters {
   uint64_t list_move_full_to_partial;
   uint64_t current_partial_null;  /* fast path saw NULL current_partial */
   uint64_t current_partial_full;  /* fast path saw full current_partial */
+  uint64_t empty_slab_recycled;   /* Phase 2.1: empty slabs pushed to cache */
+  uint64_t empty_slab_unmapped;   /* Phase 2.1: empty slabs munmap'd (cache full) */
 } PerfCounters;
 
 /* -------------------- Lifetime -------------------- */

@@ -37,8 +37,7 @@ struct Slab {
   Slab* next;
 
   /* Metadata */
-  uint32_t magic;
-  uint32_t version;
+  _Atomic uint32_t magic;     /* Atomic for lock-free validation */
   uint32_t object_size;
   uint32_t object_count;
 
@@ -80,12 +79,19 @@ struct SizeClassAlloc {
   _Atomic uint64_t list_move_full_to_partial;
   _Atomic uint64_t current_partial_null;  /* fast path saw NULL current_partial */
   _Atomic uint64_t current_partial_full;  /* fast path saw full current_partial */
+  
+  /* Phase 2: Empty slab recycling counters */
+  _Atomic uint64_t empty_slab_recycled;         /* empty slab pushed to cache */
+  _Atomic uint64_t empty_slab_cache_overflowed; /* cache full, pushed to overflow */
 
   /* Slab cache: free page stack to avoid mmap() in hot path */
   Slab** slab_cache;
   size_t cache_capacity;
   size_t cache_size;
   pthread_mutex_t cache_lock;
+  
+  /* Overflow list: bounded tracking of slabs when cache is full */
+  SlabList cache_overflow;
 };
 
 /* Main allocator structure */

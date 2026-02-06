@@ -174,8 +174,16 @@ void micro_bench(void) {
 /* ------------------------------ Main ------------------------------ */
 
 int main(void) {
+  printf("Starting smoke_test_single_thread...\n");
+  fflush(stdout);
   smoke_test_single_thread();
+  
+  printf("Starting smoke_test_multi_thread...\n");
+  fflush(stdout);
   smoke_test_multi_thread();
+  
+  printf("Starting micro_bench...\n");
+  fflush(stdout);
   micro_bench();
   return 0;
 }

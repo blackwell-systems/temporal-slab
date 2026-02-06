@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include
 
-all: smoke_tests benchmark_accurate soak_test
+all: smoke_tests benchmark_accurate soak_test churn_test
 
 # Core library object (implementation only, no main)
 slab_lib.c: slab_alloc.c
@@ -24,7 +24,11 @@ benchmark_accurate: benchmark_accurate.c slab_lib.o
 soak_test: soak_test.c slab_lib.o
 	$(CC) $(CFLAGS) soak_test.c slab_lib.o -o soak_test
 
+# Churn test executable (Phase 2.1 RSS bounds validation)
+churn_test: churn_test.c slab_lib.o
+	$(CC) $(CFLAGS) churn_test.c slab_lib.o -o churn_test
+
 clean:
-	rm -f smoke_tests benchmark_accurate soak_test slab_lib.c slab_lib.o
+	rm -f smoke_tests benchmark_accurate soak_test churn_test slab_lib.c slab_lib.o
 
 .PHONY: all clean
