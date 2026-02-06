@@ -190,11 +190,16 @@ The key observation: **p99 latency remains below 20µs even at 16 threads**. For
 - Latency-sensitive systems (HFT, real-time, embedded)
 - Bounded RSS requirements (no runaway memory growth)
 
-**When traditional allocators win:**
-- Variable-size allocations (need jemalloc/tcmalloc)
-- Large objects >768 bytes (need general-purpose allocator)
-- Low churn workloads (allocation is not bottleneck)
-- NUMA systems (need per-node allocators)
+**When jemalloc/tcmalloc win:**
+- Variable-size allocations (temporal-slab: fixed classes only)
+- Large objects >768 bytes (temporal-slab: specialized for small objects)
+- Low churn workloads (allocation overhead not bottleneck)
+- NUMA systems (temporal-slab: no per-node awareness)
+- Drop-in malloc replacement needs (jemalloc: LD_PRELOAD, huge ecosystem)
+- General-purpose server workloads (jemalloc: decades of tuning)
+
+**Core trade-off:**  
+Compared to jemalloc, temporal-slab sacrifices generality in exchange for deterministic latency and bounded RSS under sustained churn. jemalloc can be tuned to behave similarly, but temporal-slab makes this behavior structural, not heuristic.
 
 ## Reproducing These Results
 
