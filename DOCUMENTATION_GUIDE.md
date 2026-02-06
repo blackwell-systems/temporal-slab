@@ -8,9 +8,11 @@ This project has comprehensive documentation for different audiences and purpose
 ZNS-Slab/
 ├── README.md                    # Project overview and quick start
 ├── EXECUTIVE_SUMMARY.md         # High-level explanation for all audiences
+├── BENCHMARKS.md                # Performance claims, methodology, ground truth
 ├── INNOVATION_FRONTIERS.md      # Market opportunity and broken assumptions
 ├── USE_CASES.md                 # 10 domains where small objects dominate
-├── TECHNICAL_DESIGN.md          # Complete implementation specification
+├── TECHNICAL_DESIGN.md          # High-level architecture and design
+├── PHASE1_IMPLEMENTATION.md     # Concrete C implementation guide
 └── DOCUMENTATION_GUIDE.md       # This file - navigation help
 ```
 

@@ -134,16 +134,22 @@ Read the [Executive Summary](./EXECUTIVE_SUMMARY.md) - includes:
 - Audience-specific summaries (engineers, managers, CTOs, investors)
 
 ### For Engineers
+
+**Ready to implement?** See [PHASE1_IMPLEMENTATION.md](./PHASE1_IMPLEMENTATION.md) for:
+- Concrete C code structures
+- Bitmap operations with ffs()
+- mmap parameters and error handling
+- Benchmark harness implementation
+- Testing strategy
+
+**Architecture overview?** See [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md) for high-level design.
+
 ```bash
-# Phase 1: Baseline Benchmark
-cd benchmarks/
-./baseline_malloc.sh
-
-# Measures RSS memory for 1M 128-byte objects
-# This establishes the "before" measurement
+# Quick start after reading PHASE1_IMPLEMENTATION.md
+cd src/
+gcc -O2 -o slab_test slab.c bitmap.c test_slab.c
+./slab_test
 ```
-
-Then review [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md) for implementation details.
 
 ## Resume Impact
 
