@@ -10,7 +10,7 @@ int main(void) {
   assert(a && "allocator creation failed");
   
   printf("Test 1: Basic malloc/free...\n");
-  void* p1 = slab_malloc(a, 64);
+  void* p1 = slab_malloc_epoch(a, 64, 0);
   assert(p1 && "malloc failed");
   memset(p1, 0xAA, 64);
   slab_free(a, p1);
@@ -19,7 +19,7 @@ int main(void) {
   printf("\nTest 2: Multiple allocations...\n");
   void* ptrs[100];
   for (int i = 0; i < 100; i++) {
-    ptrs[i] = slab_malloc(a, 128);
+    ptrs[i] = slab_malloc_epoch(a, 128, 0);
     assert(ptrs[i] && "malloc failed in loop");
     *(int*)ptrs[i] = i;
   }
@@ -31,19 +31,19 @@ int main(void) {
   
   printf("\nTest 3: NULL and boundary cases...\n");
   slab_free(a, NULL);  /* Should not crash */
-  void* p_zero = slab_malloc(a, 0);
+  void* p_zero = slab_malloc_epoch(a, 0, 0);
   assert(p_zero == NULL && "malloc(0) should return NULL");
-  void* p_huge = slab_malloc(a, 505);
+  void* p_huge = slab_malloc_epoch(a, 505, 0);
   assert(p_huge == NULL && "malloc(505) should return NULL (max is 504)");
-  void* p_max = slab_malloc(a, 504);
+  void* p_max = slab_malloc_epoch(a, 504, 0);
   assert(p_max && "malloc(504) should succeed");
   slab_free(a, p_max);
   printf("  PASS: NULL free, malloc(0), oversized, max size\n");
   
   printf("\nTest 4: Mixed malloc and handle API...\n");
-  void* pm = slab_malloc(a, 100);
+  void* pm = slab_malloc_epoch(a, 100, 0);
   SlabHandle h;
-  void* ph = alloc_obj(a, 100, &h);
+  void* ph = alloc_obj_epoch(a, 100, 0, &h);
   assert(pm && ph && "both APIs work");
   slab_free(a, pm);
   free_obj(a, h);

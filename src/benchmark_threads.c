@@ -95,7 +95,7 @@ static void* worker_thread(void* arg) {
   /* Benchmark allocation */
   for (int i = 0; i < OPS_PER_THREAD; i++) {
     uint64_t t0 = now_ns();
-    void* p = alloc_obj(state->alloc, OBJECT_SIZE, &handles[i]);
+    void* p = alloc_obj_epoch(state->alloc, OBJECT_SIZE, 0, &handles[i]);
     uint64_t t1 = now_ns();
     
     if (!p) {
