@@ -273,6 +273,14 @@ static bool slab_free_slot_atomic(Slab* s, uint32_t idx, uint32_t* out_prev_fc) 
 
 /* ------------------------------ Allocator ------------------------------ */
 
+typedef struct PerfCounters {
+  uint64_t slow_path_hits;
+  uint64_t new_slab_count;
+  uint64_t list_move_partial_to_full;
+  uint64_t list_move_full_to_partial;
+  uint64_t current_partial_miss;
+} PerfCounters;
+
 typedef struct SizeClassAlloc {
   uint32_t object_size;
 
@@ -286,6 +294,19 @@ typedef struct SizeClassAlloc {
   pthread_mutex_t lock;
 
   size_t total_slabs;
+
+  /* Performance counters for tail latency attribution */
+  _Atomic uint64_t slow_path_hits;
+  _Atomic uint64_t new_slab_count;
+  _Atomic uint64_t list_move_partial_to_full;
+  _Atomic uint64_t list_move_full_to_partial;
+  _Atomic uint64_t current_partial_miss;
+
+  /* Slab cache: free page stack to avoid mmap() in hot path */
+  Slab** slab_cache;
+  size_t cache_capacity;
+  size_t cache_size;
+  pthread_mutex_t cache_lock;
 } SizeClassAlloc;
 
 typedef struct SlabAllocator {
@@ -301,14 +322,85 @@ static void allocator_init(SlabAllocator* a) {
     atomic_store_explicit(&a->classes[i].current_partial, NULL, memory_order_relaxed);
     pthread_mutex_init(&a->classes[i].lock, NULL);
     a->classes[i].total_slabs = 0;
+
+    /* Initialize performance counters */
+    atomic_store_explicit(&a->classes[i].slow_path_hits, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].new_slab_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].list_move_partial_to_full, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].list_move_full_to_partial, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].current_partial_miss, 0, memory_order_relaxed);
+
+    /* Initialize slab cache (32 pages per size class = 128KB) */
+    a->classes[i].cache_capacity = 32;
+    a->classes[i].cache_size = 0;
+    a->classes[i].slab_cache = (Slab**)calloc(a->classes[i].cache_capacity, sizeof(Slab*));
+    pthread_mutex_init(&a->classes[i].cache_lock, NULL);
   }
 }
 
-static Slab* new_slab(uint32_t obj_size) {
+/* ------------------------------ Slab cache operations ------------------------------ */
+
+static Slab* cache_pop(SizeClassAlloc* sc) {
+  pthread_mutex_lock(&sc->cache_lock);
+  Slab* s = NULL;
+  if (sc->cache_size > 0) {
+    s = sc->slab_cache[--sc->cache_size];
+  }
+  pthread_mutex_unlock(&sc->cache_lock);
+  return s;
+}
+
+/* Note: cache_push will be used in Phase 2 when implementing slab recycling on empty */
+static void cache_push(SizeClassAlloc* sc, Slab* s) {
+  pthread_mutex_lock(&sc->cache_lock);
+  if (sc->cache_size < sc->cache_capacity) {
+    sc->slab_cache[sc->cache_size++] = s;
+    s = NULL;
+  }
+  pthread_mutex_unlock(&sc->cache_lock);
+  
+  /* If cache is full, unmap the page */
+  if (s) {
+    unmap_one_page(s);
+  }
+}
+
+/* Suppress unused warning - used in Phase 2 for empty slab recycling */
+static inline void __attribute__((unused)) suppress_cache_push_warning(void) {
+  cache_push(NULL, NULL);
+}
+
+/* ------------------------------ Slab allocation ------------------------------ */
+
+static Slab* new_slab(SizeClassAlloc* sc) {
+  uint32_t obj_size = sc->object_size;
+
+  /* Try to pop from cache first */
+  Slab* s = cache_pop(sc);
+  if (s) {
+    /* Reinitialize the cached slab */
+    s->prev = NULL;
+    s->next = NULL;
+    s->list_id = SLAB_LIST_NONE;
+    atomic_store_explicit(&s->free_count, s->object_count, memory_order_relaxed);
+    
+    /* Clear bitmap */
+    _Atomic uint32_t* bm = slab_bitmap_ptr(s);
+    uint32_t words = slab_bitmap_words(s->object_count);
+    for (uint32_t i = 0; i < words; i++) {
+      atomic_store_explicit(&bm[i], 0u, memory_order_relaxed);
+    }
+    
+    return s;
+  }
+
+  /* Cache miss - allocate new page */
+  atomic_fetch_add_explicit(&sc->new_slab_count, 1, memory_order_relaxed);
+  
   void* page = map_one_page();
   if (!page) return NULL;
 
-  Slab* s = (Slab*)page;
+  s = (Slab*)page;
 
   uint32_t count = slab_object_count(obj_size);
   if (count == 0) {
@@ -368,6 +460,7 @@ static void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
         /* Slab is now full - move PARTIAL->FULL and publish new current */
         pthread_mutex_lock(&sc->lock);
         if (cur->list_id == SLAB_LIST_PARTIAL) {
+          atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
           list_remove(&sc->partial, cur);
           cur->list_id = SLAB_LIST_FULL;
           list_push_back(&sc->full, cur);
@@ -389,6 +482,7 @@ static void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
     }
     
     /* Allocation failed (slab was full) - null current_partial and go slow */
+    atomic_fetch_add_explicit(&sc->current_partial_miss, 1, memory_order_relaxed);
     Slab* expected = cur;
     atomic_compare_exchange_strong_explicit(
       &sc->current_partial, &expected, NULL,
@@ -397,11 +491,12 @@ static void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
 
   /* Slow path: need mutex to pick/create slab (use loop, not recursion) */
   for (;;) {
+    atomic_fetch_add_explicit(&sc->slow_path_hits, 1, memory_order_relaxed);
     pthread_mutex_lock(&sc->lock);
 
     Slab* s = sc->partial.head;
     if (!s) {
-      s = new_slab(sc->object_size);
+      s = new_slab(sc);
       if (!s) {
         pthread_mutex_unlock(&sc->lock);
         return NULL;
@@ -429,6 +524,7 @@ static void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
     if (prev_fc == 1) {
       pthread_mutex_lock(&sc->lock);
       if (s->list_id == SLAB_LIST_PARTIAL) {
+        atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
         list_remove(&sc->partial, s);
         s->list_id = SLAB_LIST_FULL;
         list_push_back(&sc->full, s);
@@ -471,6 +567,7 @@ static bool free_obj(SlabAllocator* a, SlabHandle h) {
   if (prev_fc == 0) {
     pthread_mutex_lock(&sc->lock);
     if (s->list_id == SLAB_LIST_FULL) {
+      atomic_fetch_add_explicit(&sc->list_move_full_to_partial, 1, memory_order_relaxed);
       list_remove(&sc->full, s);
       s->list_id = SLAB_LIST_PARTIAL;
       list_push_back(&sc->partial, s);
@@ -514,7 +611,31 @@ static void allocator_destroy(SlabAllocator* a) {
 
     pthread_mutex_unlock(&sc->lock);
     pthread_mutex_destroy(&sc->lock);
+
+    /* Drain slab cache */
+    pthread_mutex_lock(&sc->cache_lock);
+    for (size_t j = 0; j < sc->cache_size; j++) {
+      unmap_one_page(sc->slab_cache[j]);
+    }
+    free(sc->slab_cache);
+    sc->cache_size = 0;
+    sc->cache_capacity = 0;
+    pthread_mutex_unlock(&sc->cache_lock);
+    pthread_mutex_destroy(&sc->cache_lock);
   }
+}
+
+/* ------------------------------ Performance counters ------------------------------ */
+
+static void get_perf_counters(SlabAllocator* a, uint32_t size_class, PerfCounters* out) {
+  if (size_class >= 4 || !out) return;
+  
+  SizeClassAlloc* sc = &a->classes[size_class];
+  out->slow_path_hits = atomic_load_explicit(&sc->slow_path_hits, memory_order_relaxed);
+  out->new_slab_count = atomic_load_explicit(&sc->new_slab_count, memory_order_relaxed);
+  out->list_move_partial_to_full = atomic_load_explicit(&sc->list_move_partial_to_full, memory_order_relaxed);
+  out->list_move_full_to_partial = atomic_load_explicit(&sc->list_move_full_to_partial, memory_order_relaxed);
+  out->current_partial_miss = atomic_load_explicit(&sc->current_partial_miss, memory_order_relaxed);
 }
 
 /* ------------------------------ RSS (Linux) ------------------------------ */

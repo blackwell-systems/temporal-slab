@@ -1,4 +1,28 @@
 # ZNS-Slab Phase 1 Test Results
+
+Background:
+-----------
+These are CORRECTNESS validation results, not performance benchmarks.
+The primary goal is to verify that the allocator:
+  1. Passes single-threaded smoke tests (20K alloc/free cycles)
+  2. Passes multi-threaded stress tests (8 threads × 500K iterations)
+  3. Has no races, memory corruption, or allocation failures
+
+Context:
+--------
+Phase 1.5 implementation includes:
+  - Lock-free fast path with atomic current_partial pointer
+  - Fixed 7 critical correctness issues:
+    * UB in valid_mask (shift by 32)
+    * Racy transition detection (now uses fetch_add/sub return values)
+    * Recursion risk in slow path (changed to loop)
+    * Precise 1->0 and 0->1 edge detection
+    * Proper memory ordering (acquire/release)
+
+The micro_bench numbers (69ns alloc, 8.7ns free) are indicative but NOT
+defensible - see benchmark_results_accurate.txt for proper methodology
+with mmap/munmap RSS tracking and percentile latency measurements.
+
 Date: Thu Feb  5 21:14:11 MST 2026
 Platform: Linux BWIAP-8CY2RW3 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
 Compiler: gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0

@@ -151,19 +151,25 @@ gcc -O2 -o slab_test slab.c bitmap.c test_slab.c
 ./slab_test
 ```
 
-## Resume Impact
-
-If you can tell an interviewer:
-
-> "I designed a specialized slab allocator for sub-4KB objects that reduces per-object overhead to <5% through lifetime-aligned allocation and cache-line packing. By grouping objects with shared lifecycles into fixed-size slabs, the system eliminates fragmentation, achieves O(1) bulk deletion, and maximizes CPU L1 cache locality. This demonstrates systems-level thinking about memory hierarchy and hardware alignment."
-
-You're not a "LeetCode person." You're a **Systems Architect**.
-
 ## Project Status
 
-**Current Phase**: Phase 1 - Core Slab Allocator
+**Current Phase**: Phase 1.5 Complete ✅
 
-This is a *design brief for a real systems artifact*, not a speculative idea. It's buildable, benchmarkable, and defensible.
+**Achieved:** Release-quality slab allocator with measurable, attributable, and reproducible performance.
+
+**Performance (Intel Core Ultra 7 165H, GCC 13.3.0 -O3):**
+- p50: 26ns allocation, 24ns free
+- p99: 1423ns allocation, 45ns free
+- p999: 2303ns allocation, 184ns free
+- Memory overhead: 3.4%
+- Cache hit rate: 97%
+
+**Quick Start:**
+```bash
+make bench  # One-command build + benchmark + regression check
+```
+
+See [PHASE1.5_COMPLETE.md](./PHASE1.5_COMPLETE.md) for full release details and [RELEASE_NOTES_v1.5.md](./RELEASE_NOTES_v1.5.md) for technical architecture.
 
 ## License
 
