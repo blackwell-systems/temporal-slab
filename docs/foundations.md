@@ -39,6 +39,7 @@ This document builds the theoretical foundation for temporal-slab from first pri
 - [Bitmap Allocation](#bitmap-allocation)
 
 **Implementation Techniques**
+- [Fast Path vs Slow Path](#fast-path-vs-slow-path)
 - [Lock-Free Allocation](#lock-free-allocation)
 - [Compare-and-Swap (CAS)](#compare-and-swap-cas)
 - [Atomic Operations](#atomic-operations)
@@ -1256,6 +1257,174 @@ Bitmaps are cache-friendly: 64 slot states fit in 8 bytes (one cache line). Bitm
 Compare to free lists: a free list for 63 slots might store 63 pointers (504 bytes) plus metadata. The bitmap stores 8 bytes. That's 63× less metadata, all in one cache line.
 
 temporal-slab uses 64-bit bitmaps stored in the slab header. Lock-free allocation uses atomic CAS loops on the bitmap to claim slots without mutexes. Bitmap operations are the foundation of the sub-100ns allocation fast path.
+
+## Fast Path vs Slow Path
+
+Fast path and slow path (also called hot path and cold path) are terms describing the two execution branches in performance-critical code. The fast path is the common case optimized for minimum latency. The slow path is the rare case that handles edge conditions, initialization, or complex operations.
+
+**Fast path characteristics:**
+
+The fast path is designed to execute as quickly as possible:
+- **No locks** - Uses lock-free atomic operations instead of mutexes
+- **No syscalls** - Operates entirely in userspace (no mmap/munmap)
+- **No allocations** - Uses pre-allocated structures (no dynamic memory)
+- **Minimal branching** - Few or no conditional branches (avoid misprediction)
+- **Cache-friendly** - Accesses data likely already in L1/L2 cache
+
+**Slow path characteristics:**
+
+The slow path handles exceptional cases:
+- **Locks allowed** - Can acquire mutexes (correctness over speed)
+- **Syscalls allowed** - Can call mmap, munmap, madvise
+- **Allocations allowed** - Can allocate metadata structures
+- **Complex logic** - Can scan lists, search trees, compute heuristics
+- **Tolerates latency** - 1-10 microseconds acceptable (vs <100ns for fast path)
+
+**The key insight: Optimize the common case**
+
+If 99% of allocations hit the fast path and 1% hit the slow path:
+
+```
+Fast path: 50ns per allocation
+Slow path: 5µs per allocation (100× slower)
+
+Average latency:
+0.99 × 50ns + 0.01 × 5µs = 49.5ns + 50ns = 99.5ns
+
+The fast path dominates performance!
+```
+
+Even if the slow path is 100× slower, it barely affects average latency because it's so rare.
+
+**Fast path vs slow path in temporal-slab allocation:**
+
+**Fast path (99%+ of allocations):**
+
+```
+Allocate 128 bytes:
+1. Load current_partial pointer (atomic load, 1 cycle)
+2. Check slab has free slots (bitmap != 0xFFFF, 1 cycle)
+3. Find first free bit (BSF instruction, 1 cycle)
+4. Claim bit with CAS (20-40 cycles)
+5. Calculate slot address (multiply + add, 2 cycles)
+6. Return pointer
+
+Total: ~30-50 cycles (~10-17ns at 3GHz)
+No locks, no syscalls, no allocations
+```
+
+**Slow path (<1% of allocations):**
+
+```
+Current slab is full, need new slab:
+1. Acquire global mutex (50-200 cycles if uncontended)
+2. Check if other thread already allocated slab (10 cycles)
+3. Pop slab from cache OR mmap new slab:
+   - Cache hit: 50 cycles (pop from list)
+   - Cache miss: 3000-10,000 cycles (mmap syscall)
+4. Initialize slab metadata (50 cycles)
+5. Update current_partial pointer (atomic store, 1 cycle)
+6. Release mutex (50 cycles)
+7. Allocate from new slab (fast path, 30 cycles)
+
+Total:
+- Cache hit: ~200-400 cycles (~100-150ns)
+- Cache miss: ~3000-10,000 cycles (~1-3µs)
+
+10-100× slower than fast path, but rare
+```
+
+**Why the split matters:**
+
+Without fast/slow path separation, every allocation would need to:
+- Acquire a mutex (100+ cycles) → Contention bottleneck
+- Check if slab exists (unnecessary for existing slabs)
+- Handle edge cases (wasted cycles in common case)
+
+Result: 150-200 cycles minimum per allocation (~50-70ns)
+
+With fast/slow path separation:
+- Fast path: 30-50 cycles (3-4× faster!)
+- Slow path: 200-10,000 cycles (acceptable, rare)
+- Average: ~50 cycles when fast path hit rate is 99%
+
+**Fast path optimization strategies in temporal-slab:**
+
+**1. Lock-free via atomics:**
+```c
+// Fast path: No mutex
+Slab* slab = atomic_load(&current_partial);  // Lock-free load
+if (CAS(&slab->bitmap, old, new)) {          // Lock-free claim
+    return slot;
+}
+
+// Slow path: Mutex for structural changes
+mutex_lock(&alloc->mutex);
+allocate_new_slab();
+mutex_unlock(&alloc->mutex);
+```
+
+**2. Pre-selected slab:**
+```c
+// Fast path: Use current_partial (already selected)
+Slab* slab = current_partial;  // No search
+
+// Slow path: Search partial list or allocate new
+Slab* slab = find_partial_slab();  // Scan list
+if (!slab) slab = allocate_new_slab();  // mmap
+```
+
+**3. Bitmap allocation:**
+```c
+// Fast path: Bitmap bit scan (1 cycle)
+int slot = __builtin_ctzll(~bitmap);  // BSF instruction
+
+// Slow path: Could use complex free list search
+// (temporal-slab doesn't, but traditional allocators do)
+FreeBlock* block = search_free_list(size);  // O(N) scan
+```
+
+**Hot path vs cold path (synonymous):**
+
+"Hot path" and "cold path" are synonyms for fast path and slow path, with the metaphor being CPU heat:
+- **Hot path:** Executed so frequently it "heats up" the CPU (cache stays warm, branch predictor learns pattern)
+- **Cold path:** Executed so rarely the CPU cache is "cold" (cache misses, unpredicted branches)
+
+The terms are interchangeable. temporal-slab documentation uses "fast path" and "slow path" for clarity.
+
+**Fast/slow path in other contexts:**
+
+**Database query execution:**
+- Fast path: Query hits index, returns in <1ms (99% of queries)
+- Slow path: Query requires full table scan, 100ms+ (1% of queries)
+
+**Network request handling:**
+- Fast path: Request served from cache, <1ms (95% of requests)
+- Slow path: Cache miss, fetch from backend, 50ms+ (5% of requests)
+
+**Compiler optimization:**
+- Fast path: Hot loop compiled with aggressive optimization
+- Slow path: Error handling compiled with -O0 (cold code)
+
+The pattern is universal: identify the common case (fast path), optimize aggressively, tolerate higher cost in rare case (slow path).
+
+**Why this matters for temporal-slab:**
+
+temporal-slab's 0% RSS growth and sub-100ns latency both depend on fast/slow path separation:
+
+**Fast path enables sub-100ns latency:**
+- Lock-free bitmap allocation (no mutex contention)
+- No syscalls (no mmap/munmap)
+- No metadata updates (just bitmap CAS)
+- Result: Median p50 = 74ns (from benchmarks)
+
+**Slow path handles growth:**
+- Mutex-protected slab allocation (rare, acceptable cost)
+- mmap for new slabs (amortized via cache)
+- List manipulation (updating partial/full lists)
+- Result: p99 = 374ns, p99.9 = 1.1µs (still fast, but 5-15× slower than median)
+
+The fast path is what makes temporal-slab suitable for HFT and real-time systems. The slow path is what makes it correct and prevents unbounded growth.
 
 ## Lock-Free Allocation
 
