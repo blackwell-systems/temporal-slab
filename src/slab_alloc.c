@@ -388,7 +388,22 @@ static Slab* new_slab(SizeClassAlloc* sc) {
   return s;
 }
 
-/* Note: SlabHandle now defined in public header (include/slab_alloc.h) */
+/* ------------------------------ Handle encoding ------------------------------ */
+
+/* Encode slab/slot/size_class into opaque 64-bit handle */
+static inline SlabHandle encode_handle(Slab* slab, uint32_t slot, uint32_t size_class) {
+  uintptr_t slab_addr = (uintptr_t)slab;
+  return ((uint64_t)slab_addr << 16) | ((uint64_t)slot << 8) | (uint64_t)size_class;
+}
+
+/* Decode opaque handle into slab/slot/size_class */
+static inline Slab* decode_handle(SlabHandle h, uint32_t* out_slot, uint32_t* out_size_class) {
+  *out_slot = (uint32_t)((h >> 8) & 0xFF);
+  *out_size_class = (uint32_t)(h & 0xFF);
+  return (Slab*)(uintptr_t)(h >> 16);
+}
+
+/* ------------------------------ Allocation ------------------------------ */
 
 /*
   Phase 1.5 Allocation Strategy:
@@ -432,10 +447,7 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
       
       void* p = slab_slot_ptr(cur, idx);
       if (out) {
-        out->slab = cur;
-        out->slot = idx;
-        out->size_class = (uint32_t)ci;
-        // out->slab_version = slab_version;  /* Use early-captured version */
+        *out = encode_handle(cur, idx, (uint32_t)ci);
       }
       return p;
     }
@@ -503,10 +515,7 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
 
     void* p = slab_slot_ptr(s, idx);
     if (out) {
-      out->slab = s;
-      out->slot = idx;
-      out->size_class = (uint32_t)ci;
-      // out->slab_version = slab_version;  /* Use early-captured version */
+      *out = encode_handle(s, idx, (uint32_t)ci);
     }
     return p;
   }
@@ -525,18 +534,22 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
     - Slabs stay mapped during allocator lifetime for safe validation
 */
 bool free_obj(SlabAllocator* a, SlabHandle h) {
-  if (!h.slab) return false;
-  if (h.size_class >= (uint32_t)k_num_classes) return false;
+  if (h == 0) return false;  /* NULL handle */
+  
+  /* Decode opaque handle */
+  uint32_t slot, size_class;
+  Slab* s = decode_handle(h, &slot, &size_class);
+  
+  if (size_class >= (uint32_t)k_num_classes) return false;
 
-  SizeClassAlloc* sc = &a->classes[h.size_class];
-  Slab* s = (Slab*)h.slab;  /* Cast from void* (public) to Slab* (internal) */
+  SizeClassAlloc* sc = &a->classes[size_class];
   
   /* Validate slab magic - safe because slabs stay mapped during runtime */
   if (atomic_load_explicit(&s->magic, memory_order_relaxed) != SLAB_MAGIC) return false;
 
   /* Precise transition detection: get previous free_count from fetch_add */
   uint32_t prev_fc = 0;
-  if (!slab_free_slot_atomic(s, h.slot, &prev_fc)) return false;
+  if (!slab_free_slot_atomic(s, slot, &prev_fc)) return false;
 
   /* New free_count is prev_fc + 1 */
   uint32_t new_fc = prev_fc + 1;
