@@ -236,7 +236,7 @@ SlabAllocator* slab_allocator_create(void);
  *   PerfCounters pc;
  *   get_perf_counters(alloc, class_idx, &pc);
  *   uint64_t net_slabs = pc.new_slab_count - pc.empty_slab_recycled;
- *   if (net_slabs > expected) { /* potential leak */ }
+ *   if (net_slabs > expected) { potential_leak(); }
  * 
  * THREAD SAFETY: Caller must ensure no concurrent operations.
  */
