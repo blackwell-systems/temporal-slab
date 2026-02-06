@@ -14,6 +14,7 @@ src/smoke_tests_tsan
 src/churn_test
 src/test_public_api
 src/test_struct_layout
+src/test_malloc_wrapper
 
 # Test outputs
 *.log

@@ -605,6 +605,36 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   return true;
 }
 
+/* ------------------------------ Malloc-style wrapper ------------------------------ */
+
+void* slab_malloc(SlabAllocator* a, size_t size) {
+  /* Reserve 8 bytes for handle header */
+  if (size == 0 || size > 504) return NULL;  /* Max: 512 - 8 = 504 bytes */
+  
+  uint32_t alloc_size = (uint32_t)(size + sizeof(SlabHandle));
+  SlabHandle h;
+  void* obj = alloc_obj(a, alloc_size, &h);
+  if (!obj) return NULL;
+  
+  /* Store handle in first 8 bytes */
+  *(SlabHandle*)obj = h;
+  
+  /* Return pointer after header */
+  return (void*)((uint8_t*)obj + sizeof(SlabHandle));
+}
+
+void slab_free(SlabAllocator* a, void* ptr) {
+  if (!ptr) return;
+  
+  /* Read handle from 8 bytes before user pointer */
+  SlabHandle h = *(SlabHandle*)((uint8_t*)ptr - sizeof(SlabHandle));
+  
+  /* Free using handle (validates and frees) */
+  free_obj(a, h);
+}
+
+/* ------------------------------ Cleanup ------------------------------ */
+
 void allocator_destroy(SlabAllocator* a) {
   for (size_t i = 0; i < k_num_classes; i++) {
     SizeClassAlloc* sc = &a->classes[i];
