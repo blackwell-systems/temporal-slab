@@ -4,14 +4,46 @@ A high-performance slab allocator designed for **sustained allocation/free churn
 
 ZNS-Slab provides a lock-free fast path for allocation, conservative recycling for correctness, and explicit safety guarantees for real-world service workloads.
 
-## Why ZNS-Slab
+## Why ZNS-Slab Exists
 
-Most general-purpose allocators optimize for throughput, not stability under churn. In long-running services, this leads to:
-- RSS growth over time
-- Tail latency spikes from mmap/munmap
-- Undefined behavior on stale or double frees
+### Fragmentation as Entropy
 
-ZNS-Slab is built for the opposite trade-off: **predictability, safety, and bounded memory usage under sustained churn**.
+In long-running systems, memory fragmentation is not a bug—it is entropy.
+
+Traditional allocators (e.g. malloc) treat memory as a spatial problem: they search for holes large enough to satisfy each allocation request. Over time, this leads to spatial fragmentation: memory resembles "Swiss cheese"—plenty of free space in aggregate, but scattered into unusable fragments. Allocation cost rises, cache locality degrades, and allocator metadata grows.
+
+More subtle—and more damaging—is temporal fragmentation.
+
+In conventional allocators, objects with vastly different lifetimes are often placed adjacent to one another. When a short-lived object is freed, its memory cannot be efficiently reclaimed if neighboring objects are long-lived. Pages accumulate mixed lifetimes and cannot be reused or released cleanly.
+
+ZNS-Slab addresses this by organizing allocation around temporal affinity instead of spatial holes.
+
+Objects are grouped into slabs based on when they are allocated, implicitly aligning their lifetimes. Rather than searching for holes, allocation proceeds sequentially within a slab. When the objects in a slab expire, the slab becomes empty as a unit and can be safely recycled.
+
+This shifts allocation from a reactive search problem to a predictive layout strategy:
+
+- No hole searching in fragmented address space
+- No mixing of unrelated lifetimes within a slab
+- Clear, deterministic reuse boundaries
+
+Traditional allocators fight entropy by constantly reordering memory. ZNS-Slab manages entropy by ensuring objects expire in an organized way.
+
+### The Missing Middle
+
+Existing ZNS systems operate at file or extent granularity. At small object sizes (64–256 bytes), metadata and tracking costs dominate and destroy cache locality.
+
+ZNS-Slab moves lifetime-aware placement to the allocator layer, where object-scale decisions are cheap and precise. This fills the missing middle between memory allocators and lifetime-aware storage systems.
+
+### Substrate, Not Policy
+
+ZNS-Slab does not require applications to provide lifetime hints. Lifetime information is implicit in allocation and reuse patterns.
+
+By managing memory at the slab level, the allocator already knows:
+- When objects are created
+- When groups of objects become unused
+- When entire slabs can be safely recycled
+
+This makes ZNS-Slab a substrate that higher layers can build on, not a policy engine that applications must tune.
 
 **Key outcomes:**
 - Bounded RSS under churn (2.2% growth over 1000 cycles)
@@ -124,6 +156,18 @@ Fixed size classes optimized for common object sizes:
 - Malloc wrapper: **504 bytes** (512 - 8 byte header for handle storage)
 
 ## Architecture
+
+### Alignment Across the Hierarchy
+
+ZNS-Slab applies a single organizing principle—temporal affinity—across the memory hierarchy:
+
+- Objects are grouped by expected lifetime
+- Slabs act as the unit of allocation, reuse, and eventual release
+- The same model extends naturally from DRAM to PMEM or CXL memory
+
+This mirrors how zone-based storage groups data by lifetime at larger granularities, but operates at the scale of cache lines and pages.
+
+**ZNS-Slab is ZNS-inspired rather than ZNS-dependent:** it delivers the benefits of lifetime-aware placement without requiring specific hardware.
 
 ### Memory Layout
 - **Slab = 4KB page** with header, bitmap, and object slots
