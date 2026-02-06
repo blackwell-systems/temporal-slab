@@ -654,7 +654,7 @@ void get_perf_counters(SlabAllocator* a, uint32_t size_class, PerfCounters* out)
   out->current_partial_null = atomic_load_explicit(&sc->current_partial_null, memory_order_relaxed);
   out->current_partial_full = atomic_load_explicit(&sc->current_partial_full, memory_order_relaxed);
   out->empty_slab_recycled = atomic_load_explicit(&sc->empty_slab_recycled, memory_order_relaxed);
-  out->empty_slab_unmapped = atomic_load_explicit(&sc->empty_slab_cache_overflowed, memory_order_relaxed);
+  out->empty_slab_overflowed = atomic_load_explicit(&sc->empty_slab_cache_overflowed, memory_order_relaxed);
 }
 
 /* ------------------------------ RSS (Linux) ------------------------------ */
