@@ -267,21 +267,6 @@ It does **not** implement:
 
 Higher-level systems (caches, tiered allocators, eviction frameworks) are expected to be built *on top* of temporal-slab in separate projects.
 
-## Project Status
-
-temporal-slab is stable and production-ready for:
-- Fixed-size object allocation
-- Long-running services with sustained churn
-- Systems requiring predictable RSS behavior
-
-**Test coverage:**
-- Single-thread correctness: PASS
-- Multi-thread correctness: PASS (8 threads × 500K iterations)
-- Handle validation: PASS
-- Malloc wrapper: PASS
-- RSS bounds: PASS (2.2% growth over 1000 cycles)
-
-Future work is incremental and opt-in (additional size classes, optional wrappers).
 
 ## Limitations
 
