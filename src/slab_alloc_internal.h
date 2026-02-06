@@ -78,8 +78,7 @@ struct SizeClassAlloc {
   _Atomic uint64_t new_slab_count;
   _Atomic uint64_t list_move_partial_to_full;
   _Atomic uint64_t list_move_full_to_partial;
-  _Atomic uint64_t current_partial_null;
-  _Atomic uint64_t current_partial_full;
+  _Atomic uint64_t current_partial_miss;  /* Will split into null+full in next commit */
 
   /* Slab cache: free page stack to avoid mmap() in hot path */
   Slab** slab_cache;
@@ -91,7 +90,8 @@ struct SizeClassAlloc {
 /* Main allocator structure */
 struct SlabAllocator {
   SlabConfig config;
-  SizeClassAlloc* classes;  /* Array of size class allocators */
+  uint32_t num_classes;
+  SizeClassAlloc* classes;  /* Dynamically allocated array */
 };
 
 /* Internal handle mapping */
