@@ -1,5 +1,11 @@
 # ZNS-Slab Architecture
 
+## Why This Exists
+
+Traditional allocators optimize for spatial reuse and hole-finding. ZNS-Slab optimizes for **temporal coherence**: grouping objects by lifetime so memory is reclaimed in whole slabs instead of fragments.
+
+This document describes the allocator's design and its role as a foundation for higher-level systems.
+
 ## Current Scope
 
 ZNS-Slab is a **lifetime-aware memory allocator** for fixed-size objects. It provides:
@@ -10,6 +16,27 @@ ZNS-Slab is a **lifetime-aware memory allocator** for fixed-size objects. It pro
 - Dual APIs (handle-based and malloc-style)
 
 This document describes the current implementation and the path to extended functionality.
+
+## Non-Goals
+
+ZNS-Slab intentionally does not attempt:
+- Variable-sized allocation (use jemalloc/tcmalloc)
+- Fine-grained object migration between tiers
+- General-purpose malloc replacement
+- Predicting object lifetimes heuristically
+
+Lifetime alignment emerges naturally from allocation patterns, not policy.
+
+## Current Use Cases
+
+ZNS-Slab is well-suited for:
+- Session stores
+- Cache metadata
+- Connection tracking
+- Deduplication tables
+- High-churn object registries
+
+These workloads benefit from bounded RSS and predictable latency under sustained churn.
 
 ## Core Allocator Design
 
@@ -119,6 +146,8 @@ void promote_slab(TieredAllocator* ta, Slab* slab, int from_tier, int to_tier) {
 - Entire slab moves atomically (no partial state)
 - Aligned lifetimes mean hot/cold slabs are naturally separable
 - FULL slabs can move without coordination (not published)
+
+**Critical constraint:** No code in this repo (ZNS-Slab) assumes tiers exist. Tiering is an optional higher-level orchestration layer.
 
 ### Layer 3: Eviction Policy
 
