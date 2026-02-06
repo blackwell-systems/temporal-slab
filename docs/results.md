@@ -221,13 +221,47 @@ Full instructions in [benchmarks/README.md](../benchmarks/README.md).
 
 ## Baseline Comparisons
 
-*Coming soon: Side-by-side comparison with jemalloc, tcmalloc, and system malloc*
+### Extreme Churn Stress Test
 
-Planned metrics:
-- Latency (p50, p99, p999) across allocators
-- RSS growth under churn test
-- Fragmentation overhead
-- Scaling behavior (threads vs latency)
+**See full analysis:** [temporal-slab-allocator-bench](https://github.com/blackwell-systems/temporal-slab-allocator-bench)
+
+Comparison against system_malloc under pathological conditions (1M objects × 100 cycles):
+
+![Latency Comparison](benchmark-results/latency_comparison.png)
+
+![RSS Comparison](benchmark-results/rss_comparison.png)
+
+**Key Findings:**
+
+| Metric | system_malloc | temporal_slab | Winner |
+|--------|---------------|---------------|--------|
+| p50 allocation | 21ns | 32ns | system_malloc (52% faster) |
+| p99 allocation | 1,238ns | 374ns | **temporal_slab (3.3x better)** |
+| p999 allocation | 3,813ns | 959ns | **temporal_slab (4.0x better)** |
+| RSS growth | 111,553% | 125,741% | Neither (both pathological) |
+
+**Interpretation:**
+
+This extreme workload (1M objects × 100 cycles = 200M operations) intentionally exceeds reasonable design limits to find breaking points:
+
+- **temporal_slab strength**: Consistent tail latency even under extreme stress (p99 3.3x better)
+- **system_malloc strength**: Fast median allocation (21ns vs 32ns)
+- **Both struggle**: RSS growth exceeds 100,000% showing FIFO pattern defeats lifetime-aware placement
+
+**Realistic workload scale:**
+- Typical: 10K-100K objects × 10-20 cycles
+- This test: 10-100x over typical scale
+- Purpose: Stress testing, not validation of typical performance
+
+### Planned Comparisons
+
+*Coming soon: jemalloc and tcmalloc comparison at realistic scale*
+
+Target metrics:
+- Latency (p50, p99, p999) at 100K objects × 10 cycles
+- RSS growth under realistic churn patterns
+- Multi-threaded scaling (1-16 threads)
+- Mixed allocation patterns (not pure FIFO)
 
 ## Hardware Sensitivity
 
