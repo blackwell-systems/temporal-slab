@@ -290,10 +290,14 @@ temporal-slab is designed for subsystems with fixed-size allocation patterns:
 - 88.9% space efficiency (11.1% internal fragmentation)
 - 8 size classes cover 48-768 byte range with <25% waste per allocation
 
-**Not recommended for:**
-- Variable-size allocations (use jemalloc/tcmalloc)
-- Objects >768 bytes
-- Systems requiring NUMA-local allocation
+**When jemalloc/tcmalloc are better choices:**
+- Variable-size allocations (temporal-slab: fixed classes only)
+- Objects >768 bytes (temporal-slab: specialized for small objects)
+- NUMA systems (temporal-slab: no per-node awareness)
+- Drop-in malloc replacement (jemalloc: LD_PRELOAD, huge ecosystem)
+- General-purpose workloads (jemalloc: decades of production tuning)
+
+**Core trade-off:** Compared to jemalloc, temporal-slab sacrifices generality in exchange for deterministic latency and bounded RSS under sustained churn.
 
 ## Non-Goals
 
@@ -303,7 +307,7 @@ temporal-slab intentionally does not attempt to:
 - Perform background compaction or relocation
 - Guess object lifetimes heuristically
 
-It is designed to be predictable, conservative, and explicit.
+It is designed to be predictable, conservative, and explicit—a specialized tool for a specific class of problems.
 
 ## Build and Test
 
