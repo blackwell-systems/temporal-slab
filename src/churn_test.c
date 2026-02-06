@@ -138,9 +138,9 @@ static void churn_test(void) {
   printf("\n--- Phase 2.1 Recycling Counters ---\n");
   printf("New slabs allocated:        %" PRIu64 "\n", counters.new_slab_count);
   printf("Empty slabs recycled:       %" PRIu64 "\n", counters.empty_slab_recycled);
-  printf("Empty slabs unmapped:       %" PRIu64 "\n", counters.empty_slab_unmapped);
+  printf("Empty slabs overflowed:     %" PRIu64 " (cache full)\n", counters.empty_slab_overflowed);
   
-  uint64_t total_recycled = counters.empty_slab_recycled + counters.empty_slab_unmapped;
+  uint64_t total_recycled = counters.empty_slab_recycled + counters.empty_slab_overflowed;
   if (total_recycled > 0) {
     double recycle_ratio = (double)total_recycled / (double)counters.new_slab_count * 100.0;
     printf("Recycling ratio:            %.1f%% (recycled / allocated)\n", recycle_ratio);

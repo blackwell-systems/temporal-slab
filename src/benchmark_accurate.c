@@ -260,9 +260,9 @@ static void benchmark_latency_accurate(void) {
   /* Phase 2.1: Empty slab recycling */
   printf("\n--- Phase 2.1: Empty Slab Recycling ---\n");
   printf("Empty slabs recycled:       %" PRIu64 " (pushed to cache)\n", counters.empty_slab_recycled);
-  printf("Empty slabs unmapped:       %" PRIu64 " (cache was full)\n", counters.empty_slab_unmapped);
+  printf("Empty slabs overflowed:     %" PRIu64 " (cache full, moved to overflow list)\n", counters.empty_slab_overflowed);
   
-  uint64_t total_empty = counters.empty_slab_recycled + counters.empty_slab_unmapped;
+  uint64_t total_empty = counters.empty_slab_recycled + counters.empty_slab_overflowed;
   if (total_empty > 0) {
     double recycle_rate = (double)counters.empty_slab_recycled / (double)total_empty * 100.0;
     printf("Cache hit rate on recycle:  %.1f%%\n", recycle_rate);
@@ -275,7 +275,7 @@ static void benchmark_latency_accurate(void) {
     printf("  - Net new slabs: %" PRIu64 " (allocated %" PRIu64 ", recycled %" PRIu64 ")\n",
            net_slabs, counters.new_slab_count, total_empty);
     printf("  - p99/p999 spikes from mmap calls (%" PRIu64 " mmap, %" PRIu64 " munmap)\n", 
-           counters.new_slab_count, counters.empty_slab_unmapped);
+           counters.new_slab_count, counters.empty_slab_overflowed);
   }
   if (counters.slow_path_hits > counters.new_slab_count) {
     printf("  - Additional slow path hits (%" PRIu64 ") from list contention\n", 
