@@ -36,6 +36,20 @@
 #define CHURN_SIZE (10 * 1000)      /* Free and reallocate 10K objects per cycle */
 #define RSS_SAMPLE_INTERVAL 10      /* Sample RSS every 10 cycles */
 
+/* CSV export */
+static FILE* g_csv_file = NULL;
+
+static void csv_write_header(void) {
+  if (!g_csv_file) return;
+  fprintf(g_csv_file, "allocator,cycle,rss_mib,slabs_allocated,slabs_recycled,slabs_overflowed\n");
+}
+
+static void csv_write_sample(int cycle, double rss_mib, uint64_t allocated, uint64_t recycled, uint64_t overflowed) {
+  if (!g_csv_file) return;
+  fprintf(g_csv_file, "temporal-slab,%d,%.2f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+          cycle, rss_mib, allocated, recycled, overflowed);
+}
+
 /* Churn test: allocate/free in patterns that create empty slabs */
 static void churn_test(void) {
   printf("\n=== Phase 2.1 Churn Test ===\n\n");
@@ -113,7 +127,12 @@ static void churn_test(void) {
       if (rss < rss_min) rss_min = rss;
       if (rss > rss_max) rss_max = rss;
       
+      /* Get recycling stats for 128B size class (index 2) */
+      PerfCounters pc;
+      get_perf_counters(&a, 2, &pc);
+      
       printf("  Cycle %4d: RSS = %.2f MiB\n", cycle, rss_mib);
+      csv_write_sample(cycle, rss_mib, pc.new_slab_count, pc.empty_slab_recycled, pc.empty_slab_overflowed);
       sample_count++;
     }
   }
@@ -167,7 +186,32 @@ static void churn_test(void) {
   allocator_destroy(&a);
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+  /* Parse --csv argument */
+  const char* csv_path = NULL;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
+      csv_path = argv[i + 1];
+      i++;
+    }
+  }
+  
+  /* Open CSV file if requested */
+  if (csv_path) {
+    g_csv_file = fopen(csv_path, "w");
+    if (!g_csv_file) {
+      fprintf(stderr, "Failed to open CSV file: %s\n", csv_path);
+      return 1;
+    }
+    csv_write_header();
+  }
+  
   churn_test();
+  
+  if (g_csv_file) {
+    fclose(g_csv_file);
+    printf("\nCSV written to: %s\n", csv_path);
+  }
+  
   return 0;
 }
