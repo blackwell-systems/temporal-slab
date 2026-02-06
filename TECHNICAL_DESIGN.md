@@ -62,14 +62,19 @@ Total Size: 4096 bytes (one OS page)
 
 ### Slab Size Classes
 
-| Class | Object Size | Objects/Slab | Bitmap Bits | Efficiency |
-|-------|-------------|--------------|-------------|------------|
-| Tiny  | 64B         | 62           | 64 bits     | 96.9%      |
-| Small | 128B        | 31           | 32 bits     | 97.5%      |
-| Medium| 256B        | 15           | 16 bits     | 96.9%      |
-| Large | 512B        | 7            | 8 bits      | 93.8%      |
+| Class  | Object Size | Objects/Slab | Per-Object Overhead | Efficiency |
+|--------|-------------|--------------|---------------------|------------|
+| Tiny   | 64B         | 61           | 3.1 bytes (4.9%)    | 95.3%      |
+| Small  | 128B        | 30           | 6.4 bytes (5.0%)    | 93.8%      |
+| Medium | 256B        | 15           | 12.8 bytes (5.0%)   | 93.8%      |
+| Large  | 512B        | 7            | 27.4 bytes (5.4%)   | 87.5%      |
 
-**Efficiency = (Objects × Size) / 4096 bytes**
+**Calculations**:
+- `Objects/Slab = floor((4096 - 192) / Object Size)`  where 192 = Header (64B) + Bitmap (128B)
+- `Efficiency = (Objects × Size) / 4096 bytes`
+- `Overhead = 192 / Objects`
+
+**See [BENCHMARKS.md](./BENCHMARKS.md) for detailed analysis and validation plan.**
 
 ---
 

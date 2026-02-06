@@ -4,7 +4,9 @@ A cache system optimized for small objects, designed to outperform Redis through
 
 **Important**: ZNS-Slab is a cache system, not a system of record. It provides fast, memory-efficient storage for ephemeral data.
 
-**Target Performance**: 4x faster access, 20x better memory efficiency for 128-byte objects.
+**Target Performance**: 2-3x faster allocation, <5% memory overhead for 128-byte objects.
+
+**Note**: All performance claims are design targets for Phase 1. See [BENCHMARKS.md](./BENCHMARKS.md) for methodology and validated results (pending implementation).
 
 ---
 
@@ -72,23 +74,27 @@ Complete implementation specification including:
 ## Why This Matters
 
 ### The Problem
-Redis stores a 128-byte string with 62% overhead:
-- Actual data: 128 bytes
-- Metadata: 64 bytes  
-- Allocator overhead: 16 bytes
-- Total: 208 bytes
+General-purpose allocators and cache systems incur significant per-object overhead for small objects:
+- **Object headers**: Type info, refcount, metadata (16-24 bytes)
+- **Allocator metadata**: Size classes, alignment padding (10-30%)
+- **Fragmentation**: Memory holes from varied lifetimes
+- **Cache locality**: Poor packing leads to L1 cache misses
 
 ### The Solution
-ZNS-Slab packs objects into 4KB slabs with 3% overhead:
-- 31 objects per slab
-- Bitmap allocation (4 bytes per object)
-- Zero fragmentation
-- Cache-line aligned
+ZNS-Slab packs objects into 4KB slabs with minimal overhead:
+- **30 objects per slab** (128-byte size class)
+- **192 bytes total metadata** (64B header + 128B bitmap)
+- **6.4 bytes per object** overhead (192 / 30)
+- **Zero fragmentation** (fixed-size slots)
+- **Cache-line aligned** (64-byte boundaries)
 
-### The Difference
-- **20x** reduction in memory overhead
-- **4x** faster GET operations (50ns vs 200ns)
-- **10x** fewer cache misses
+### The Targets (Phase 1)
+- **<5% memory overhead** (vs estimated 30-50% for Redis/malloc)
+- **2-3x faster allocation** (target <100ns p99 vs malloc ~150-300ns)
+- **Zero fragmentation** (guaranteed by design)
+- **Predictable latency** (no GC pauses, no compaction)
+
+**See [BENCHMARKS.md](./BENCHMARKS.md) for detailed analysis and measurement plan.**
 
 ## Implementation Roadmap
 
@@ -143,7 +149,7 @@ Then review [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md) for implementation deta
 
 If you can tell an interviewer:
 
-> "I identified that Redis has 62% memory overhead for small objects due to allocator fragmentation. I designed a specialized slab allocator that packs sub-4KB objects into cache-aligned pages, reducing overhead to 3% and achieving 4x faster access by maximizing CPU L1 cache hits."
+> "I designed a specialized slab allocator for sub-4KB objects that reduces per-object overhead to <5% through lifetime-aligned allocation and cache-line packing. By grouping objects with shared lifecycles into fixed-size slabs, the system eliminates fragmentation, achieves O(1) bulk deletion, and maximizes CPU L1 cache locality. This demonstrates systems-level thinking about memory hierarchy and hardware alignment."
 
 You're not a "LeetCode person." You're a **Systems Architect**.
 
