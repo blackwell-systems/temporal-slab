@@ -293,6 +293,65 @@ static void benchmark_latency_accurate(void) {
   allocator_destroy(&a);
 }
 
+/* ------------------------------ Size Class Fragmentation Analysis ------------------------------ */
+
+static void benchmark_fragmentation(void) {
+  printf("\n=== Internal Fragmentation Analysis ===\n\n");
+  
+  /* Test workload: realistic size distribution */
+  const uint32_t test_sizes[] = {
+    48, 56, 64, 72, 80, 88, 96,     /* Small objects */
+    112, 128, 144, 160, 176, 192,    /* Medium objects */
+    224, 256, 288, 320, 352, 384,    /* Large objects */
+    448, 512, 576, 640, 704, 768     /* XL objects */
+  };
+  const size_t num_test_sizes = sizeof(test_sizes) / sizeof(test_sizes[0]);
+  
+  /* Size classes (from slab_alloc.c) */
+  const uint32_t size_classes[] = {64, 96, 128, 192, 256, 384, 512, 768};
+  const size_t num_classes = 8;
+  
+  printf("%-12s %-12s %-12s %-12s\n", "Requested", "Rounded", "Wasted", "Efficiency");
+  printf("%-12s %-12s %-12s %-12s\n", "--------", "-------", "------", "----------");
+  
+  uint64_t total_requested = 0;
+  uint64_t total_wasted = 0;
+  
+  for (size_t i = 0; i < num_test_sizes; i++) {
+    uint32_t requested = test_sizes[i];
+    
+    /* Find smallest class that fits */
+    uint32_t rounded = 0;
+    for (size_t j = 0; j < num_classes; j++) {
+      if (requested <= size_classes[j]) {
+        rounded = size_classes[j];
+        break;
+      }
+    }
+    
+    if (rounded == 0) {
+      printf("%-12u %-12s %-12s %-12s\n", requested, "TOO BIG", "-", "-");
+      continue;
+    }
+    
+    uint32_t wasted = rounded - requested;
+    double efficiency = (double)requested / (double)rounded * 100.0;
+    
+    total_requested += requested;
+    total_wasted += wasted;
+    
+    printf("%-12u %-12u %-12u %.1f%%\n", requested, rounded, wasted, efficiency);
+  }
+  
+  double avg_efficiency = (double)total_requested / (double)(total_requested + total_wasted) * 100.0;
+  
+  printf("\n--- Summary ---\n");
+  printf("Total requested:  %lu bytes\n", total_requested);
+  printf("Total wasted:     %lu bytes\n", total_wasted);
+  printf("Avg efficiency:   %.1f%%\n", avg_efficiency);
+  printf("Avg fragmentation: %.1f%% internal waste\n", 100.0 - avg_efficiency);
+}
+
 /* ------------------------------ Main ------------------------------ */
 
 int main(void) {
@@ -301,6 +360,7 @@ int main(void) {
   
   benchmark_rss_accurate();
   benchmark_latency_accurate();
+  benchmark_fragmentation();
   
   printf("\n=== All Benchmarks Complete ===\n");
   return 0;

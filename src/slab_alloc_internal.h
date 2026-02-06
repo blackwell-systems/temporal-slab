@@ -106,7 +106,7 @@ struct SizeClassAlloc {
 
 /* Main allocator structure */
 struct SlabAllocator {
-  SizeClassAlloc classes[4];
+  SizeClassAlloc classes[8];  /* Expanded from 4 to 8 for HFT granularity */
 };
 
 #endif /* SLAB_ALLOC_INTERNAL_H */

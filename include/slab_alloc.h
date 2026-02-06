@@ -30,7 +30,7 @@ typedef struct SlabAllocator SlabAllocator;
  * Handle encoding (64-bit):
  *   [63:16] Slab pointer (48 bits, user-space addresses)
  *   [15:8]  Slot index (8 bits, max 255 objects/slab)
- *   [7:0]   Size class (8 bits, currently 0-3)
+ *   [7:0]   Size class (8 bits, currently 0-7)
  * 
  * Zero handle is invalid (NULL sentinel).
  * Handles remain valid for validation even after free (slabs stay mapped).
@@ -74,16 +74,16 @@ bool free_obj(SlabAllocator* alloc, SlabHandle handle);
  *   slab_free(alloc, p);
  * 
  * Overhead: 8 bytes per allocation (handle storage)
- * Max usable size: 512 - 8 = 504 bytes (largest size class minus header)
+ * Max usable size: 768 - 8 = 760 bytes (largest size class minus header)
  * 
- * Returns NULL if size > 504 bytes or allocation fails.
+ * Returns NULL if size > 760 bytes or allocation fails.
  */
 void* slab_malloc(SlabAllocator* alloc, size_t size);
 void slab_free(SlabAllocator* alloc, void* ptr);
 
 /* -------------------- Instrumentation -------------------- */
 
-/* Get performance counters for size class index (0-3) */
+/* Get performance counters for size class index (0-7) */
 void get_perf_counters(SlabAllocator* alloc, uint32_t size_class, PerfCounters* out);
 
 /* -------------------- Utilities -------------------- */

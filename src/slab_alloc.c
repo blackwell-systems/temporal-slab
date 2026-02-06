@@ -33,9 +33,18 @@
 
 _Static_assert((SLAB_PAGE_SIZE & (SLAB_PAGE_SIZE - 1)) == 0, "SLAB_PAGE_SIZE must be power of two");
 
-/* Size classes (Phase 1) */
-static const uint32_t k_size_classes[] = {64u, 128u, 256u, 512u};
+/* Size classes (HFT-optimized: sub-100 byte granularity) */
+static const uint32_t k_size_classes[] = {64u, 96u, 128u, 192u, 256u, 384u, 512u, 768u};
 static const size_t   k_num_classes   = sizeof(k_size_classes) / sizeof(k_size_classes[0]);
+
+/* O(1) lookup table: maps size -> class index
+ * Max supported size: 768 bytes
+ * Granularity: 1 byte (768 entries)
+ * Memory cost: 768 bytes (fits in L1 cache)
+ */
+#define MAX_ALLOC_SIZE 768u
+static uint8_t k_class_lookup[MAX_ALLOC_SIZE + 1];
+static bool k_lookup_initialized = false;
 
 /* ------------------------------ Utilities ------------------------------ */
 
@@ -55,11 +64,30 @@ static inline uint32_t ctz32(uint32_t x) {
 #endif
 }
 
-static inline int class_index_for_size(uint32_t sz) {
-  for (size_t i = 0; i < k_num_classes; i++) {
-    if (sz <= k_size_classes[i]) return (int)i;
+/* Initialize O(1) class lookup table at first use */
+static void init_class_lookup(void) {
+  if (k_lookup_initialized) return;
+  
+  /* For each byte size, find smallest class that fits */
+  for (uint32_t sz = 1; sz <= MAX_ALLOC_SIZE; sz++) {
+    uint8_t class_idx = 0xFF; /* invalid */
+    for (size_t i = 0; i < k_num_classes; i++) {
+      if (sz <= k_size_classes[i]) {
+        class_idx = (uint8_t)i;
+        break;
+      }
+    }
+    k_class_lookup[sz] = class_idx;
   }
-  return -1;
+  k_class_lookup[0] = 0xFF; /* zero-size is invalid */
+  
+  k_lookup_initialized = true;
+}
+
+/* O(1) class index lookup (deterministic, no branches per class) */
+static inline int class_index_for_size(uint32_t sz) {
+  if (sz == 0 || sz > MAX_ALLOC_SIZE) return -1;
+  return (int)k_class_lookup[sz];
 }
 
 /* ------------------------------ Intrusive list operations ------------------------------ */
@@ -246,6 +274,9 @@ void slab_allocator_free(SlabAllocator* a) {
 
 /* Init/destroy: for internal use or when caller provides storage */
 void allocator_init(SlabAllocator* a) {
+  /* Initialize O(1) class lookup table (once per process) */
+  init_class_lookup();
+  
   memset(a, 0, sizeof(*a));
   for (size_t i = 0; i < k_num_classes; i++) {
     a->classes[i].object_size = k_size_classes[i];
