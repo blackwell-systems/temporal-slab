@@ -9,15 +9,17 @@ The allocator provides a lock-free fast path, conservative recycling guarantees,
 - Lock-free allocation with sub-100ns median latency
 - Safe handle validation (no crashes on invalid frees)
 - Conservative recycling (correctness over aggressive reclamation)
+- **Epoch-based temporal grouping** - 16-epoch ring buffer for lifetime separation
 
 **Not yet competitive:**
 - Mixed-size, mixed-lifetime workloads (see benchmark results)
 - General-purpose allocator replacement
 
 **Roadmap:**
-- Epoch-based placement mechanism for true lifetime-aware grouping
+- `epoch_close()` API for aggressive recycling of expired epochs
 - Per-class hot slab ring for reduced contention
 - Configurable size class sets
+- Lazy compaction for nearly-empty slabs
 
 ## Why temporal-slab Exists
 
@@ -100,7 +102,7 @@ These guarantees prioritize correctness and observability over aggressive reclam
 SlabAllocator* alloc = slab_allocator_create();
 
 SlabHandle h;
-void* p = alloc_obj(alloc, 128, &h);
+void* p = alloc_obj_epoch(alloc, 128, 0, &h);  // Epoch 0 for general use
 // use p
 free_obj(alloc, h);
 
@@ -114,9 +116,38 @@ slab_allocator_free(alloc);
 
 SlabAllocator* alloc = slab_allocator_create();
 
-void* p = slab_malloc(alloc, 128);
+void* p = slab_malloc_epoch(alloc, 128, 0);  // Epoch 0 for general use
 // use p
 slab_free(alloc, p);
+
+slab_allocator_free(alloc);
+```
+
+### Epoch-aware API (temporal grouping)
+
+```c
+#include <slab_alloc.h>
+
+SlabAllocator* alloc = slab_allocator_create();
+
+// Long-lived backbone data in epoch 0
+void* backbone = slab_malloc_epoch(alloc, 128, 0);
+
+// Short-lived session data in rotating epochs
+EpochId current = epoch_current(alloc);  // Get active epoch (starts at 0)
+void* session = slab_malloc_epoch(alloc, 128, current);
+
+// Advance epoch to "close" previous epoch (ring buffer wraps at 16)
+epoch_advance(alloc);
+
+// Next allocations use new epoch
+EpochId next = epoch_current(alloc);  // Returns 1
+void* new_session = slab_malloc_epoch(alloc, 128, next);
+
+// Free in any order - epoch tracked per object
+slab_free(alloc, session);
+slab_free(alloc, new_session);
+slab_free(alloc, backbone);
 
 slab_allocator_free(alloc);
 ```
@@ -126,6 +157,7 @@ slab_allocator_free(alloc);
 cd src/
 make
 ./smoke_tests    # Validate correctness
+./test_epochs    # Validate epoch isolation and lifecycle
 ./churn_test     # Validate RSS bounds
 ```
 
@@ -228,21 +260,89 @@ void allocator_destroy(SlabAllocator* alloc);
 
 ### Handle-Based API (zero overhead)
 ```c
-void* alloc_obj(SlabAllocator* alloc, uint32_t size, SlabHandle* out_handle);
+void* alloc_obj_epoch(SlabAllocator* alloc, uint32_t size, EpochId epoch, SlabHandle* out_handle);
 bool free_obj(SlabAllocator* alloc, SlabHandle handle);
 ```
 - Zero overhead (no hidden headers)
 - Explicit handle management
 - Returns false on invalid/stale handles
+- Epoch parameter for temporal grouping
 
 ### Malloc-Style API (8-byte overhead)
 ```c
-void* slab_malloc(SlabAllocator* alloc, size_t size);
+void* slab_malloc_epoch(SlabAllocator* alloc, size_t size, EpochId epoch);
 void slab_free(SlabAllocator* alloc, void* ptr);
 ```
 - 8-byte header overhead per allocation
-- Max size: 504 bytes
+- Max size: 504 bytes (512 - 8 byte header)
 - NULL-safe: `slab_free(a, NULL)` is no-op
+- Epoch parameter for temporal grouping
+
+### Epoch API (temporal grouping)
+```c
+typedef uint32_t EpochId;
+
+EpochId epoch_current(SlabAllocator* alloc);
+void epoch_advance(SlabAllocator* alloc);
+```
+
+**Epoch semantics:**
+- **16-epoch ring buffer** - EpochIds wrap at 16 (0-15)
+- **Temporal grouping** - Objects allocated in same epoch share slabs
+- **Thread-safe** - `epoch_advance()` uses atomic increment
+- **No forced expiration** - Advancing epoch doesn't free objects
+- **Natural drainage** - Old epochs drain as objects are freed
+
+**Use cases:**
+
+**1. Session-based allocation:**
+```c
+// Allocate long-lived server state in epoch 0
+void* server_ctx = slab_malloc_epoch(alloc, 256, 0);
+
+// Rotate epochs every 1000 requests
+for (int i = 0; i < 10000; i++) {
+  if (i % 1000 == 0) epoch_advance(alloc);
+  
+  EpochId e = epoch_current(alloc);
+  void* req_ctx = slab_malloc_epoch(alloc, 128, e);
+  
+  // Process request...
+  
+  slab_free(alloc, req_ctx);
+}
+```
+
+**2. Cache with lifetime buckets:**
+```c
+// Separate short-lived from long-lived cache entries
+EpochId short_lived_epoch = 1;  // Rotates frequently
+EpochId long_lived_epoch = 0;   // Stable
+
+void* hot_entry = slab_malloc_epoch(alloc, 192, short_lived_epoch);
+void* cold_entry = slab_malloc_epoch(alloc, 192, long_lived_epoch);
+```
+
+**3. Message queue with batching:**
+```c
+// Each batch gets its own epoch
+epoch_advance(alloc);  // Start new batch
+EpochId batch = epoch_current(alloc);
+
+for (int i = 0; i < batch_size; i++) {
+  void* msg = slab_malloc_epoch(alloc, 256, batch);
+  enqueue(msg);
+}
+
+// When batch processed, all messages free together
+// Slabs from this epoch become empty as a unit
+```
+
+**Design rationale:**
+- Objects with similar lifetimes → same slab
+- When epoch expires → all objects free together → slabs recycle efficiently
+- No explicit TTL management required
+- Future: `epoch_close()` can enable aggressive recycling of old epochs
 
 ### Performance Counters
 ```c
@@ -332,6 +432,7 @@ It is designed to be predictable, conservative, and explicit—a specialized too
 cd src/
 make                    # Build all tests
 ./smoke_tests          # Correctness tests
+./test_epochs          # Epoch isolation and lifecycle tests
 ./churn_test           # RSS bounds validation
 ./test_malloc_wrapper  # malloc/free API tests
 ./benchmark_accurate   # Performance measurement
@@ -346,6 +447,7 @@ src/
   slab_alloc.c           - Implementation
   slab_alloc_internal.h  - Internal structures
   smoke_tests.c          - Correctness tests
+  test_epochs.c          - Epoch isolation and lifecycle tests
   churn_test.c           - RSS bounds validation
   test_malloc_wrapper.c  - malloc/free API tests
   benchmark_accurate.c   - Performance measurement
