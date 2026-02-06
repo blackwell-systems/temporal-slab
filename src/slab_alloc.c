@@ -282,11 +282,23 @@ void allocator_init(SlabAllocator* a) {
   /* Initialize O(1) class lookup table (once per process) */
   init_class_lookup();
   
-  memset(a, 0, sizeof(*a));
-  
-  /* Initialize global epoch state */
+  /* IMPORTANT: Initialize atomics BEFORE memset (memset on atomics is UB) */
   a->epoch_count = EPOCH_COUNT;
   atomic_store_explicit(&a->current_epoch, 0, memory_order_relaxed);
+  
+  /* Initialize all epochs as ACTIVE (MUST be before memset) */
+  for (uint32_t e = 0; e < EPOCH_COUNT; e++) {
+    atomic_store_explicit(&a->epoch_state[e], EPOCH_ACTIVE, memory_order_relaxed);
+  }
+  
+  /* Zero out non-atomic fields (classes array) */
+  for (size_t i = 0; i < k_num_classes; i++) {
+    a->classes[i].epochs = NULL;
+    a->classes[i].slab_cache = NULL;
+    a->classes[i].cache_size = 0;
+    a->classes[i].cache_capacity = 0;
+    a->classes[i].total_slabs = 0;
+  }
   
   for (size_t i = 0; i < k_num_classes; i++) {
     a->classes[i].object_size = k_size_classes[i];
@@ -474,6 +486,12 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
   if (ci < 0) return NULL;
   
   if (epoch >= a->epoch_count) return NULL;  /* Invalid epoch */
+  
+  /* CRITICAL: Refuse allocations into CLOSING epochs */
+  uint32_t state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_acquire);
+  if (state != EPOCH_ACTIVE) {
+    return NULL;  /* Epoch is not active (draining or invalid state) */
+  }
 
   SizeClassAlloc* sc = &a->classes[(size_t)ci];
   EpochState* es = get_epoch_state(sc, epoch);
@@ -524,6 +542,12 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
 
   /* Slow path: need mutex to pick/create slab (use loop, not recursion) */
   for (;;) {
+    /* Double-check epoch state in slow path (may have changed) */
+    state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_acquire);
+    if (state != EPOCH_ACTIVE) {
+      return NULL;  /* Epoch closed while we were contending */
+    }
+    
     atomic_fetch_add_explicit(&sc->slow_path_hits, 1, memory_order_relaxed);
     pthread_mutex_lock(&sc->lock);
 
@@ -619,12 +643,35 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   /* New free_count is prev_fc + 1 */
   uint32_t new_fc = prev_fc + 1;
 
-  /* Phase 2: Check if slab became empty - recycle FULL-only (provably safe) */
+  /* Phase 2: Check if slab became empty - recycle based on epoch state */
   if (new_fc == s->object_count) {
     pthread_mutex_lock(&sc->lock);
     
-    if (s->list_id == SLAB_LIST_FULL) {
-      /* FULL-list slabs are never published, always safe to recycle */
+    /* Check epoch state for aggressive recycling */
+    uint32_t epoch_state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_acquire);
+    
+    if (epoch_state == EPOCH_CLOSING) {
+      /* OPTION A: Aggressive recycling for CLOSING epochs
+       * Since epoch is CLOSING, we guarantee no new allocations into this epoch.
+       * Therefore, it's safe to recycle empty slabs regardless of list_id.
+       * The current_partial was already nulled in epoch_advance(), so no races. */
+      if (s->list_id == SLAB_LIST_FULL) {
+        list_remove(&es->full, s);
+      } else if (s->list_id == SLAB_LIST_PARTIAL) {
+        list_remove(&es->partial, s);
+      }
+      
+      if (s->list_id != SLAB_LIST_NONE) {
+        s->list_id = SLAB_LIST_NONE;
+        sc->total_slabs--;
+        pthread_mutex_unlock(&sc->lock);
+        
+        /* Push to cache (or overflow if cache full) - outside lock */
+        cache_push(sc, s);
+        return true;
+      }
+    } else if (s->list_id == SLAB_LIST_FULL) {
+      /* ACTIVE epochs: Conservative FULL-only recycling (original behavior) */
       list_remove(&es->full, s);
       s->list_id = SLAB_LIST_NONE;
       sc->total_slabs--;
@@ -634,10 +681,7 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
       cache_push(sc, s);
       return true;
     } else if (s->list_id == SLAB_LIST_PARTIAL) {
-      /* Empty PARTIAL slab: unpublish if current_partial (but do NOT recycle).
-       * This nudges the system to pick a different slab on next slow path,
-       * reducing "empty-but-published" weirdness. The slab stays on PARTIAL
-       * list and will be reused naturally. */
+      /* Empty PARTIAL slab in ACTIVE epoch: unpublish but don't recycle */
       Slab* expected = s;
       (void)atomic_compare_exchange_strong_explicit(
           &es->current_partial, &expected, NULL,
@@ -806,13 +850,27 @@ EpochId epoch_current(SlabAllocator* a) {
 }
 
 void epoch_advance(SlabAllocator* a) {
-  uint32_t old_epoch = atomic_fetch_add_explicit(&a->current_epoch, 1, memory_order_relaxed);
-  /* Ring buffer wrap: modulo epoch_count */
-  uint32_t new_epoch = (old_epoch + 1) % a->epoch_count;
+  uint32_t old_epoch_raw = atomic_fetch_add_explicit(&a->current_epoch, 1, memory_order_relaxed);
+  uint32_t old_epoch = old_epoch_raw % a->epoch_count;
+  uint32_t new_epoch = (old_epoch_raw + 1) % a->epoch_count;
   
-  /* Note: Old epoch is now "closed" - no new allocations, but existing
-   * objects remain valid and can be freed. Slabs drain naturally. */
-  (void)new_epoch; /* Suppress unused variable warning */
+  /* CRITICAL: Implement epoch closing semantics
+   * Rule: Never allocate into a CLOSING epoch */
+  
+  /* Mark old epoch as CLOSING */
+  atomic_store_explicit(&a->epoch_state[old_epoch], EPOCH_CLOSING, memory_order_release);
+  
+  /* Mark new epoch as ACTIVE (overwrites CLOSING state on wrap-around) */
+  atomic_store_explicit(&a->epoch_state[new_epoch], EPOCH_ACTIVE, memory_order_release);
+  
+  /* Null current_partial for old epoch across all size classes
+   * This ensures no thread will allocate from a published slab in CLOSING epoch */
+  for (size_t i = 0; i < k_num_classes; i++) {
+    EpochState* es = &a->classes[i].epochs[old_epoch];
+    atomic_store_explicit(&es->current_partial, NULL, memory_order_release);
+  }
+  
+  /* Old epoch now drains: frees continue, but no new allocations refill slabs */
 }
 
 /*
