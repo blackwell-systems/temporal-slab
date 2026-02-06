@@ -1,0 +1,13 @@
+# ZNS-Slab Phase 1 Test Results
+Date: Thu Feb  5 21:14:11 MST 2026
+Platform: Linux BWIAP-8CY2RW3 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+Compiler: gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0
+Build: gcc -O3 -std=c11 -pthread
+
+
+smoke_test_single_thread: OK
+smoke_test_multi_thread: OK (8 threads x 500000 iters)
+micro_bench (128B):
+  alloc avg: 69.2 ns/op
+  free  avg: 8.7 ns/op
+  RSS: 297267200 bytes (283.50 MiB)
