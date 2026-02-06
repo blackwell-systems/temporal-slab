@@ -61,11 +61,25 @@ void allocator_destroy(SlabAllocator* alloc);
 
 /* -------------------- Core API -------------------- */
 
-/* Allocate object, returns pointer or NULL on failure */
+/* Handle-based allocation (low-level, explicit handle management) */
 void* alloc_obj(SlabAllocator* alloc, uint32_t size, SlabHandle* out_handle);
-
-/* Free object using handle */
 bool free_obj(SlabAllocator* alloc, SlabHandle handle);
+
+/* -------------------- Malloc-style API -------------------- */
+
+/* malloc/free wrapper - stores handle in 8-byte header before returned pointer
+ * 
+ * Usage:
+ *   void* p = slab_malloc(alloc, size);
+ *   slab_free(alloc, p);
+ * 
+ * Overhead: 8 bytes per allocation (handle storage)
+ * Max usable size: 512 - 8 = 504 bytes (largest size class minus header)
+ * 
+ * Returns NULL if size > 504 bytes or allocation fails.
+ */
+void* slab_malloc(SlabAllocator* alloc, size_t size);
+void slab_free(SlabAllocator* alloc, void* ptr);
 
 /* -------------------- Instrumentation -------------------- */
 

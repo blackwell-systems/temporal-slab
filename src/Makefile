@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include
 
-all: smoke_tests benchmark_accurate soak_test churn_test
+all: smoke_tests benchmark_accurate soak_test churn_test test_malloc_wrapper
 
 # Core library object (implementation only, no main)
 slab_lib.c: slab_alloc.c
@@ -28,7 +28,11 @@ soak_test: soak_test.c slab_lib.o
 churn_test: churn_test.c slab_lib.o
 	$(CC) $(CFLAGS) churn_test.c slab_lib.o -o churn_test
 
+# Malloc wrapper test executable
+test_malloc_wrapper: test_malloc_wrapper.c slab_lib.o
+	$(CC) $(CFLAGS) test_malloc_wrapper.c slab_lib.o -o test_malloc_wrapper
+
 clean:
-	rm -f smoke_tests benchmark_accurate soak_test churn_test slab_lib.c slab_lib.o
+	rm -f smoke_tests benchmark_accurate soak_test churn_test test_malloc_wrapper slab_lib.c slab_lib.o
 
 .PHONY: all clean
