@@ -27,7 +27,7 @@ void smoke_test_single_thread(void) {
   if (!hs) exit(1);
 
   for (int i = 0; i < N; i++) {
-    void* p = alloc_obj(&a, 128, &hs[i]);
+    void* p = alloc_obj_epoch(&a, 128, 0, &hs[i]);
     if (!p) {
       fprintf(stderr, "alloc failed at %d (errno=%d)\n", i, errno);
       exit(1);
@@ -44,7 +44,7 @@ void smoke_test_single_thread(void) {
 
   for (int i = 0; i < N / 2; i++) {
     SlabHandle h;
-    void* p = alloc_obj(&a, 128, &h);
+    void* p = alloc_obj_epoch(&a, 128, 0, &h);
     if (!p) {
       fprintf(stderr, "re-alloc failed at %d\n", i);
       exit(1);
@@ -72,7 +72,7 @@ static void* worker_alloc_free(void* arg) {
   if (!hs) return NULL;
 
   for (int i = 0; i < a->iters; i++) {
-    void* p = alloc_obj(a->alloc, 128, &hs[i]);
+    void* p = alloc_obj_epoch(a->alloc, 128, 0, &hs[i]);
     if (!p) {
       free(hs);
       return (void*)1;
@@ -136,7 +136,7 @@ void micro_bench(void) {
 
   uint64_t t0 = now_ns();
   for (int i = 0; i < N; i++) {
-    void* p = alloc_obj(&a, 128, &hs[i]);
+    void* p = alloc_obj_epoch(&a, 128, 0, &hs[i]);
     if (!p) {
       fprintf(stderr, "alloc failed at %d\n", i);
       exit(1);

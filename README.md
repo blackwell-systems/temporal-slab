@@ -1,10 +1,23 @@
 # temporal-slab
 
-temporal-slab is a **lifetime-aware slab allocator** for fixed-size objects, designed for systems that require **predictable latency**, **bounded memory usage**, and **safe behavior under sustained allocation churn**.
+temporal-slab is a **high-performance slab allocator** for fixed-size objects, designed for systems that require **predictable latency**, **safe behavior under sustained churn**, and **narrow size distributions**.
 
-Traditional allocators optimize for spatial reuse and best-fit placement, which leads to fragmentation, allocator jitter, and unbounded RSS growth in long-running systems. temporal-slab takes a different approach: it organizes memory by **object lifetime**, grouping allocations with similar temporal behavior into slabs that can be reclaimed safely and efficiently.
+The allocator provides a lock-free fast path, conservative recycling guarantees, and explicit safety contracts. It excels in workloads with consistent object sizes (cache metadata, sessions, connection tracking).
 
-The allocator provides a lock-free fast path, conservative recycling guarantees, and explicit safety contracts, making it suitable for latency-sensitive and correctness-critical systems.
+**Current status (v0.x):**
+- Optimized for single-size or narrow size distribution workloads
+- Lock-free allocation with sub-100ns median latency
+- Safe handle validation (no crashes on invalid frees)
+- Conservative recycling (correctness over aggressive reclamation)
+
+**Not yet competitive:**
+- Mixed-size, mixed-lifetime workloads (see benchmark results)
+- General-purpose allocator replacement
+
+**Roadmap:**
+- Epoch-based placement mechanism for true lifetime-aware grouping
+- Per-class hot slab ring for reduced contention
+- Configurable size class sets
 
 ## Why temporal-slab Exists
 

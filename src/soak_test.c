@@ -57,7 +57,7 @@ static void* soak_worker(void* arg) {
   while (!g_stop) {
     /* Allocate batch */
     for (int i = 0; i < batch_size && !g_stop; i++) {
-      void* p = alloc_obj(a->alloc, size, &handles[i]);
+      void* p = alloc_obj_epoch(a->alloc, size, 0, &handles[i]);
       if (!p) {
         a->stats->failures++;
         continue;

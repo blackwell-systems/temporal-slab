@@ -18,6 +18,9 @@
 #define SLAB_MAGIC   0x534C4142u /* "SLAB" */
 #define SLAB_VERSION 1u
 
+/* Epoch configuration */
+#define EPOCH_COUNT 16u  /* Ring buffer size (power of 2 for fast modulo) */
+
 /* Slab list membership (partial/full lists, protected by sc->lock) */
 typedef enum SlabListId {
   SLAB_LIST_PARTIAL = 0,
@@ -57,6 +60,9 @@ struct Slab {
   /* Cache state for lifecycle tracking */
   SlabCacheState cache_state;
   
+  /* Epoch membership for temporal grouping */
+  uint32_t epoch_id;
+  
   uint8_t _pad[2];
 };
 
@@ -67,16 +73,22 @@ struct SlabList {
   size_t len;
 };
 
+/* Per-epoch state within a size class */
+typedef struct EpochState {
+  /* Lists guarded by parent size-class mutex */
+  SlabList partial;
+  SlabList full;
+
+  /* Fast-path current slab (lock-free) */
+  _Atomic(Slab*) current_partial;
+} EpochState;
+
 /* Per-size-class allocator state */
 struct SizeClassAlloc {
   uint32_t object_size;
 
-  /* Lists guarded by mutex */
-  SlabList partial;
-  SlabList full;
-
-  /* Phase 1.5: Fast-path current slab (lock-free) */
-  _Atomic(Slab*) current_partial;
+  /* Per-epoch state arrays (EPOCH_COUNT entries) */
+  EpochState* epochs;  /* Dynamically allocated [EPOCH_COUNT] */
 
   pthread_mutex_t lock;
 
@@ -107,6 +119,10 @@ struct SizeClassAlloc {
 /* Main allocator structure */
 struct SlabAllocator {
   SizeClassAlloc classes[8];  /* Expanded from 4 to 8 for HFT granularity */
+  
+  /* Global epoch state */
+  _Atomic uint32_t current_epoch;  /* Active epoch for new allocations */
+  uint32_t epoch_count;            /* Number of epochs (EPOCH_COUNT) */
 };
 
 #endif /* SLAB_ALLOC_INTERNAL_H */

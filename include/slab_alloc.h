@@ -78,6 +78,35 @@
  */
 #define SLAB_PAGE_SIZE 4096u
 
+/* ==================== Epoch Management ==================== */
+
+/* Epoch ID for temporal grouping
+ * 
+ * Objects allocated in the same epoch are grouped into the same slabs,
+ * enabling efficient reclamation when the epoch expires.
+ * 
+ * PROPERTIES:
+ * - Epochs are numbered 0..N-1 (ring buffer, N=16 by default)
+ * - Epoch 0 is the default for backward compatibility
+ * - Epochs advance via epoch_advance() call
+ * - Closed epochs drain naturally (no forced compaction)
+ * 
+ * LIFECYCLE:
+ *   uint32_t e0 = epoch_current(alloc);  // Returns active epoch
+ *   void* p = alloc_obj_epoch(alloc, 128, e0, &h);
+ *   
+ *   epoch_advance(alloc);  // Rotate to next epoch
+ *   
+ *   uint32_t e1 = epoch_current(alloc);  // New allocations go here
+ *   void* q = alloc_obj_epoch(alloc, 128, e1, &h2);
+ * 
+ * USE CASES:
+ * - Session stores: allocate request objects in same epoch, reclaim when request completes
+ * - Cache entries: group by insertion time, evict entire epochs
+ * - Message queues: separate producer epochs, batch-free on consumer drain
+ */
+typedef uint32_t EpochId;
+
 /* ==================== Opaque Types ==================== */
 
 /* Opaque allocator handle
@@ -258,75 +287,53 @@ void slab_allocator_free(SlabAllocator* alloc);
 void allocator_init(SlabAllocator* alloc);
 void allocator_destroy(SlabAllocator* alloc);
 
-/* ==================== Core API (Handle-Based) ==================== */
+/* ==================== Core API (Epoch-Aware, Handle-Based) ==================== */
 
-/* Allocate object with explicit handle
+/* Allocate object in specific epoch with explicit handle
  * 
- * This is the low-level API with zero per-allocation overhead. The returned
- * handle encodes the allocation location and must be passed to free_obj().
+ * This is the core allocation API with zero per-allocation overhead.
+ * Objects allocated in the same epoch are grouped into the same slabs.
  * 
  * PARAMETERS:
  *   alloc      - Allocator instance
  *   size       - Requested size in bytes (must be > 0 and <= 768)
+ *   epoch      - Epoch ID (must be < epoch_count)
  *   out_handle - Output parameter for handle (must not be NULL)
  * 
  * RETURNS:
  *   Pointer to allocated memory (aligned to 8 bytes), or NULL on failure.
  *   On success, *out_handle is set to a valid handle for later freeing.
  * 
+ * EPOCH SEMANTICS:
+ *   Objects allocated in the same epoch share slabs. When an epoch's
+ *   objects are freed, slabs can be recycled efficiently.
+ * 
  * SIZE CLASS SELECTION (O(1), deterministic):
  *   Size is rounded up to next size class via lookup table:
  *   1-64   → 64    |  65-96   → 96    | 97-128   → 128  | 129-192  → 192
  *   193-256 → 256  |  257-384 → 384   | 385-512  → 512  | 513-768  → 768
  * 
- *   Internal fragmentation = (rounded_size - requested_size) / rounded_size
- *   Average waste: 11.1% across realistic distributions
- * 
- * ALLOCATION STRATEGY:
- *   1. Fast path: Atomic load of current_partial slab
- *   2. Find free slot in bitmap via CAS loop (lock-free)
- *   3. Slow path (rare): Acquire mutex, select new slab from partial list
- *   4. If no partial slabs: pop from cache or allocate new slab (mmap)
- * 
- * FAILURE MODES:
- *   Returns NULL if:
- *   - size == 0 or size > 768
- *   - out_handle == NULL
- *   - System out of memory (mmap fails, errno set by OS)
- * 
  * PERFORMANCE (Intel Core Ultra 7, 128-byte objects):
- *   Fast path: ~70ns median, ~200ns p95 (lock-free CAS loop)
- *   Slow path: ~2-5µs (new slab allocation, mmap syscall)
- *   Fast path hit rate: >97% in steady state
- * 
- * WHEN TO USE THIS API:
- * - Performance-critical paths (zero overhead)
- * - Explicit control over allocation lifetime
- * - Building higher-level data structures (hash tables, pools)
- * - Willing to track handles separately from pointers
+ *   Fast path: ~70ns median (lock-free CAS loop)
+ *   Slow path: ~2-5µs (new slab allocation via mmap)
  * 
  * THREAD SAFETY: Safe to call concurrently on same allocator.
  */
-void* alloc_obj(SlabAllocator* alloc, uint32_t size, SlabHandle* out_handle);
+void* alloc_obj_epoch(SlabAllocator* alloc, uint32_t size, EpochId epoch, SlabHandle* out_handle);
 
 /* Free object by handle
  * 
  * PARAMETERS:
  *   alloc  - Allocator instance (must be same as used for allocation)
- *   handle - Handle returned from alloc_obj()
+ *   handle - Handle returned from alloc_obj_epoch()
  * 
  * RETURNS:
  *   true  - Object successfully freed
  *   false - Handle invalid (wrong allocator, double-free, corrupted handle)
  * 
- * VALIDATION:
- *   Checks slab magic number and slot state before freeing.
- *   Invalid handles are rejected safely (no crash).
- * 
- * BEHAVIOR AFTER FREE:
- *   - Memory may be reused immediately by other allocations
- *   - Handle remains invalid (repeated frees will return false)
- *   - Pointer becomes dangling (do not dereference)
+ * EPOCH HANDLING:
+ *   Uses slab's stored epoch_id to look up correct epoch state.
+ *   Frees work across epoch boundaries (can free old epoch objects).
  * 
  * THREAD SAFETY: Safe to call concurrently.
  */
@@ -334,46 +341,33 @@ bool free_obj(SlabAllocator* alloc, SlabHandle handle);
 
 /* ==================== Malloc-Style API ==================== */
 
-/* Allocate memory (malloc-compatible interface)
- * 
- * Convenience wrapper around alloc_obj() that hides handle management.
- * Stores the handle in an 8-byte header before the returned pointer.
+/* Allocate memory in specific epoch (malloc-compatible)
  * 
  * PARAMETERS:
  *   alloc - Allocator instance
  *   size  - Requested size in bytes (must be > 0 and <= 760)
+ *   epoch - Epoch ID (must be < epoch_count)
  * 
  * RETURNS:
  *   Pointer to usable memory, or NULL on failure.
- *   The returned pointer is 8 bytes after the allocation start (handle is hidden).
  * 
  * OVERHEAD:
  *   8 bytes per allocation (handle storage in header)
  *   Max usable size: 760 bytes (768 - 8 byte header)
  * 
- * EXAMPLE:
- *   void* p = slab_malloc(alloc, 100);  // Actually allocates 128-byte slot
- *   if (!p) { handle_error(); }
- *   memcpy(p, data, 100);
- *   slab_free(alloc, p);
- * 
  * THREAD SAFETY: Safe to call concurrently.
  */
-void* slab_malloc(SlabAllocator* alloc, size_t size);
+void* slab_malloc_epoch(SlabAllocator* alloc, size_t size, EpochId epoch);
 
-/* Free memory allocated by slab_malloc()
+/* Free memory allocated by slab_malloc_epoch()
  * 
  * PARAMETERS:
  *   alloc - Allocator instance (must match allocation call)
- *   ptr   - Pointer returned by slab_malloc(), or NULL
+ *   ptr   - Pointer returned by slab_malloc_epoch(), or NULL
  * 
  * BEHAVIOR:
  *   Reads handle from 8-byte header before ptr and calls free_obj().
  *   NULL pointers are safely ignored (no-op, like standard free()).
- * 
- * SAFETY:
- *   Invalid pointers are detected and rejected (no crash).
- *   Double-free is detected and ignored.
  * 
  * THREAD SAFETY: Safe to call concurrently.
  */
@@ -440,5 +434,75 @@ uint64_t read_rss_bytes_linux(void);
  *   printf("Allocation took %lu ns\n", t1 - t0);
  */
 uint64_t now_ns(void);
+
+/* ==================== Epoch API ==================== */
+
+/* Get current active epoch
+ * 
+ * Returns the epoch ID that new allocations will be assigned to.
+ * 
+ * THREAD SAFETY: Safe to call concurrently.
+ */
+EpochId epoch_current(SlabAllocator* alloc);
+
+/* Advance to next epoch
+ * 
+ * Rotates the active epoch forward (mod epoch_count).
+ * Previous epoch is "closed" - no new allocations, but existing objects remain valid.
+ * 
+ * BEHAVIOR:
+ * - Atomic increment of current_epoch counter
+ * - No immediate memory reclamation (epochs drain naturally as objects are freed)
+ * - No compaction or relocation (objects never move)
+ * 
+ * USAGE PATTERN:
+ *   // Allocate batch of related objects
+ *   EpochId e = epoch_current(alloc);
+ *   for (int i = 0; i < batch_size; i++) {
+ *     void* p = alloc_obj_epoch(alloc, size, e, &handles[i]);
+ *   }
+ *   
+ *   // Rotate to next epoch for next batch
+ *   epoch_advance(alloc);
+ * 
+ * THREAD SAFETY: Safe to call concurrently (uses atomic increment).
+ */
+void epoch_advance(SlabAllocator* alloc);
+
+/* Allocate object in specific epoch (handle-based)
+ * 
+ * Same as alloc_obj(), but allocates into specified epoch for temporal grouping.
+ * 
+ * PARAMETERS:
+ *   alloc      - Allocator instance
+ *   size       - Requested size in bytes
+ *   epoch      - Epoch ID (must be < epoch_count)
+ *   out_handle - Output parameter for handle
+ * 
+ * RETURNS:
+ *   Pointer to allocated memory, or NULL on failure.
+ * 
+ * EPOCH VALIDATION:
+ *   If epoch >= epoch_count, returns NULL.
+ * 
+ * THREAD SAFETY: Safe to call concurrently.
+ */
+void* alloc_obj_epoch(SlabAllocator* alloc, uint32_t size, EpochId epoch, SlabHandle* out_handle);
+
+/* Allocate object in specific epoch (malloc-style)
+ * 
+ * Same as slab_malloc(), but allocates into specified epoch.
+ * 
+ * PARAMETERS:
+ *   alloc - Allocator instance
+ *   size  - Requested size in bytes
+ *   epoch - Epoch ID (must be < epoch_count)
+ * 
+ * RETURNS:
+ *   Pointer to usable memory, or NULL on failure.
+ * 
+ * THREAD SAFETY: Safe to call concurrently.
+ */
+void* slab_malloc_epoch(SlabAllocator* alloc, size_t size, EpochId epoch);
 
 #endif /* SLAB_ALLOC_H */

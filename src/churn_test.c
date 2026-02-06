@@ -72,7 +72,7 @@ static void churn_test(void) {
   /* Phase 1: Fill to steady state */
   printf("Phase 1: Filling to steady state (%d objects)...\n", NUM_OBJECTS);
   for (int i = 0; i < NUM_OBJECTS; i++) {
-    void* p = alloc_obj(&a, OBJECT_SIZE, &handles[i]);
+    void* p = alloc_obj_epoch(&a, OBJECT_SIZE, 0, &handles[i]);
     if (!p) {
       fprintf(stderr, "Allocation failed at %d\n", i);
       exit(1);
@@ -111,7 +111,7 @@ static void churn_test(void) {
     /* Reallocate in same pattern (may reuse recycled slabs) */
     for (int i = 0; i < CHURN_SIZE; i++) {
       int idx = (start_idx + i) % NUM_OBJECTS;
-      void* p = alloc_obj(&a, OBJECT_SIZE, &handles[idx]);
+      void* p = alloc_obj_epoch(&a, OBJECT_SIZE, 0, &handles[idx]);
       if (!p) {
         fprintf(stderr, "Reallocation failed at cycle %d, index %d\n", cycle, idx);
         exit(1);

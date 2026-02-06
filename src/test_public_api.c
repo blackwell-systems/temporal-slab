@@ -26,7 +26,7 @@ int main(void) {
   void* ptrs[N];
   
   for (int i = 0; i < N; i++) {
-    ptrs[i] = alloc_obj(alloc, 128, &handles[i]);
+    ptrs[i] = alloc_obj_epoch(alloc, 128, 0, &handles[i]);
     if (!ptrs[i]) {
       fprintf(stderr, "Allocation failed at %d\n", i);
       return 1;

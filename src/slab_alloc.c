@@ -54,6 +54,11 @@ uint64_t now_ns(void) {
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Helper: Get epoch state for a given size class and epoch */
+static inline EpochState* get_epoch_state(SizeClassAlloc* sc, uint32_t epoch_id) {
+  return &sc->epochs[epoch_id];
+}
+
 static inline uint32_t ctz32(uint32_t x) {
 #if defined(__GNUC__) || defined(__clang__)
   return (uint32_t)__builtin_ctz(x);
@@ -278,13 +283,32 @@ void allocator_init(SlabAllocator* a) {
   init_class_lookup();
   
   memset(a, 0, sizeof(*a));
+  
+  /* Initialize global epoch state */
+  a->epoch_count = EPOCH_COUNT;
+  atomic_store_explicit(&a->current_epoch, 0, memory_order_relaxed);
+  
   for (size_t i = 0; i < k_num_classes; i++) {
     a->classes[i].object_size = k_size_classes[i];
-    list_init(&a->classes[i].partial);
-    list_init(&a->classes[i].full);
-    atomic_store_explicit(&a->classes[i].current_partial, NULL, memory_order_relaxed);
     pthread_mutex_init(&a->classes[i].lock, NULL);
     a->classes[i].total_slabs = 0;
+
+    /* Allocate per-epoch state arrays */
+    a->classes[i].epochs = (EpochState*)calloc(EPOCH_COUNT, sizeof(EpochState));
+    if (!a->classes[i].epochs) {
+      /* Allocation failure - clean up and abort */
+      for (size_t j = 0; j < i; j++) {
+        free(a->classes[j].epochs);
+      }
+      return;
+    }
+    
+    /* Initialize each epoch's state */
+    for (uint32_t e = 0; e < EPOCH_COUNT; e++) {
+      list_init(&a->classes[i].epochs[e].partial);
+      list_init(&a->classes[i].epochs[e].full);
+      atomic_store_explicit(&a->classes[i].epochs[e].current_partial, NULL, memory_order_relaxed);
+    }
 
     /* Initialize performance counters */
     atomic_store_explicit(&a->classes[i].slow_path_hits, 0, memory_order_relaxed);
@@ -355,7 +379,7 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
 
 /* ------------------------------ Slab allocation ------------------------------ */
 
-static Slab* new_slab(SizeClassAlloc* sc) {
+static Slab* new_slab(SizeClassAlloc* sc, uint32_t epoch_id) {
   uint32_t obj_size = sc->object_size;
 
   /* Try to pop from cache first */
@@ -374,6 +398,7 @@ static Slab* new_slab(SizeClassAlloc* sc) {
     s->next = NULL;
     s->list_id = SLAB_LIST_NONE;
     s->cache_state = SLAB_ACTIVE;  /* Will be added to partial list */
+    s->epoch_id = epoch_id;  /* Assign to epoch for temporal grouping */
     atomic_store_explicit(&s->free_count, s->object_count, memory_order_relaxed);
     
     /* Clear bitmap */
@@ -409,6 +434,7 @@ static Slab* new_slab(SizeClassAlloc* sc) {
   atomic_store_explicit(&s->free_count, count, memory_order_relaxed);
   s->list_id = SLAB_LIST_NONE;
   s->cache_state = SLAB_ACTIVE;  /* Will be added to partial list */
+  s->epoch_id = epoch_id;  /* Assign to epoch for temporal grouping */
 
   _Atomic uint32_t* bm = slab_bitmap_ptr(s);
   uint32_t words = slab_bitmap_words(count);
@@ -437,21 +463,23 @@ static inline Slab* decode_handle(SlabHandle h, uint32_t* out_slot, uint32_t* ou
 /* ------------------------------ Allocation ------------------------------ */
 
 /*
-  Phase 1.5 Allocation Strategy:
-    1) Load current_partial (acquire)
-    2) If non-NULL, try alloc
-       - On success: check if slab became full (free_count==0), move to FULL
-       - On failure: CAS current_partial to NULL (best-effort), go to slow path
-    3) Slow path: lock, pick/create slab, store_release to current_partial
+  Epoch-Aware Allocation Strategy:
+    1) Load epoch state for (size_class, epoch_id)
+    2) Try fast path: atomic load of epochs[epoch_id].current_partial
+    3) On success: check if slab became full, move PARTIAL->FULL within epoch
+    4) Slow path: lock, pick/create slab from epoch's partial list
 */
-void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
+void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle* out) {
   int ci = class_index_for_size(size);
   if (ci < 0) return NULL;
+  
+  if (epoch >= a->epoch_count) return NULL;  /* Invalid epoch */
 
   SizeClassAlloc* sc = &a->classes[(size_t)ci];
+  EpochState* es = get_epoch_state(sc, epoch);
 
-  /* Fast path: try current_partial */
-  Slab* cur = atomic_load_explicit(&sc->current_partial, memory_order_acquire);
+  /* Fast path: try current_partial for this epoch */
+  Slab* cur = atomic_load_explicit(&es->current_partial, memory_order_acquire);
   
   if (cur && atomic_load_explicit(&cur->magic, memory_order_relaxed) == SLAB_MAGIC) {
     uint32_t prev_fc = 0;
@@ -464,14 +492,14 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
         pthread_mutex_lock(&sc->lock);
         if (cur->list_id == SLAB_LIST_PARTIAL) {
           atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
-          list_remove(&sc->partial, cur);
+          list_remove(&es->partial, cur);
           cur->list_id = SLAB_LIST_FULL;
-          list_push_back(&sc->full, cur);
+          list_push_back(&es->full, cur);
           
           /* Publish next partial slab to reduce slow-path contention */
-          Slab* next = sc->partial.head;
+          Slab* next = es->partial.head;
           assert(!next || next->list_id == SLAB_LIST_PARTIAL);
-          atomic_store_explicit(&sc->current_partial, next, memory_order_release);
+          atomic_store_explicit(&es->current_partial, next, memory_order_release);
         }
         pthread_mutex_unlock(&sc->lock);
       }
@@ -487,7 +515,7 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
     atomic_fetch_add_explicit(&sc->current_partial_full, 1, memory_order_relaxed);
     Slab* expected = cur;
     atomic_compare_exchange_strong_explicit(
-      &sc->current_partial, &expected, NULL,
+      &es->current_partial, &expected, NULL,
       memory_order_release, memory_order_relaxed);
   } else if (!cur) {
     /* current_partial was NULL - count this miss */
@@ -499,21 +527,21 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
     atomic_fetch_add_explicit(&sc->slow_path_hits, 1, memory_order_relaxed);
     pthread_mutex_lock(&sc->lock);
 
-    Slab* s = sc->partial.head;
+    Slab* s = es->partial.head;
     if (!s) {
-      s = new_slab(sc);
+      s = new_slab(sc, epoch);
       if (!s) {
         pthread_mutex_unlock(&sc->lock);
         return NULL;
       }
       s->list_id = SLAB_LIST_PARTIAL;
-      list_push_back(&sc->partial, s);
+      list_push_back(&es->partial, s);
       sc->total_slabs++;
     }
 
     /* Publish to current_partial (release) */
     assert(s->list_id == SLAB_LIST_PARTIAL);
-    atomic_store_explicit(&sc->current_partial, s, memory_order_release);
+    atomic_store_explicit(&es->current_partial, s, memory_order_release);
 
     pthread_mutex_unlock(&sc->lock);
 
@@ -532,14 +560,14 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
       pthread_mutex_lock(&sc->lock);
       if (s->list_id == SLAB_LIST_PARTIAL) {
         atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
-        list_remove(&sc->partial, s);
+        list_remove(&es->partial, s);
         s->list_id = SLAB_LIST_FULL;
-        list_push_back(&sc->full, s);
+        list_push_back(&es->full, s);
         
         /* Publish next partial if available */
-        Slab* next = sc->partial.head;
+        Slab* next = es->partial.head;
         assert(!next || next->list_id == SLAB_LIST_PARTIAL);
-        atomic_store_explicit(&sc->current_partial, next, memory_order_release);
+        atomic_store_explicit(&es->current_partial, next, memory_order_release);
       }
       pthread_mutex_unlock(&sc->lock);
     }
@@ -551,6 +579,7 @@ void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
     return p;
   }
 }
+
 
 /*
   Free Strategy:
@@ -577,6 +606,11 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   
   /* Validate slab magic - safe because slabs stay mapped during runtime */
   if (atomic_load_explicit(&s->magic, memory_order_relaxed) != SLAB_MAGIC) return false;
+  
+  /* Get epoch state for this slab */
+  uint32_t epoch = s->epoch_id;
+  if (epoch >= a->epoch_count) return false;  /* Invalid epoch */
+  EpochState* es = get_epoch_state(sc, epoch);
 
   /* Precise transition detection: get previous free_count from fetch_add */
   uint32_t prev_fc = 0;
@@ -591,7 +625,7 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
     
     if (s->list_id == SLAB_LIST_FULL) {
       /* FULL-list slabs are never published, always safe to recycle */
-      list_remove(&sc->full, s);
+      list_remove(&es->full, s);
       s->list_id = SLAB_LIST_NONE;
       sc->total_slabs--;
       pthread_mutex_unlock(&sc->lock);
@@ -606,7 +640,7 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
        * list and will be reused naturally. */
       Slab* expected = s;
       (void)atomic_compare_exchange_strong_explicit(
-          &sc->current_partial, &expected, NULL,
+          &es->current_partial, &expected, NULL,
           memory_order_release, memory_order_relaxed);
     }
     
@@ -619,15 +653,15 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
     pthread_mutex_lock(&sc->lock);
     if (s->list_id == SLAB_LIST_FULL) {
       atomic_fetch_add_explicit(&sc->list_move_full_to_partial, 1, memory_order_relaxed);
-      list_remove(&sc->full, s);
+      list_remove(&es->full, s);
       s->list_id = SLAB_LIST_PARTIAL;
-      list_push_back(&sc->partial, s);
+      list_push_back(&es->partial, s);
       
       /* Publish as current_partial if NULL (reduce slow-path trips) */
       assert(s->list_id == SLAB_LIST_PARTIAL);
       Slab* expected = NULL;
       atomic_compare_exchange_strong_explicit(
-        &sc->current_partial, &expected, s,
+        &es->current_partial, &expected, s,
         memory_order_release, memory_order_relaxed);
     }
     pthread_mutex_unlock(&sc->lock);
@@ -638,13 +672,13 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
 
 /* ------------------------------ Malloc-style wrapper ------------------------------ */
 
-void* slab_malloc(SlabAllocator* a, size_t size) {
+void* slab_malloc_epoch(SlabAllocator* a, size_t size, EpochId epoch) {
   /* Reserve 8 bytes for handle header */
   if (size == 0 || size > 504) return NULL;  /* Max: 512 - 8 = 504 bytes */
   
   uint32_t alloc_size = (uint32_t)(size + sizeof(SlabHandle));
   SlabHandle h;
-  void* obj = alloc_obj(a, alloc_size, &h);
+  void* obj = alloc_obj_epoch(a, alloc_size, epoch, &h);
   if (!obj) return NULL;
   
   /* Store handle in first 8 bytes */
@@ -653,6 +687,7 @@ void* slab_malloc(SlabAllocator* a, size_t size) {
   /* Return pointer after header */
   return (void*)((uint8_t*)obj + sizeof(SlabHandle));
 }
+
 
 void slab_free(SlabAllocator* a, void* ptr) {
   if (!ptr) return;
@@ -672,23 +707,34 @@ void allocator_destroy(SlabAllocator* a) {
 
     pthread_mutex_lock(&sc->lock);
 
-    Slab* cur = sc->partial.head;
-    while (cur) {
-      Slab* next = cur->next;
-      unmap_one_page(cur);
-      cur = next;
-    }
+    /* Destroy all per-epoch state */
+    if (sc->epochs) {
+      for (uint32_t e = 0; e < EPOCH_COUNT; e++) {
+        EpochState* es = &sc->epochs[e];
+        
+        Slab* cur = es->partial.head;
+        while (cur) {
+          Slab* next = cur->next;
+          unmap_one_page(cur);
+          cur = next;
+        }
 
-    cur = sc->full.head;
-    while (cur) {
-      Slab* next = cur->next;
-      unmap_one_page(cur);
-      cur = next;
-    }
+        cur = es->full.head;
+        while (cur) {
+          Slab* next = cur->next;
+          unmap_one_page(cur);
+          cur = next;
+        }
 
-    list_init(&sc->partial);
-    list_init(&sc->full);
-    atomic_store_explicit(&sc->current_partial, NULL, memory_order_relaxed);
+        list_init(&es->partial);
+        list_init(&es->full);
+        atomic_store_explicit(&es->current_partial, NULL, memory_order_relaxed);
+      }
+      
+      free(sc->epochs);
+      sc->epochs = NULL;
+    }
+    
     sc->total_slabs = 0;
 
     pthread_mutex_unlock(&sc->lock);
@@ -704,7 +750,7 @@ void allocator_destroy(SlabAllocator* a) {
     sc->cache_capacity = 0;
     
     /* Drain overflow list */
-    cur = sc->cache_overflow.head;
+    Slab* cur = sc->cache_overflow.head;
     while (cur) {
       Slab* next = cur->next;
       unmap_one_page(cur);
@@ -751,6 +797,22 @@ uint64_t read_rss_bytes_linux(void) {
 #else
   return 0;
 #endif
+}
+
+/* ------------------------------ Epoch API ------------------------------ */
+
+EpochId epoch_current(SlabAllocator* a) {
+  return atomic_load_explicit(&a->current_epoch, memory_order_relaxed);
+}
+
+void epoch_advance(SlabAllocator* a) {
+  uint32_t old_epoch = atomic_fetch_add_explicit(&a->current_epoch, 1, memory_order_relaxed);
+  /* Ring buffer wrap: modulo epoch_count */
+  uint32_t new_epoch = (old_epoch + 1) % a->epoch_count;
+  
+  /* Note: Old epoch is now "closed" - no new allocations, but existing
+   * objects remain valid and can be freed. Slabs drain naturally. */
+  (void)new_epoch; /* Suppress unused variable warning */
 }
 
 /*

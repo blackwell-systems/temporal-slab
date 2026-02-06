@@ -115,7 +115,7 @@ static void benchmark_rss_accurate(void) {
   /* Allocate objects */
   printf("\nAllocating %d objects of 128 bytes...\n", N);
   for (int i = 0; i < N; i++) {
-    void* p = alloc_obj(&a, 128, &hs[i]);
+    void* p = alloc_obj_epoch(&a, 128, 0, &hs[i]);
     if (!p) {
       fprintf(stderr, "Allocation failed at %d\n", i);
       exit(1);
@@ -206,7 +206,7 @@ static void benchmark_latency_accurate(void) {
   printf("Measuring allocation latency (1M iterations)...\n");
   for (int i = 0; i < N; i++) {
     uint64_t t0 = now_ns();
-    void* p = alloc_obj(&a, 128, &hs[i]);
+    void* p = alloc_obj_epoch(&a, 128, 0, &hs[i]);
     uint64_t t1 = now_ns();
     
     if (!p) {
