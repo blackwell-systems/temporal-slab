@@ -131,27 +131,27 @@ make
 
 ## Performance Summary
 
-**Platform:** Intel Core Ultra 7 165H, Linux, GCC 13.3.0 -O3
+![Performance Overview](docs/images/summary.png)
 
-**Latency (128-byte objects):**
-- Allocation: **70ns** average
-- Free: **12ns** average
-- Cache hit rate: **97%+**
+temporal-slab delivers three key properties for latency-sensitive workloads:
 
-These results reflect steady-state behavior under sustained churn, not short-lived microbenchmarks.
+1. **Deterministic allocation latency** - Sub-100ns median, <2µs p99, no jitter
+2. **Stable RSS under churn** - 2.4% growth over 1000 cycles (vs 20-50% for malloc/tcmalloc)
+3. **Predictable trade-offs** - 11.1% internal fragmentation, zero external fragmentation
 
-**Memory efficiency:**
-- RSS growth under churn: **2.2%** (15.30 → 15.64 MiB, 1000 cycles)
-- Zero cache overflows (optimal cache utilization)
+**Quick Results (Intel Core Ultra 7, 128-byte objects):**
 
-**Concurrency:**
-- Validated with 8 threads × 500K iterations
-- Zero allocator-internal failures
+| Metric | Value | Comparison |
+|--------|-------|------------|
+| p50 allocation | 70ns | Competitive with jemalloc |
+| p99 allocation | 1.7µs | 2-3 orders of magnitude better than compacting allocators |
+| RSS growth (1000 cycles) | 2.4% | 10-20x better than malloc/tcmalloc |
+| Space efficiency | 88.9% | Reasonable for fixed size classes |
+| Thread scaling | Linear to 4 threads | Lock-free fast path, cache coherence limits beyond 8 threads |
 
-**Interpretation:**
-- Median latency stays sub-100ns under contention
-- RSS remains stable under sustained churn
-- No memory leaks or unbounded growth
+**Important:** temporal-slab does not attempt to outperform general-purpose allocators everywhere. It eliminates latency variance and RSS drift for fixed-size, churn-heavy workloads.
+
+**Full analysis:** See [docs/results.md](docs/results.md) for detailed benchmarks, charts, and interpretation guidelines.
 
 ## Size Classes
 
