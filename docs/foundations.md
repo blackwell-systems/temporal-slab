@@ -11,6 +11,7 @@ This document builds the theoretical foundation for temporal-slab from first pri
 
 **Allocator Fundamentals**
 - [Memory Allocator](#memory-allocator)
+- [Churn](#churn)
 - [Spatial Fragmentation](#spatial-fragmentation)
 - [Temporal Fragmentation](#temporal-fragmentation)
 - [Fragmentation as Entropy](#fragmentation-as-entropy)
@@ -56,6 +57,28 @@ RSS is distinct from virtual memory size (which includes unmapped pages and page
 A memory allocator bridges the gap between what the OS provides (pages) and what programs need (arbitrary-sized objects). The OS gives memory in 4KB chunks. A web server needs 80 bytes for a session, 256 bytes for a request, 512 bytes for a response. The allocator subdivides pages into smaller allocations.
 
 The canonical allocator interface is `malloc(size)` and `free(ptr)`. The allocator's job is to maintain a pool of pages, satisfy allocation requests by finding or creating space, and reclaim space when objects are freed. The allocator must answer: where should this allocation go? When can freed memory be reused? How can pages be returned to the OS when they are no longer needed?
+
+## Churn
+
+Churn is the rate at which a system allocates and frees memory, particularly when those allocations are short-lived and happen continuously. Churn measures how fast objects come and go, not how big they are or how many exist at once.
+
+High-churn workloads allocate thousands of small objects per second, which live for microseconds or milliseconds, are freed quickly, and are immediately replaced by new allocations. This cycle repeats indefinitely. Even if peak memory usage is small, the allocator is constantly working.
+
+**What churn looks like in practice:**
+
+A session store allocates 200-byte session objects at 10,000 requests per second. Each session lives 5 seconds on average. At any moment, 50,000 sessions exist (steady state). But the allocator handles 10,000 allocations and 10,000 frees per second—20,000 operations per second total. This is high churn.
+
+A cache system allocates entries as they are populated and frees them on eviction. If the cache has 1 million entries with a 10-minute TTL and uniform access, it churns ~1,667 entries per second. The cache size is large, but the churn rate is moderate.
+
+**Why churn stresses allocators:**
+
+Under high churn, allocators must continuously find space, track freed objects, merge or split blocks, and maintain metadata. This leads to allocator jitter (occasional slow allocations), RSS drift (memory footprint creeping upward), cache misses from scattered metadata, and unpredictable latency under load.
+
+**Why churn matters more than throughput in HFT:**
+
+HFT engines do not allocate huge amounts of memory—they allocate small amounts constantly. A trading system might allocate 100-byte order objects at 100,000 per second. Peak memory is only a few megabytes, but the churn rate is extreme. Instability comes from the allocator's internal bookkeeping, not from the volume of data. A single 10µs allocation spike can cause a missed trade worth millions.
+
+Churn is the entropy generator that slowly destabilizes long-running processes. temporal-slab is designed specifically for this: grouping allocations by when they happen so short-lived objects die together. This eliminates per-object bookkeeping overhead, fragmentation from interleaved lifetimes, and jitter from metadata growth.
 
 ## Spatial Fragmentation
 
