@@ -539,31 +539,13 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   /* New free_count is prev_fc + 1 */
   uint32_t new_fc = prev_fc + 1;
 
-  /* Phase 2: Check if slab became empty - try to recycle safely */
+  /* Phase 2: Check if slab became empty - recycle FULL-only (provably safe) */
   if (new_fc == s->object_count) {
     pthread_mutex_lock(&sc->lock);
-    
-    bool can_recycle = false;
     
     if (s->list_id == SLAB_LIST_FULL) {
       /* FULL-list slabs are never published, always safe to recycle */
       list_remove(&sc->full, s);
-      can_recycle = true;
-    } else if (s->list_id == SLAB_LIST_PARTIAL) {
-      /* Try to unpublish if it's current_partial */
-      Slab* expected = s;
-      if (atomic_compare_exchange_strong_explicit(
-            &sc->current_partial, &expected, NULL,
-            memory_order_release, memory_order_relaxed)) {
-        /* Successfully unpublished - safe to recycle */
-        list_remove(&sc->partial, s);
-        can_recycle = true;
-      }
-      /* If CAS failed, slab is either not published or another thread has it
-       * Leave it on PARTIAL list - it will be recycled eventually */
-    }
-    
-    if (can_recycle) {
       s->list_id = SLAB_LIST_NONE;
       sc->total_slabs--;
       pthread_mutex_unlock(&sc->lock);
@@ -571,6 +553,15 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
       /* Push to cache (or overflow if cache full) - outside lock */
       cache_push(sc, s);
       return true;
+    } else if (s->list_id == SLAB_LIST_PARTIAL) {
+      /* Empty PARTIAL slab: unpublish if current_partial (but do NOT recycle).
+       * This nudges the system to pick a different slab on next slow path,
+       * reducing "empty-but-published" weirdness. The slab stays on PARTIAL
+       * list and will be reused naturally. */
+      Slab* expected = s;
+      (void)atomic_compare_exchange_strong_explicit(
+          &sc->current_partial, &expected, NULL,
+          memory_order_release, memory_order_relaxed);
     }
     
     pthread_mutex_unlock(&sc->lock);
