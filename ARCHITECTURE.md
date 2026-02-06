@@ -1,14 +1,14 @@
-# ZNS-Slab Architecture
+# temporal-slab Architecture
 
 ## Why This Exists
 
-Traditional allocators optimize for spatial reuse and hole-finding. ZNS-Slab optimizes for **temporal coherence**: grouping objects by lifetime so memory is reclaimed in whole slabs instead of fragments.
+Traditional allocators optimize for spatial reuse and hole-finding. temporal-slab optimizes for **temporal coherence**: grouping objects by lifetime so memory is reclaimed in whole slabs instead of fragments.
 
 This document describes the allocator's design and its role as a foundation for higher-level systems.
 
 ## Current Scope
 
-ZNS-Slab is a **lifetime-aware memory allocator** for fixed-size objects. It provides:
+temporal-slab is a **lifetime-aware memory allocator** for fixed-size objects. It provides:
 
 - Lock-free allocation fast path
 - Bounded RSS under sustained churn
@@ -19,7 +19,7 @@ This document describes the current implementation and the path to extended func
 
 ## Non-Goals
 
-ZNS-Slab intentionally does not attempt:
+temporal-slab intentionally does not attempt:
 - Variable-sized allocation (use jemalloc/tcmalloc)
 - Fine-grained object migration between tiers
 - General-purpose malloc replacement
@@ -29,7 +29,7 @@ Lifetime alignment emerges naturally from allocation patterns, not policy.
 
 ## Current Use Cases
 
-ZNS-Slab is well-suited for:
+temporal-slab is well-suited for:
 - Session stores
 - Cache metadata
 - Connection tracking
@@ -147,7 +147,7 @@ void promote_slab(TieredAllocator* ta, Slab* slab, int from_tier, int to_tier) {
 - Aligned lifetimes mean hot/cold slabs are naturally separable
 - FULL slabs can move without coordination (not published)
 
-**Critical constraint:** No code in this repo (ZNS-Slab) assumes tiers exist. Tiering is an optional higher-level orchestration layer.
+**Critical constraint:** No code in this repo (temporal-slab) assumes tiers exist. Tiering is an optional higher-level orchestration layer.
 
 ### Layer 3: Eviction Policy
 
@@ -164,7 +164,7 @@ void evict_coldest_slab(SlabAllocator* alloc, int size_class) {
 
 ## Why Separation Matters
 
-**ZNS-Slab (this repo):**
+**temporal-slab (this repo):**
 - Pure allocator with no policy
 - Zero external dependencies
 - Clear safety contract
@@ -172,19 +172,19 @@ void evict_coldest_slab(SlabAllocator* alloc, int size_class) {
 
 **ZNS-Cache (future repo):**
 - Hash table + eviction policy
-- Depends on ZNS-Slab
+- Depends on temporal-slab
 - Can experiment with different eviction strategies
 - Users choose if they want it
 
 **ZNS-Tiered (future repo):**
 - DRAM/PMEM/NVMe coordination
-- Depends on ZNS-Slab
+- Depends on temporal-slab
 - Can target different hardware configs
 - Optional for most users
 
 ## Recommended Next Steps
 
-For **this repo (ZNS-Slab)**:
+For **this repo (temporal-slab)**:
 1. ✅ Keep allocator-only scope
 2. ✅ Archive planning docs to docs/archive/
 3. Add ARCHITECTURE.md (this file) explaining extension path
@@ -194,8 +194,8 @@ For **zns-cache repo (new)**:
 1. Start with minimal hash table using `slab_malloc()`
 2. Add LRU eviction policy
 3. Add TTL support
-4. Reference ZNS-Slab as dependency
+4. Reference temporal-slab as dependency
 
-This keeps ZNS-Slab focused, stable, and maximally useful as a foundation.
+This keeps temporal-slab focused, stable, and maximally useful as a foundation.
 
 Sound good?

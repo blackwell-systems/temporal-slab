@@ -1,5 +1,5 @@
 /*
- * soak_test.c - ZNS-Slab Long-Running Stability Test
+ * soak_test.c - temporal-slab Long-Running Stability Test
  * 
  * Runs allocation/free patterns for extended periods to catch:
  * - Memory leaks (RSS growth)
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
     }
   }
   
-  printf("ZNS-Slab Soak Test\n");
+  printf("temporal-slab Soak Test\n");
   printf("==================\n");
   printf("Duration:  %d seconds (%.1f hours)\n", duration_seconds, duration_seconds / 3600.0);
   printf("Threads:   8 (2 per size class)\n");
