@@ -6,7 +6,7 @@
  * Do not include this file from outside src/
  */
 
-#include "../include/slab_alloc.h"
+#include <slab_alloc.h>
 #include <stdatomic.h>
 #include <pthread.h>
 
@@ -78,7 +78,8 @@ struct SizeClassAlloc {
   _Atomic uint64_t new_slab_count;
   _Atomic uint64_t list_move_partial_to_full;
   _Atomic uint64_t list_move_full_to_partial;
-  _Atomic uint64_t current_partial_miss;  /* Will split into null+full in next commit */
+  _Atomic uint64_t current_partial_null;  /* fast path saw NULL current_partial */
+  _Atomic uint64_t current_partial_full;  /* fast path saw full current_partial */
 
   /* Slab cache: free page stack to avoid mmap() in hot path */
   Slab** slab_cache;
@@ -89,16 +90,7 @@ struct SizeClassAlloc {
 
 /* Main allocator structure */
 struct SlabAllocator {
-  SlabConfig config;
-  uint32_t num_classes;
-  SizeClassAlloc* classes;  /* Dynamically allocated array */
+  SizeClassAlloc classes[4];
 };
-
-/* Internal handle mapping */
-typedef struct SlabHandleInternal {
-  Slab* slab;
-  uint32_t slot;
-  uint32_t size_class;
-} SlabHandleInternal;
 
 #endif /* SLAB_ALLOC_INTERNAL_H */

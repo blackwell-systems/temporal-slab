@@ -8,112 +8,66 @@
 /*
  * ZNS-Slab Phase 1.5 - Public API
  * 
- * A specialized slab allocator for sub-4KB objects with:
- * - Lock-free fast path
- * - Per-size-class slab cache
- * - Performance counter attribution
- * - Sub-100ns median latency
+ * Specialized slab allocator for sub-4KB objects.
+ * 
+ * USAGE: Stack-allocate SlabAllocator, call allocator_init(), use alloc_obj/free_obj.
+ * 
+ * IMPORTANT: SlabAllocator internal fields are PRIVATE.
+ * Do not access fields directly. Treat as opaque and use provided API only.
+ * Internal layout will change in Phase 1.6 (full opaque types).
  */
 
-/* Opaque allocator handle - internal structure hidden */
+/* Configuration constants */
+#define SLAB_PAGE_SIZE 4096u
+
+/* Opaque allocator - definition in slab_alloc_internal.h */
 typedef struct SlabAllocator SlabAllocator;
 
-/* Concrete handle returned to caller - must be saved for free */
+/* Handle for allocated objects */
 typedef struct SlabHandle {
-  void* _internal[3];  /* Opaque - do not access directly */
+  void* slab;           /* PRIVATE */
+  uint32_t slot;        /* PRIVATE */
+  uint32_t size_class;  /* PRIVATE */
 } SlabHandle;
 
-/* Performance counters snapshot - read-only */
+/* Performance counters snapshot (read-only) */
 typedef struct PerfCounters {
   uint64_t slow_path_hits;
   uint64_t new_slab_count;
   uint64_t list_move_partial_to_full;
   uint64_t list_move_full_to_partial;
-  uint64_t current_partial_null;
-  uint64_t current_partial_full;
+  uint64_t current_partial_null;  /* fast path saw NULL current_partial */
+  uint64_t current_partial_full;  /* fast path saw full current_partial */
 } PerfCounters;
-
-/* Configuration for allocator initialization */
-typedef struct SlabConfig {
-  uint32_t page_size;           /* Slab page size (default: 4096) */
-  uint32_t cache_capacity;      /* Pages per size class (default: 32) */
-  uint32_t num_size_classes;    /* Number of size classes (default: 4) */
-  const uint32_t* size_classes; /* Array of sizes (default: 64,128,256,512) */
-} SlabConfig;
 
 /* -------------------- Core API -------------------- */
 
-/*
- * Get default configuration.
- * Modifiable - caller can override fields before passing to init.
- */
-SlabConfig slab_default_config(void);
+/* Initialize allocator - call before use */
+void allocator_init(SlabAllocator* alloc);
 
-/*
- * Initialize allocator with given configuration.
- * Returns NULL on allocation failure.
- */
-SlabAllocator* slab_allocator_create(const SlabConfig* config);
+/* Destroy allocator - frees all resources */
+void allocator_destroy(SlabAllocator* alloc);
 
-/*
- * Destroy allocator and free all slabs.
- * Drains cache and releases all memory.
- */
-void slab_allocator_destroy(SlabAllocator* alloc);
+/* Allocate object, returns pointer or NULL on failure */
+void* alloc_obj(SlabAllocator* alloc, uint32_t size, SlabHandle* out_handle);
 
-/*
- * Allocate object of given size.
- * Returns pointer to allocated memory, or NULL on failure.
- * If out_handle is non-NULL, fills it with handle for later free.
- */
-void* slab_alloc(SlabAllocator* alloc, uint32_t size, SlabHandle* out_handle);
-
-/*
- * Free previously allocated object using handle.
- * Returns true on success, false if handle is invalid.
- */
-bool slab_free(SlabAllocator* alloc, SlabHandle handle);
+/* Free object using handle */
+bool free_obj(SlabAllocator* alloc, SlabHandle handle);
 
 /* -------------------- Instrumentation -------------------- */
 
-/*
- * Get performance counters for specific size class.
- * size_class is index (0-based), not byte size.
- * Returns false if size_class is out of range.
- */
-bool slab_get_counters(SlabAllocator* alloc, uint32_t size_class, PerfCounters* out);
-
-/*
- * Reset performance counters for specific size class.
- * Useful for benchmark phases.
- */
-void slab_reset_counters(SlabAllocator* alloc, uint32_t size_class);
+/* Get performance counters for size class index (0-3) */
+void get_perf_counters(SlabAllocator* alloc, uint32_t size_class, PerfCounters* out);
 
 /* -------------------- Utilities -------------------- */
 
-/*
- * Get size class index for given object size.
- * Returns -1 if size exceeds largest size class.
- */
-int slab_size_class_for(SlabAllocator* alloc, uint32_t size);
+/* Calculate objects per slab for given object size */
+uint32_t slab_object_count(uint32_t obj_size);
 
-/*
- * Get number of objects per slab for given size class.
- * Returns 0 if size_class is out of range.
- */
-uint32_t slab_objects_per_slab(SlabAllocator* alloc, uint32_t size_class);
+/* Read process RSS in bytes (Linux only, 0 on other platforms) */
+uint64_t read_rss_bytes_linux(void);
 
-/* -------------------- Platform-Specific -------------------- */
-
-/*
- * Read RSS (Resident Set Size) in bytes.
- * Linux-only - returns 0 on other platforms.
- */
-uint64_t slab_read_rss_bytes(void);
-
-/*
- * Get current time in nanoseconds (monotonic clock).
- */
-uint64_t slab_now_ns(void);
+/* Get monotonic time in nanoseconds */
+uint64_t now_ns(void);
 
 #endif /* SLAB_ALLOC_H */
