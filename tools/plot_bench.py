@@ -180,6 +180,51 @@ def plot_latency_cdf(data: List[Dict], output_dir: Path):
     plt.close()
 
 
+def plot_rss_over_time(data: List[Dict], output_dir: Path):
+    """Plot RSS stability over churn cycles"""
+    if not data:
+        print("No RSS churn data found", file=sys.stderr)
+        return
+    
+    cycles = [int(row['cycle']) for row in data]
+    rss_values = [float(row['rss_mib']) for row in data]
+    allocated = [int(row['slabs_allocated']) for row in data]
+    recycled = [int(row['slabs_recycled']) for row in data]
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    
+    # Top plot: RSS over time
+    ax1.plot(cycles, rss_values, linewidth=2, color='steelblue', marker='o', markersize=3)
+    ax1.set_xlabel('Churn Cycle', fontsize=11)
+    ax1.set_ylabel('RSS (MiB)', fontsize=11)
+    ax1.set_title('RSS Stability Under Sustained Churn', fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    
+    # Add growth annotation
+    if rss_values:
+        rss_initial = rss_values[0]
+        rss_final = rss_values[-1]
+        growth_pct = ((rss_final - rss_initial) / rss_initial) * 100
+        ax1.axhline(y=rss_initial, color='green', linestyle='--', linewidth=1, alpha=0.5, label=f'Initial: {rss_initial:.2f} MiB')
+        ax1.axhline(y=rss_final, color='red', linestyle='--', linewidth=1, alpha=0.5, label=f'Final: {rss_final:.2f} MiB ({growth_pct:+.1f}%)')
+        ax1.legend(loc='upper left')
+    
+    # Bottom plot: Slab allocation vs recycling
+    ax2.plot(cycles, allocated, linewidth=2, color='coral', marker='s', markersize=3, label='Slabs Allocated')
+    ax2.plot(cycles, recycled, linewidth=2, color='forestgreen', marker='^', markersize=3, label='Slabs Recycled')
+    ax2.set_xlabel('Churn Cycle', fontsize=11)
+    ax2.set_ylabel('Slab Count', fontsize=11)
+    ax2.set_title('Slab Lifecycle (Allocation vs Recycling)', fontsize=12, fontweight='bold')
+    ax2.legend(loc='upper left')
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    output_path = output_dir / 'rss_over_time.png'
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Generated: {output_path}")
+    plt.close()
+
+
 def plot_summary_card(latency_data: List[Dict], frag_data: List[Dict], output_dir: Path):
     """Generate summary card with key metrics"""
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -271,8 +316,9 @@ def main():
     # Separate by type
     latency_data = [row for row in all_data if 'op' in row]
     frag_data = [row for row in all_data if 'efficiency_pct' in row and 'op' not in row]
+    rss_data = [row for row in all_data if 'cycle' in row and 'rss_mib' in row]
     
-    print(f"Loaded {len(latency_data)} latency rows, {len(frag_data)} fragmentation rows")
+    print(f"Loaded {len(latency_data)} latency rows, {len(frag_data)} fragmentation rows, {len(rss_data)} RSS samples")
     
     # Generate charts
     print("\nGenerating visualizations...")
@@ -283,6 +329,9 @@ def main():
     
     if frag_data:
         plot_fragmentation(frag_data, args.output)
+    
+    if rss_data:
+        plot_rss_over_time(rss_data, args.output)
     
     if latency_data or frag_data:
         plot_summary_card(latency_data, frag_data, args.output)
