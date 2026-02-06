@@ -1,12 +1,14 @@
-# Cache-Based Database Innovation Frontiers
+# Cache System Innovation Frontiers
 
 ## Overview
 
-This document explores the current innovation gaps in cache-based database systems, focusing on opportunities created by evolving hardware architectures and the transition from the traditional "RAM is fast, Disk is slow" paradigm to a more nuanced memory hierarchy.
+This document explores the current innovation gaps in cache systems, focusing on opportunities created by evolving hardware architectures and the transition from the traditional "RAM is fast, Disk is slow" paradigm to a more nuanced memory hierarchy.
+
+**Note**: ZNS-Slab is a cache system, not a system of record. It optimizes ephemeral storage rather than durable persistence.
 
 ## The Changing Landscape
 
-For decades, database caching was binary: data existed either in DRAM (fast) or on disk (slow). Modern hardware has fundamentally disrupted this dichotomy with:
+For decades, caching was binary: data existed either in DRAM (fast) or on disk (slow). Modern hardware has fundamentally disrupted this dichotomy with:
 
 - **NVMe SSDs**: Near-RAM speeds at a fraction of the cost
 - **Persistent Memory (PMEM)**: Non-volatile memory with DRAM-like latency
@@ -178,9 +180,9 @@ This is the foundational insight. Everything else follows:
 - Write amplification = 1
 - Perfect cache locality
 
-#### Why Redis Cannot Easily Adopt This
+#### Why Redis Is Architecturally Constrained From This
 
-Redis cannot easily adopt lifetime-aligned slabs because its object model assumes *independent key eviction* and *arbitrary object lifetimes*. Retrofitting slab-aligned eviction would require fundamental changes to Redis's LRU implementation and memory manager.
+Redis is architecturally constrained from adopting lifetime-aligned slabs because its object model assumes *independent key eviction* and *arbitrary object lifetimes*. Retrofitting slab-aligned eviction would require fundamental changes to Redis's LRU implementation and memory manager, breaking backward compatibility.
 
 #### Core Concept
 Design a specialized allocator that packs small objects into contiguous "Slabs" that match CPU cache line sizes (typically 64 bytes) and page sizes (4KB).
@@ -227,6 +229,8 @@ Design a specialized allocator that packs small objects into contiguous "Slabs" 
 | Memory overhead | 62% | 3% | 20x improvement |
 | Cache misses | High | Minimal | 10x reduction |
 | Bulk scan | 1000/μs | 10000/μs | 10x faster |
+
+**About ZNS**: ZNS (Zoned Namespace) NVMe enhances ZNS-Slab's deletion and write amplification guarantees through hardware zone resets, but the slab allocator remains valuable even on conventional NVMe due to reduced fragmentation and superior cache locality.
 
 ---
 

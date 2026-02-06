@@ -1,6 +1,8 @@
 # ZNS-Slab: Specialized Cache for Sub-4KB Objects
 
-A cache-based database optimized for small objects, designed to outperform Redis through slab allocation and cache-line optimization.
+A cache system optimized for small objects, designed to outperform Redis through slab allocation and cache-line optimization.
+
+**Important**: ZNS-Slab is a cache system, not a system of record. It provides fast, memory-efficient storage for ephemeral data.
 
 **Target Performance**: 4x faster access, 20x better memory efficiency for 128-byte objects.
 
