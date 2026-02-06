@@ -70,13 +70,13 @@ static void* soak_worker(void* arg) {
     
     /* Free batch */
     for (int i = 0; i < batch_size && !g_stop; i++) {
-      if (handles[i].slab) {
+      if (handles[i] != 0) {
         if (free_obj(a->alloc, handles[i])) {
           a->stats->frees++;
         } else {
           a->stats->failures++;
         }
-        handles[i].slab = NULL;
+        handles[i] = 0;
       }
     }
   }
