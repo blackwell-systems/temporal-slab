@@ -1,0 +1,16 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+src/slab_lib.c
+
+# Executables
+src/slab_alloc
+src/benchmark_accurate
+
+# Test outputs
+*.log
+
+# Archive files (for local comparison only)
+benchmark_results_phase1.0_baseline.txt
