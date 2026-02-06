@@ -1,27 +1,41 @@
 # Performance Results
 
-Benchmark results for temporal-slab on representative workloads.
+Validated benchmark results comparing temporal-slab against system_malloc.
+
+**See full benchmark suite:** [temporal-slab-allocator-bench](https://github.com/blackwell-systems/temporal-slab-allocator-bench)
+
+## Executive Summary
+
+temporal-slab delivers on its core promise: **bounded RSS and predictable tail latency** under sustained churn.
+
+**Key Findings (100K objects, 10% turnover, 100 cycles):**
+
+| Metric | system_malloc | temporal_slab | Outcome |
+|--------|---------------|---------------|---------|
+| **RSS growth** | 0% | 0% | ✓ Both achieve perfect stability |
+| **Baseline memory** | 15.98 MiB | 21.83 MiB | +37% overhead (trade-off) |
+| **p50 allocation** | 21ns | 30ns | 43% slower (acceptable) |
+| **p99 allocation** | 1,238ns | 374ns | **3.3x better** (key advantage) |
+| **p999 allocation** | 3,813ns | 959ns | **4.0x better** |
 
 ## What These Results Demonstrate
 
-temporal-slab is optimized for a specific but common class of workloads. These benchmarks demonstrate that it provides:
+1. **Bounded RSS under realistic churn** ✓
+   - 0% growth over 100 cycles with 10% object turnover
+   - Validates core design claim
+   - Both allocators achieve stability when objects coexist
 
-1. **Deterministic allocation latency**
-   - Sub-100ns median (p50)
-   - Low p99/p50 ratio (consistent performance)
-   - No background pauses or compaction spikes
+2. **Predictable tail latency** ✓
+   - 3.3x better p99, 4.0x better p999 vs system_malloc
+   - Lock-free design prevents contention spikes
+   - Critical for HFT and latency-sensitive systems
 
-2. **Stable memory usage under churn**
-   - RSS remains bounded even under sustained alloc/free cycles
-   - 2.4% growth over 1000 churn cycles (vs 20-50% for malloc/tcmalloc)
-   - No long-term memory inflation
-
-3. **Predictable trade-offs**
+3. **Honest trade-offs** ✓
+   - +37% memory overhead (slab structure cost)
+   - Slower median allocation (30ns vs 21ns)
    - Fixed internal fragmentation (11.1% average)
-   - Zero external fragmentation (no holes, no search)
-   - O(1) allocation cost (deterministic class selection)
 
-**Important:** temporal-slab does not attempt to outperform general-purpose allocators across all workloads. It exists to eliminate latency variance and RSS drift in churn-heavy systems with fixed-size allocation patterns.
+**Important:** temporal-slab sacrifices median performance and memory efficiency for predictable tail latency and RSS stability. It excels in workloads where worst-case behavior matters more than average-case performance.
 
 ## Test Environment
 
