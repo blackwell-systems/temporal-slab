@@ -6,7 +6,7 @@
 #include <stddef.h>
 
 /*
- * ZNS-Slab Phase 1.6 - Public API
+ * temporal-slab Phase 1.6 - Public API
  * 
  * Specialized slab allocator for sub-4KB objects.
  * 

@@ -1,5 +1,5 @@
 /*
- * slab_alloc.c - ZNS-Slab Phase 1.5 Implementation
+ * slab_alloc.c - temporal-slab Phase 1.5 Implementation
  * 
  * Release-quality slab allocator with:
  * - Lock-free fast path (atomic current_partial pointer)

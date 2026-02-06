@@ -355,7 +355,7 @@ static void benchmark_fragmentation(void) {
 /* ------------------------------ Main ------------------------------ */
 
 int main(void) {
-  printf("ZNS-Slab Phase 1 - Accurate Benchmarks\n");
+  printf("temporal-slab Phase 1 - Accurate Benchmarks\n");
   printf("======================================\n");
   
   benchmark_rss_accurate();

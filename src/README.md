@@ -1,4 +1,4 @@
-# ZNS-Slab Source Code
+# temporal-slab Source Code
 
 ## Implementation
 
@@ -11,9 +11,9 @@ Production-quality slab allocator optimized for sustained churn, predictable lat
 - **Opaque handles** - 64-bit encoding hides implementation details
 - **Dual API** - Handle-based (explicit control) and malloc-style (drop-in replacement)
 
-## When to Use ZNS-Slab
+## When to Use temporal-slab
 
-ZNS-Slab is designed for long-running systems that:
+temporal-slab is designed for long-running systems that:
 - Allocate and free many small, fixed-size objects
 - Require stable RSS under sustained churn
 - Are sensitive to tail latency

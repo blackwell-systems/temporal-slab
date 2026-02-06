@@ -1,5 +1,5 @@
 /*
- * smoke_tests.c - ZNS-Slab Phase 1.5 Smoke Tests
+ * smoke_tests.c - temporal-slab Phase 1.5 Smoke Tests
  * 
  * Basic correctness tests:
  * - Single-threaded alloc/free
