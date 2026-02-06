@@ -97,11 +97,17 @@ static inline int class_index_for_size(uint32_t sz) {
 
 /* ------------------------------ Intrusive list operations ------------------------------ */
 
+static inline void assert_slab_unlinked(Slab* s) {
+  assert(s->prev == NULL && "slab must be unlinked before insertion");
+  assert(s->next == NULL && "slab must be unlinked before insertion");
+}
+
 static inline void list_init(SlabList* l) {
   l->head = NULL; l->tail = NULL; l->len = 0;
 }
 
 static inline void list_push_back(SlabList* l, Slab* s) {
+  assert_slab_unlinked(s);
   s->prev = l->tail;
   s->next = NULL;
   if (l->tail) l->tail->next = s;
@@ -363,7 +369,11 @@ static Slab* cache_pop(SizeClassAlloc* sc) {
 static void cache_push(SizeClassAlloc* sc, Slab* s) {
   pthread_mutex_lock(&sc->cache_lock);
   
+  /* Slab must be fully unlinked from epoch lists before caching */
+  assert_slab_unlinked(s);
   s->list_id = SLAB_LIST_NONE;  /* Not on partial/full list anymore */
+  s->prev = NULL;  /* Defensive: ensure clean state */
+  s->next = NULL;
   
   if (sc->cache_size < sc->cache_capacity) {
     sc->slab_cache[sc->cache_size++] = s;
