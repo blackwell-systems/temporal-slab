@@ -26,6 +26,8 @@ This document builds the theoretical foundation for temporal-slab from first pri
 **Slab Allocation Model**
 - [Slab Allocator](#slab-allocator)
 - [Lifetime Affinity](#lifetime-affinity)
+- [Epoch](#epoch)
+- [Epoch Advancement](#epoch-advancement)
 - [Slab](#slab)
 - [Size Class](#size-class)
 - [Internal Fragmentation](#internal-fragmentation)
@@ -476,6 +478,190 @@ The problem is that the allocator does not know object lifetimes in advance. A s
 The solution is allocation-order affinity: group allocations that occur close together in time. Programs exhibit temporal locality—allocations that occur around the same time are often causally related and thus have correlated lifetimes. A web server handling a request allocates a request object, a response object, a buffer, and a session token. These are allocated in quick succession. They are causally related—created for the same request. When the request completes, they are all freed. If they are in the same page, that page becomes empty.
 
 Allocation-order affinity does not require the allocator to predict lifetimes. It requires the allocator to allocate sequentially within pages, so objects allocated in the same epoch end up in the same page. Lifetime correlation emerges naturally from allocation patterns, not from explicit hints.
+
+## Epoch
+
+An epoch is a time window during which allocations are grouped together onto the same set of slabs. It is the mechanism that implements lifetime affinity: objects allocated in the same epoch share slabs, separating them from objects allocated in different epochs.
+
+An epoch is identified by a simple integer (EpochId): 0, 1, 2, ..., 15. temporal-slab uses a ring buffer of 16 epochs, so epoch IDs wrap around (after epoch 15 comes epoch 0 again). Each epoch maintains its own set of slabs per size class:
+
+```
+Size Class 128 bytes:
+  Epoch 0: [Slab A][Slab B][Slab C]...
+  Epoch 1: [Slab D][Slab E]...
+  Epoch 2: [Slab F]...
+  ...
+  Epoch 15: [Slab Z]...
+```
+
+When you allocate an object, you specify which epoch it belongs to:
+
+```c
+void* ptr = slab_malloc_epoch(alloc, 128, current_epoch);
+```
+
+The allocator finds a slab from that epoch's pool and allocates a slot. All objects allocated with `current_epoch = 1` will be placed on slabs belonging to epoch 1, physically separated from objects in epoch 0 or epoch 2.
+
+**Why epochs prevent RSS growth:**
+
+Without epochs, objects with different lifetimes mix on the same slabs. A slab might contain:
+- 5 short-lived request objects (freed after 10ms)
+- 2 long-lived connection handles (live for 60 seconds)
+
+When the requests are freed, the slab has 5 empty slots but remains allocated because the 2 connections are still alive. The slab cannot be recycled. This is temporal fragmentation.
+
+With epochs, you separate lifetimes explicitly:
+
+```c
+// Long-lived backbone allocations in epoch 0
+void* connection = slab_malloc_epoch(alloc, 128, 0);
+
+// Short-lived request allocations in rotating epochs
+void* request = slab_malloc_epoch(alloc, 128, current_epoch);
+```
+
+Now the slabs are separated:
+- Epoch 0 slabs: 100% full with long-lived connections (no waste)
+- Epoch 1 slabs: All requests from time window T=0-5s (all freed together)
+
+When epoch 1's requests all die, its slabs become completely empty—no mixed lifetimes pin them. The slabs can be recycled immediately. RSS does not grow.
+
+**The epoch allocation pattern:**
+
+A typical application uses epochs like this:
+
+```c
+// Epoch 0: Static, long-lived data (server config, caches)
+void* static_data = slab_malloc_epoch(alloc, 256, 0);
+
+// Epochs 1-15: Rotating window for short-lived data
+for (int i = 0; i < 1000000; i++) {
+    if (i % 10000 == 0) {
+        epoch_advance(alloc);  // Rotate to next epoch every 10K requests
+    }
+    
+    EpochId current = epoch_current(alloc);
+    void* request_data = slab_malloc_epoch(alloc, 128, current);
+    
+    process_request(request_data);
+    
+    slab_free(alloc, request_data);
+}
+```
+
+Every 10,000 requests, the application advances to the next epoch. Old epochs gradually drain as their objects are freed. Slabs from drained epochs are recycled. The 16-epoch ring buffer provides a sliding window: the oldest epoch (16 epochs ago) is fully drained by the time you wrap around and reuse that epoch ID.
+
+**Epoch properties:**
+
+- **No forced expiration:** Advancing to a new epoch does not free objects from old epochs. Objects live until explicitly freed via `slab_free()`. Epochs only affect where new allocations go.
+- **Natural drainage:** Old epochs drain as objects are freed normally. No special GC or compaction required.
+- **Thread-safe:** `epoch_current()` and `epoch_advance()` use atomic operations. Multiple threads can allocate from the same epoch concurrently.
+- **Ring buffer:** 16 epochs wrap around. By the time you reuse epoch 0 again (after 15 advances), epoch 0's previous allocations should be long gone.
+
+**Why 16 epochs?**
+
+16 is a balance between:
+- **Too few epochs (e.g., 2):** Not enough separation—objects with different lifetimes still mix
+- **Too many epochs (e.g., 256):** Excessive overhead—each epoch maintains its own slab pools, fragmenting the allocator's state
+
+16 epochs provide sufficient separation for most workloads: if you advance every 5 seconds, that's 80 seconds of history. Objects living longer than 80 seconds should be allocated in epoch 0 (the "permanent" epoch).
+
+## Epoch Advancement
+
+Epoch advancement is the act of moving from one epoch to the next. When you call `epoch_advance(alloc)`, the allocator increments the current epoch ID (wrapping at 16):
+
+```
+Current epoch: 3
+Call epoch_advance(alloc)
+Current epoch: 4 (all new allocations now go to epoch 4's slabs)
+```
+
+Advancing epochs does two things:
+
+**1. Starts a new allocation cohort:**
+
+All allocations after advancement go to the new epoch's slabs. This separates them from the previous epoch's allocations:
+
+```
+Before advancement (epoch 3):
+Slab A (Epoch 3): [Obj 1][Obj 2][Obj 3]...
+
+Call epoch_advance() → Now epoch 4
+
+After advancement (epoch 4):
+Slab A (Epoch 3): [Obj 1][Obj 2][Obj 3]... (no new allocations)
+Slab B (Epoch 4): [Obj 4][Obj 5][Obj 6]... (new allocations go here)
+```
+
+**2. Closes the previous epoch for new allocations:**
+
+Epoch 3 is now "closed"—no new objects will be allocated there. Existing objects in epoch 3 remain alive until freed, but the slab pool stops growing. This allows epoch 3's slabs to drain naturally:
+
+```
+T=0: Advance to epoch 4
+     Epoch 3 has 1000 objects on 100 slabs
+
+T=10s: 500 objects from epoch 3 freed
+       Epoch 3 has 500 objects on 100 slabs (some slabs partially empty)
+
+T=60s: All 1000 objects from epoch 3 freed
+       Epoch 3 has 0 objects, 100 empty slabs
+       All 100 slabs pushed to cache → Available for reuse
+```
+
+**When to advance epochs:**
+
+Applications advance based on their workload characteristics:
+
+**Time-based advancement:**
+```c
+// Advance every 10 seconds
+if (time_now() - last_advance_time > 10) {
+    epoch_advance(alloc);
+    last_advance_time = time_now();
+}
+```
+
+**Request-based advancement:**
+```c
+// Advance every 10,000 requests
+if (++request_count % 10000 == 0) {
+    epoch_advance(alloc);
+}
+```
+
+**Batch-based advancement:**
+```c
+// Advance after processing each batch
+while (has_more_batches()) {
+    Batch* batch = get_next_batch();
+    epoch_advance(alloc);  // Each batch gets its own epoch
+    process_batch(batch);
+}
+```
+
+**Future: Epoch recycling (not yet implemented):**
+
+Currently, temporal-slab does not implement aggressive epoch recycling. Slabs become empty and are recycled through the normal FULL-only mechanism, but there is no explicit "close and drain this epoch" API.
+
+A future `epoch_close()` API could accelerate recycling:
+
+```c
+void epoch_close(SlabAllocator* alloc, EpochId epoch) {
+    // Mark epoch as closed
+    // Stop refilling partially-empty slabs from this epoch
+    // Let them drain without new allocations
+    // Move all PARTIAL slabs to a "draining" list
+    // Recycle them aggressively once empty
+}
+```
+
+This would enable:
+- **Faster RSS reclamation:** Drained epochs release memory sooner
+- **Explicit lifetime boundaries:** Applications can close epochs representing completed work
+- **Better memory attribution:** Track which epochs are holding memory
+
+However, the current design already achieves 0% RSS growth under steady-state churn without epoch recycling. The mechanism exists primarily to **prevent** growth, not to aggressively shrink RSS.
 
 ## Slab
 
