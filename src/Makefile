@@ -1,25 +1,30 @@
 CC = gcc
 CFLAGS = -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include
 
-all: slab_alloc benchmark_accurate
+all: smoke_tests benchmark_accurate soak_test
 
-# Extract library functions (everything before main) and remove static/inline qualifiers
+# Core library object (implementation only, no main)
 slab_lib.c: slab_alloc.c
-	sed '/^int main(void)/,$$d' slab_alloc.c | \
-	sed 's/^static inline //g' | \
+	sed 's/^static inline //g' slab_alloc.c | \
 	sed 's/^static //g' | \
 	sed 's/^inline //g' > slab_lib.c
 
 slab_lib.o: slab_lib.c
 	$(CC) $(CFLAGS) -c slab_lib.c -o slab_lib.o
 
-slab_alloc: slab_alloc.c
-	$(CC) $(CFLAGS) slab_alloc.c -o slab_alloc
+# Smoke tests executable
+smoke_tests: smoke_tests.c slab_lib.o
+	$(CC) $(CFLAGS) smoke_tests.c slab_lib.o -o smoke_tests
 
+# Accurate benchmark executable
 benchmark_accurate: benchmark_accurate.c slab_lib.o
 	$(CC) $(CFLAGS) benchmark_accurate.c slab_lib.o -o benchmark_accurate
 
+# Soak test executable (long-running stability test)
+soak_test: soak_test.c slab_lib.o
+	$(CC) $(CFLAGS) soak_test.c slab_lib.o -o soak_test
+
 clean:
-	rm -f slab_alloc benchmark_accurate slab_lib.c slab_lib.o
+	rm -f smoke_tests benchmark_accurate soak_test slab_lib.c slab_lib.o
 
 .PHONY: all clean
