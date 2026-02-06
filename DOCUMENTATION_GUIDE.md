@@ -63,14 +63,28 @@ Also see: [README.md Resume Impact section](./README.md#resume-impact)
 
 ---
 
+### 📊 "I want to see benchmark data and performance claims"
+→ [BENCHMARKS.md](./BENCHMARKS.md)
+
+**Ground truth for all performance claims:**
+- Canonical slab layout with exact overhead calculations
+- Design targets vs. validated results (clearly separated)
+- Redis baseline analysis methodology
+- Reproducible benchmark specifications
+- Commitment to honest measurement
+
+**Read this if you're skeptical about the numbers.**
+
+---
+
 ### 🛠️ "I want implementation details"
 → [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)
 
 Complete specification including:
-- Memory layouts and data structures (Go code)
+- Memory layouts and data structures
 - Algorithm specifications with latency targets
 - Concurrency model (lock-free reads, per-bucket locking)
-- Performance benchmarks and workload assumptions
+- Performance targets with workload assumptions
 - API design and configuration
 
 **Read this if you want to BUILD this.**
@@ -81,9 +95,9 @@ Complete specification including:
 → [README.md Quick Start](./README.md#quick-start)
 
 Then:
-1. Review baseline benchmark requirements
-2. Read [TECHNICAL_DESIGN.md Phase 1](./TECHNICAL_DESIGN.md#phase-1-core-slab-allocator)
-3. Start with `src/allocator/slab.go`
+1. Review [BENCHMARKS.md](./BENCHMARKS.md) for measurement methodology
+2. Read [TECHNICAL_DESIGN.md Phase 1](./TECHNICAL_DESIGN.md#core-data-structures)
+3. Implementation language: C/Rust (TBD in Phase 1)
 
 ---
 
@@ -138,6 +152,7 @@ Read in this order:
 |----------|----------|---------|---------|
 | README.md | Everyone | 3 min | Project overview |
 | EXECUTIVE_SUMMARY.md | Non-technical | 5 min | High-level understanding |
+| BENCHMARKS.md | Engineers/Skeptics | 10 min | Performance ground truth |
 | USE_CASES.md | Product/Business | 10 min | Real-world applications |
 | INNOVATION_FRONTIERS.md | Strategic | 15 min | Market context |
 | TECHNICAL_DESIGN.md | Engineers | 30 min | Implementation |
@@ -151,11 +166,13 @@ Read in this order:
 
 This is the foundational insight everything else builds on.
 
-### The Numbers
-- **62% → 3%**: Memory overhead reduction (Redis vs ZNS-Slab)
-- **4x faster**: GET operation latency improvement (200ns → 50ns)
-- **20x better**: Overall memory efficiency gain
-- **8x density**: Objects per GB of memory
+### The Numbers (Phase 1 Targets)
+- **<5% overhead**: Per-object metadata (vs estimated 30-50% for Redis/malloc)
+- **2-3x faster allocation**: Target <100ns p99 (vs malloc ~150-300ns)
+- **Zero fragmentation**: Guaranteed by fixed-size slots
+- **6.4 bytes overhead** per 128B object (192 bytes slab metadata / 30 objects)
+
+**All numbers are design targets. See [BENCHMARKS.md](./BENCHMARKS.md) for validation status.**
 
 ### The Three Frontiers (Broken Assumptions)
 1. **Tiered Memory**: Binary "RAM or disk" model collapsed
@@ -189,7 +206,7 @@ This is the foundational insight everything else builds on.
 → [USE_CASES.md](./USE_CASES.md) (comprehensive) or [EXECUTIVE_SUMMARY.md Use Cases](./EXECUTIVE_SUMMARY.md#why-it-matters) (quick summary)
 
 **Q: What are the performance targets?**
-→ [TECHNICAL_DESIGN.md Performance Targets](./TECHNICAL_DESIGN.md#performance-targets)
+→ [BENCHMARKS.md](./BENCHMARKS.md) (authoritative source) or [TECHNICAL_DESIGN.md Performance Targets](./TECHNICAL_DESIGN.md#performance-targets) (summary)
 
 **Q: Why can't Redis just add this?**
 → [INNOVATION_FRONTIERS.md Why Redis Is Constrained](./INNOVATION_FRONTIERS.md#why-redis-is-architecturally-constrained-from-this)
@@ -208,6 +225,7 @@ This is the foundational insight everything else builds on.
 |----------|--------|-------|
 | README.md | ✅ Stable | Entry point, regularly updated |
 | EXECUTIVE_SUMMARY.md | ✅ Stable | Use for presentations |
+| BENCHMARKS.md | ✅ Stable | Ground truth for all performance claims |
 | USE_CASES.md | ✅ Stable | Market validation |
 | INNOVATION_FRONTIERS.md | ✅ Stable | Strategic context |
 | TECHNICAL_DESIGN.md | ✅ Stable | Implementation spec |
@@ -236,25 +254,34 @@ This is the foundational insight everything else builds on.
 
 **TECHNICAL_DESIGN.md** - Update when:
 - Implementation details are finalized
-- Benchmarks produce actual numbers
 - API design evolves
+- Algorithmic changes occur
+
+**BENCHMARKS.md** - Update when:
+- Any measurement is completed
+- Targets change based on feasibility analysis
+- New benchmark methodologies are added
+- **This is the authoritative source for all performance claims**
 
 ### Documentation Style Guide
 
-1. **Numbers need citations**: "62% overhead (Redis baseline)" not just "high overhead"
-2. **Assumptions must be explicit**: "Assumes uniform access distribution"
-3. **Claims must be defensible**: "4x faster (50ns vs 200ns p99)" not "much faster"
-4. **Trade-offs must be stated**: "Non-goal: Complex query language"
-5. **Skepticism increases credibility**: "Advisory, not authoritative" for AI features
-6. **Calm comparisons**: "Redis is architecturally constrained from" not "Redis cannot"
-7. **Cache vs database clarity**: "ZNS-Slab is a cache system, not a system of record"
-8. **ZNS as enhancement**: "ZNS enhances... but remains valuable on conventional NVMe"
+1. **All numbers reference BENCHMARKS.md**: Every performance claim must link to ground truth
+2. **Targets vs. validated**: Clearly label "Target:" vs "Measured:" everywhere
+3. **Assumptions must be explicit**: "Assumes uniform access, no network, CPU cache warm"
+4. **Claims must be reproducible**: Exact test conditions, commands, environment documented
+5. **Trade-offs must be stated**: "Non-goal: Complex query language"
+6. **Skepticism increases credibility**: "Advisory, not authoritative" for advanced features
+7. **Calm comparisons**: "Redis is architecturally constrained from" not "Redis cannot"
+8. **Cache vs database clarity**: "ZNS-Slab is a cache system, not a system of record"
+9. **ZNS as enhancement**: "ZNS enhances... but remains valuable on conventional NVMe"
+10. **No invented numbers**: If we can't measure it yet, we retract or label as target
 
 ---
 
 ## Getting Help
 
 - **Conceptual questions**: Start with [EXECUTIVE_SUMMARY.md](./EXECUTIVE_SUMMARY.md)
+- **Performance skepticism**: See [BENCHMARKS.md](./BENCHMARKS.md)
 - **Implementation questions**: See [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)
 - **Strategic questions**: Read [INNOVATION_FRONTIERS.md](./INNOVATION_FRONTIERS.md)
 - **Navigation confusion**: You're reading it (this file)
