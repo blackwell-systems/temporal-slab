@@ -8,26 +8,48 @@
 /*
  * temporal-slab - Lifetime-Aware Memory Allocator
  * 
- * A lock-free slab allocator that groups allocations by time to prevent
+ * A specialized slab allocator that groups allocations by time to prevent
  * temporal fragmentation. Objects allocated together are placed in the same
  * slab, so when their lifetimes end, the slab can be recycled as a unit.
  * 
+ * DESIGN GOAL:
+ * Eliminate latency variance and RSS drift in churn-heavy workloads with
+ * fixed-size allocation patterns. Not a general-purpose malloc replacement.
+ * 
  * KEY PROPERTIES:
- * - Lock-free allocation fast path (sub-100ns)
- * - Bounded RSS under sustained churn
- * - O(1) deterministic size class selection
- * - Safe handle validation (no crashes on invalid frees)
- * - No background compaction or relocation
+ * - Lock-free allocation fast path (sub-100ns median, <2µs p99)
+ * - Bounded RSS under sustained churn (2.4% growth vs 20-50% for malloc)
+ * - O(1) deterministic size class selection (no branching jitter)
+ * - Safe handle validation (invalid frees return false, never crash)
+ * - No background compaction or relocation (no latency spikes)
+ * 
+ * TRADE-OFFS:
+ * - Fixed size classes only (64-768 bytes in 8 classes)
+ * - 11.1% internal fragmentation (vs ~5-10% for jemalloc)
+ * - No NUMA awareness (single allocator for all threads)
+ * - Compared to jemalloc: sacrifices generality for deterministic behavior
+ * 
+ * IDEAL WORKLOADS:
+ * - High-frequency trading (HFT) - sub-100ns deterministic allocation
+ * - Session stores - millions of alloc/free per second
+ * - Cache metadata - bounded RSS under continuous eviction
+ * - Connection tracking - predictable latency under load
+ * - Packet buffers - fixed sizes, high churn
+ * 
+ * NOT SUITABLE FOR:
+ * - Variable-size allocations (use jemalloc/tcmalloc)
+ * - Large objects >768 bytes (use general-purpose allocator)
+ * - Drop-in malloc replacement (use jemalloc with LD_PRELOAD)
  * 
  * BASIC USAGE:
  *   SlabAllocator* a = slab_allocator_create();
  *   
- *   // Handle-based API (zero overhead)
+ *   // Handle-based API (zero overhead, explicit control)
  *   SlabHandle h;
  *   void* p = alloc_obj(a, 128, &h);
  *   free_obj(a, h);
  *   
- *   // malloc-style API (8-byte overhead per allocation)
+ *   // malloc-style API (8-byte overhead, familiar interface)
  *   void* q = slab_malloc(a, 128);
  *   slab_free(a, q);
  *   
@@ -36,9 +58,16 @@
  * THREAD SAFETY:
  * - All functions are thread-safe
  * - Allocation fast path is lock-free (no mutex contention)
- * - Multiple allocators can be used independently
+ * - Scales linearly to ~4 threads (cache coherence limits beyond 8)
+ * - Multiple allocator instances are independent
  * 
- * See docs/foundations.md for design rationale.
+ * PERFORMANCE:
+ * See docs/results.md for detailed benchmarks and charts.
+ * Quick summary: 70ns p50, 1.7µs p99, 2.4% RSS growth over 1000 churn cycles.
+ * 
+ * DESIGN RATIONALE:
+ * See docs/foundations.md for first-principles explanation of temporal
+ * fragmentation, entropy, and lifetime-aware allocation strategies.
  */
 
 /* ==================== Configuration ==================== */
@@ -94,17 +123,36 @@ typedef uint64_t SlabHandle;
 /* Performance counters for a single size class
  * 
  * These counters help attribute tail latency and diagnose allocator behavior.
- * All counters are monotonically increasing (never reset).
+ * All counters are monotonically increasing (never reset during allocator lifetime).
  * 
  * USAGE:
  *   PerfCounters pc;
  *   get_perf_counters(alloc, 2, &pc);  // size class 2 = 128 bytes
  *   printf("Slow path hits: %lu\n", pc.slow_path_hits);
  * 
- * INTERPRETATION:
- * - High slow_path_hits → contention or frequent slab exhaustion
- * - new_slab_count - empty_slab_recycled → net memory growth
- * - empty_slab_overflowed → cache too small for workload
+ * DIAGNOSTIC PATTERNS:
+ * 
+ * 1. Memory Growth:
+ *    net_slabs = new_slab_count - empty_slab_recycled
+ *    RSS_growth_MB = net_slabs * 4096 / 1024 / 1024
+ *    If net_slabs keeps growing: workload not reaching steady state
+ * 
+ * 2. Cache Effectiveness:
+ *    recycle_rate = empty_slab_recycled / (empty_slab_recycled + empty_slab_overflowed)
+ *    If recycle_rate < 95%: cache too small, increase capacity
+ * 
+ * 3. Slow Path Frequency:
+ *    slow_path_ratio = slow_path_hits / total_allocations
+ *    If ratio > 5%: current_partial churn too high, indicates contention
+ * 
+ * 4. Slab Lifecycle Health:
+ *    If list_move_partial_to_full >> list_move_full_to_partial:
+ *      Slabs filling up but not emptying (lifetime mismatch or leak)
+ * 
+ * RED FLAGS:
+ * - empty_slab_overflowed > 0: Cache too small or memory leak
+ * - new_slab_count - empty_slab_recycled > 10K: RSS will be >40MB for this class
+ * - slow_path_hits > 10% of allocations: Fast path not effective
  */
 typedef struct PerfCounters {
   uint64_t slow_path_hits;              /* Total times fast path failed (lock acquired) */
@@ -126,22 +174,71 @@ typedef struct PerfCounters {
  * 
  * RETURNS: Pointer to allocator, or NULL on allocation failure
  * 
+ * INITIALIZATION:
+ * - Builds O(1) class lookup table (768 bytes, once per process)
+ * - Allocates per-size-class structures (~4KB total)
+ * - Initializes slab cache (32 slots × 8 classes = 256 slab capacity)
+ * - Does NOT pre-allocate slabs (allocated on first use per class)
+ * 
+ * LIFETIME:
+ * - Create once per subsystem (e.g., one for sessions, one for cache)
+ * - Share across threads (lock-free fast path scales to ~4 threads)
+ * - Destroy when subsystem shuts down
+ * 
+ * TYPICAL PATTERN:
+ *   // At service startup
+ *   SlabAllocator* session_alloc = slab_allocator_create();
+ *   SlabAllocator* cache_alloc = slab_allocator_create();
+ *   
+ *   // During service operation (any thread)
+ *   void* session = alloc_obj(session_alloc, 256, &h);
+ *   
+ *   // At service shutdown
+ *   slab_allocator_free(session_alloc);
+ *   slab_allocator_free(cache_alloc);
+ * 
  * THREAD SAFETY: The returned allocator is thread-safe for all operations.
  * Multiple threads can allocate/free concurrently from the same allocator.
- * 
- * MEMORY: Allocates ~4KB for allocator structure plus cache storage.
- * Does not pre-allocate slabs (slabs are allocated on first use per class).
  */
 SlabAllocator* slab_allocator_create(void);
 
 /* Destroy allocator and release all memory
  * 
- * SAFETY:
- * - All slabs are unmapped (handles become invalid)
- * - Any use of handles after this call is undefined behavior
- * - Does NOT validate that all allocations were freed
+ * Unmaps all slabs and releases allocator structure. All handles become invalid.
  * 
- * THREAD SAFETY: Caller must ensure no concurrent operations on this allocator.
+ * PRECONDITIONS:
+ * - No threads are concurrently using this allocator
+ * - Caller has finished all operations on allocated objects
+ * 
+ * BEHAVIOR:
+ * - Unmaps all slabs (partial, full, cached, overflowed)
+ * - Frees allocator structure
+ * - Does NOT validate that all objects were freed (leaks are caller's responsibility)
+ * - Does NOT zero memory (for security-sensitive data, zero before freeing)
+ * 
+ * SAFETY:
+ * - All handles become invalid (dereferencing them is undefined behavior)
+ * - Pointers returned by alloc_obj/slab_malloc become dangling
+ * - Any use after destroy may crash or corrupt memory
+ * 
+ * TYPICAL CLEANUP PATTERN:
+ *   // Free all known allocations first
+ *   for (each tracked handle) {
+ *     free_obj(alloc, handle);
+ *   }
+ *   
+ *   // Then destroy allocator
+ *   slab_allocator_free(alloc);
+ *   alloc = NULL;  // Prevent use-after-free
+ * 
+ * MEMORY LEAK DETECTION:
+ * Use get_perf_counters() before destroy to check for leaks:
+ *   PerfCounters pc;
+ *   get_perf_counters(alloc, class_idx, &pc);
+ *   uint64_t net_slabs = pc.new_slab_count - pc.empty_slab_recycled;
+ *   if (net_slabs > expected) { /* potential leak */ }
+ * 
+ * THREAD SAFETY: Caller must ensure no concurrent operations.
  */
 void slab_allocator_free(SlabAllocator* alloc);
 
@@ -165,6 +262,9 @@ void allocator_destroy(SlabAllocator* alloc);
 
 /* Allocate object with explicit handle
  * 
+ * This is the low-level API with zero per-allocation overhead. The returned
+ * handle encodes the allocation location and must be passed to free_obj().
+ * 
  * PARAMETERS:
  *   alloc      - Allocator instance
  *   size       - Requested size in bytes (must be > 0 and <= 768)
@@ -174,20 +274,36 @@ void allocator_destroy(SlabAllocator* alloc);
  *   Pointer to allocated memory (aligned to 8 bytes), or NULL on failure.
  *   On success, *out_handle is set to a valid handle for later freeing.
  * 
- * SIZE CLASS SELECTION:
- *   Size is rounded up to next size class (O(1) lookup):
+ * SIZE CLASS SELECTION (O(1), deterministic):
+ *   Size is rounded up to next size class via lookup table:
  *   1-64   → 64    |  65-96   → 96    | 97-128   → 128  | 129-192  → 192
  *   193-256 → 256  |  257-384 → 384   | 385-512  → 512  | 513-768  → 768
+ * 
+ *   Internal fragmentation = (rounded_size - requested_size) / rounded_size
+ *   Average waste: 11.1% across realistic distributions
+ * 
+ * ALLOCATION STRATEGY:
+ *   1. Fast path: Atomic load of current_partial slab
+ *   2. Find free slot in bitmap via CAS loop (lock-free)
+ *   3. Slow path (rare): Acquire mutex, select new slab from partial list
+ *   4. If no partial slabs: pop from cache or allocate new slab (mmap)
  * 
  * FAILURE MODES:
  *   Returns NULL if:
  *   - size == 0 or size > 768
  *   - out_handle == NULL
- *   - System out of memory (mmap fails)
+ *   - System out of memory (mmap fails, errno set by OS)
  * 
- * PERFORMANCE:
- *   Fast path: ~70ns (lock-free, no syscalls)
- *   Slow path: ~2-5µs (new slab allocation, mmap call)
+ * PERFORMANCE (Intel Core Ultra 7, 128-byte objects):
+ *   Fast path: ~70ns median, ~200ns p95 (lock-free CAS loop)
+ *   Slow path: ~2-5µs (new slab allocation, mmap syscall)
+ *   Fast path hit rate: >97% in steady state
+ * 
+ * WHEN TO USE THIS API:
+ * - Performance-critical paths (zero overhead)
+ * - Explicit control over allocation lifetime
+ * - Building higher-level data structures (hash tables, pools)
+ * - Willing to track handles separately from pointers
  * 
  * THREAD SAFETY: Safe to call concurrently on same allocator.
  */

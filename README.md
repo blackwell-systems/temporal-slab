@@ -1,12 +1,10 @@
 # temporal-slab
 
-A high-performance slab allocator designed for **sustained allocation/free churn with bounded RSS and predictable latency**.
+temporal-slab is a **lifetime-aware slab allocator** for fixed-size objects, designed for systems that require **predictable latency**, **bounded memory usage**, and **safe behavior under sustained allocation churn**.
 
-temporal-slab provides a lock-free fast path for allocation, conservative recycling for correctness, and explicit safety guarantees for real-world service workloads.
+Traditional allocators optimize for spatial reuse and best-fit placement, which leads to fragmentation, allocator jitter, and unbounded RSS growth in long-running systems. temporal-slab takes a different approach: it organizes memory by **object lifetime**, grouping allocations with similar temporal behavior into slabs that can be reclaimed safely and efficiently.
 
-## What temporal-slab Solves
-
-temporal-slab is a specialized allocator for systems where memory churn, not peak throughput, is the primary source of instability. Traditional allocators degrade over time as objects with mixed lifetimes fragment memory and inflate RSS. temporal-slab prevents this by grouping allocations into fixed-size slabs with aligned lifetimes, enabling predictable latency, bounded memory growth, and safe reuse without compaction or background GC.
+The allocator provides a lock-free fast path, conservative recycling guarantees, and explicit safety contracts, making it suitable for latency-sensitive and correctness-critical systems.
 
 ## Why temporal-slab Exists
 
@@ -247,6 +245,26 @@ typedef struct PerfCounters {
 
 void get_perf_counters(SlabAllocator* alloc, uint32_t size_class, PerfCounters* out);
 ```
+
+## Scope
+
+temporal-slab is intentionally focused on **memory allocation only**.
+
+It provides:
+- Fixed-size object allocation
+- Lock-free fast paths
+- Deterministic reclamation behavior
+- Bounded RSS under sustained churn
+- Strong safety guarantees (no use-after-free, safe stale handle validation)
+
+It does **not** implement:
+- Eviction policies
+- Cache logic
+- TTL management
+- Tiered storage or persistence
+- NUMA placement strategies
+
+Higher-level systems (caches, tiered allocators, eviction frameworks) are expected to be built *on top* of temporal-slab in separate projects.
 
 ## Project Status
 
