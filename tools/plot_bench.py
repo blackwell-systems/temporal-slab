@@ -30,13 +30,32 @@ except ImportError:
 
 
 def load_csv(path: Path) -> List[Dict]:
-    """Load CSV file into list of dictionaries"""
+    """Load CSV file into list of dictionaries (handles multiple sections with headers)"""
     if not path.exists():
         return []
     
+    results = []
     with open(path, 'r') as f:
-        reader = csv.DictReader(f)
-        return list(reader)
+        lines = f.readlines()
+    
+    current_section = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            # Blank line - process accumulated section
+            if current_section:
+                reader = csv.DictReader(current_section)
+                results.extend(list(reader))
+                current_section = []
+        else:
+            current_section.append(line)
+    
+    # Process final section
+    if current_section:
+        reader = csv.DictReader(current_section)
+        results.extend(list(reader))
+    
+    return results
 
 
 def plot_fragmentation(data: List[Dict], output_dir: Path):
