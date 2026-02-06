@@ -2,7 +2,11 @@
 
 ## Executive Summary
 
-ZNS-Slab is a specialized cache-based database optimized for sub-4KB objects, designed to outperform Redis through slab allocation, cache-line optimization, and eventual AI-driven eviction. Target: **4x faster access** and **20x better memory efficiency** for small objects.
+ZNS-Slab is a specialized cache system optimized for sub-4KB objects, designed to outperform Redis through slab allocation, cache-line optimization, and eventual intent-aware eviction. 
+
+**Positioning**: ZNS-Slab is a cache system, not a system of record. It optimizes ephemeral storage (sessions, tokens, counters) rather than durable persistence.
+
+Target: **4x faster access** and **20x better memory efficiency** for small objects.
 
 ---
 
@@ -10,7 +14,7 @@ ZNS-Slab is a specialized cache-based database optimized for sub-4KB objects, de
 
 This system explicitly does **not** aim to be:
 
-1. **General-purpose database replacement** - ZNS-Slab is a cache, not a durable data store
+1. **General-purpose database replacement** - ZNS-Slab is a cache system, not a system of record
 2. **Complex query language** - Key-value operations only; no SQL, no aggregations
 3. **Full transactional semantics** - No multi-key transactions, no distributed commits
 4. **Universal workload support** - Optimized for small objects only (sub-4KB)
@@ -316,7 +320,9 @@ func (h *LFUHeap) EvictLFU() *CacheEntry {
 }
 ```
 
-### Phase 3: Intent-Aware Prediction
+### Phase 3: Intent-Aware Prediction (Phase 4+ Feature)
+
+**Note**: This is a Phase 4+ enhancement, not a core requirement. The slab allocator is the innovation; intent-aware eviction is an optional optimization layer.
 
 ```go
 type PredictiveCache struct {
@@ -345,7 +351,7 @@ func (pc *PredictiveCache) PrefetchCandidates() []*CacheEntry {
 }
 ```
 
-**Critical Design Constraint**: AI-driven eviction is *advisory, not authoritative*. Incorrect predictions degrade gracefully to LRU behavior, not cache thrashing.
+**Critical Design Constraint**: Intent-aware eviction is *advisory, not authoritative*. Incorrect predictions degrade gracefully to LRU behavior, not cache thrashing.
 
 ---
 
@@ -441,6 +447,8 @@ func BenchmarkGet(b *testing.B) {
 | PMEM | ~300ns | $$$ | Warm, stable data |
 | NVMe | ~20µs | $$ | Read-heavy, append-only |
 | HDD | ~5ms | $ | Cold archival |
+
+**About ZNS**: ZNS (Zoned Namespace) NVMe enhances deletion efficiency through hardware zone resets and eliminates write amplification, but ZNS-Slab's core benefits (fragmentation elimination, cache locality) apply to conventional NVMe as well.
 
 ### Promotion/Demotion Logic
 

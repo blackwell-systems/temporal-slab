@@ -184,7 +184,7 @@ This is the foundational insight everything else builds on.
 → [TECHNICAL_DESIGN.md Performance Targets](./TECHNICAL_DESIGN.md#performance-targets)
 
 **Q: Why can't Redis just add this?**
-→ [INNOVATION_FRONTIERS.md Why Redis Cannot Adopt](./INNOVATION_FRONTIERS.md#why-redis-cannot-easily-adopt-this)
+→ [INNOVATION_FRONTIERS.md Why Redis Is Constrained](./INNOVATION_FRONTIERS.md#why-redis-is-architecturally-constrained-from-this)
 
 **Q: What are the non-goals?**
 → [TECHNICAL_DESIGN.md Non-Goals](./TECHNICAL_DESIGN.md#non-goals)
@@ -237,6 +237,9 @@ This is the foundational insight everything else builds on.
 3. **Claims must be defensible**: "4x faster (50ns vs 200ns p99)" not "much faster"
 4. **Trade-offs must be stated**: "Non-goal: Complex query language"
 5. **Skepticism increases credibility**: "Advisory, not authoritative" for AI features
+6. **Calm comparisons**: "Redis is architecturally constrained from" not "Redis cannot"
+7. **Cache vs database clarity**: "ZNS-Slab is a cache system, not a system of record"
+8. **ZNS as enhancement**: "ZNS enhances... but remains valuable on conventional NVMe"
 
 ---
 

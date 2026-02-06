@@ -28,7 +28,9 @@ General-purpose systems like Redis work, but they **waste memory**, suffer from 
 
 ## What Is ZNS-Slab?
 
-**ZNS-Slab is a specialized cache-oriented object store designed specifically for small objects (sub-4KB) on modern hardware.**
+**ZNS-Slab is a specialized cache system designed specifically for small objects (sub-4KB) on modern hardware.**
+
+**Positioning**: ZNS-Slab is a cache system, not a system of record. It optimizes ephemeral storage (sessions, tokens, counters) rather than durable persistence.
 
 Instead of treating memory and storage as separate worlds, it:
 
@@ -71,8 +73,10 @@ That single insight eliminates most of the complexity found in traditional datab
 ### 3. Slabs Map Directly to Hardware Storage Zones
 
 * Writes are sequential (ideal for NVMe)
-* Deletion is a fast "zone reset" instead of millions of tiny deletes
+* Deletion is a fast "zone reset" instead of millions of tiny deletes (on ZNS-enabled devices)
 * Write amplification is effectively eliminated
+
+**Note**: ZNS (Zoned Namespace) NVMe enhances deletion and write amplification guarantees, but the slab allocator remains valuable even on conventional NVMe due to reduced fragmentation and cache locality.
 
 ### 4. The System Is Cache-First
 
@@ -85,7 +89,7 @@ That single insight eliminates most of the complexity found in traditional datab
 ## Why This Is Different
 
 ### vs. Redis
-**Redis** is general-purpose and flexible, but wastes memory on small objects and assumes everything lives in DRAM.
+**Redis** is general-purpose and flexible, but its architecture incurs significant overhead for small objects and assumes DRAM-only deployment.
 
 * Redis: 62% overhead for 128-byte objects
 * ZNS-Slab: 3% overhead
