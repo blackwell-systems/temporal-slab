@@ -4,6 +4,10 @@ A high-performance slab allocator designed for **sustained allocation/free churn
 
 ZNS-Slab provides a lock-free fast path for allocation, conservative recycling for correctness, and explicit safety guarantees for real-world service workloads.
 
+## What ZNS-Slab Solves
+
+ZNS-Slab is a specialized allocator for systems where memory churn, not peak throughput, is the primary source of instability. Traditional allocators degrade over time as objects with mixed lifetimes fragment memory and inflate RSS. ZNS-Slab prevents this by grouping allocations into fixed-size slabs with aligned lifetimes, enabling predictable latency, bounded memory growth, and safe reuse without compaction or background GC.
+
 ## Why ZNS-Slab Exists
 
 ### Fragmentation as Entropy
@@ -56,13 +60,16 @@ This makes ZNS-Slab a substrate that higher layers can build on, not a policy en
 ZNS-Slab makes the following guarantees:
 
 - **No runtime `munmap()`**  
-  Slabs remain mapped for the lifetime of the allocator. Memory is only released in `allocator_destroy()`.
+  Slabs remain mapped for the lifetime of the allocator (no use-after-free faults). Memory is only released in `allocator_destroy()`.
 
 - **Stale handles are safe**  
   `free_obj()` validates slab magic and slot state. Invalid or double frees return `false` and never crash.
 
 - **Conservative recycling**  
   Only slabs that were previously FULL are recycled. PARTIAL slabs are never recycled, preventing use-after-free races.
+
+- **No background compaction or relocation**  
+  Objects never move once allocated. No surprise latency spikes from background maintenance.
 
 - **Bounded memory**  
   RSS is bounded by `(partial + full + cache + overflow) = working set`. Cache overflow list prevents unbounded growth.
@@ -129,6 +136,8 @@ make
 - Allocation: **70ns** average
 - Free: **12ns** average
 - Cache hit rate: **97%+**
+
+These results reflect steady-state behavior under sustained churn, not short-lived microbenchmarks.
 
 **Memory efficiency:**
 - RSS growth under churn: **2.2%** (15.30 → 15.64 MiB, 1000 cycles)
@@ -264,11 +273,22 @@ ZNS-Slab is designed for subsystems with fixed-size allocation patterns:
 - Cache entries
 - Message queues
 - Packet buffers
+- Systems that cannot tolerate allocator-induced latency spikes or RSS drift
 
 **Not recommended for:**
 - Variable-size allocations (use jemalloc/tcmalloc)
 - Objects >512 bytes
 - Systems requiring NUMA-local allocation
+
+## Non-Goals
+
+ZNS-Slab intentionally does not attempt to:
+- Replace general-purpose allocators (malloc, jemalloc)
+- Support arbitrary object sizes
+- Perform background compaction or relocation
+- Guess object lifetimes heuristically
+
+It is designed to be predictable, conservative, and explicit.
 
 ## Build and Test
 
