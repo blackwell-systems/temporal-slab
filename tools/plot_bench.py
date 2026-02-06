@@ -225,6 +225,49 @@ def plot_rss_over_time(data: List[Dict], output_dir: Path):
     plt.close()
 
 
+def plot_scaling(data: List[Dict], output_dir: Path):
+    """Plot multi-threaded scaling (throughput and latency vs threads)"""
+    if not data:
+        print("No scaling data found", file=sys.stderr)
+        return
+    
+    threads = [int(row['threads']) for row in data]
+    throughput = [float(row['throughput_ops_sec']) for row in data]
+    p99 = [float(row['p99_ns']) for row in data]
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Left plot: Throughput scaling
+    ax1.plot(threads, throughput, linewidth=2, color='steelblue', marker='o', markersize=8)
+    ax1.set_xlabel('Thread Count', fontsize=11)
+    ax1.set_ylabel('Throughput (ops/sec)', fontsize=11)
+    ax1.set_title('Throughput Scaling', fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks(threads)
+    
+    # Add ideal linear scaling line
+    if throughput:
+        ideal = [throughput[0] * t / threads[0] for t in threads]
+        ax1.plot(threads, ideal, linestyle='--', color='gray', alpha=0.5, label='Ideal Linear')
+        ax1.legend()
+    
+    # Right plot: p99 latency vs threads
+    ax2.plot(threads, p99, linewidth=2, color='coral', marker='s', markersize=8)
+    ax2.set_xlabel('Thread Count', fontsize=11)
+    ax2.set_ylabel('p99 Latency (nanoseconds)', fontsize=11)
+    ax2.set_title('Tail Latency vs Thread Count', fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xticks(threads)
+    ax2.axhline(y=10000, color='red', linestyle='--', linewidth=1, alpha=0.5, label='10µs threshold')
+    ax2.legend()
+    
+    plt.tight_layout()
+    output_path = output_dir / 'scaling.png'
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Generated: {output_path}")
+    plt.close()
+
+
 def plot_summary_card(latency_data: List[Dict], frag_data: List[Dict], output_dir: Path):
     """Generate summary card with key metrics"""
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -317,8 +360,9 @@ def main():
     latency_data = [row for row in all_data if 'op' in row]
     frag_data = [row for row in all_data if 'efficiency_pct' in row and 'op' not in row]
     rss_data = [row for row in all_data if 'cycle' in row and 'rss_mib' in row]
+    scaling_data = [row for row in all_data if 'throughput_ops_sec' in row]
     
-    print(f"Loaded {len(latency_data)} latency rows, {len(frag_data)} fragmentation rows, {len(rss_data)} RSS samples")
+    print(f"Loaded {len(latency_data)} latency rows, {len(frag_data)} fragmentation rows, {len(rss_data)} RSS samples, {len(scaling_data)} scaling points")
     
     # Generate charts
     print("\nGenerating visualizations...")
@@ -332,6 +376,9 @@ def main():
     
     if rss_data:
         plot_rss_over_time(rss_data, args.output)
+    
+    if scaling_data:
+        plot_scaling(scaling_data, args.output)
     
     if latency_data or frag_data:
         plot_summary_card(latency_data, frag_data, args.output)
