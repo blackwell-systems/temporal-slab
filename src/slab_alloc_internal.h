@@ -18,12 +18,19 @@
 #define SLAB_MAGIC   0x534C4142u /* "SLAB" */
 #define SLAB_VERSION 1u
 
-/* Internal slab list membership */
+/* Slab list membership (partial/full lists, protected by sc->lock) */
 typedef enum SlabListId {
-  SLAB_LIST_NONE    = 0,
-  SLAB_LIST_PARTIAL = 1,
-  SLAB_LIST_FULL    = 2,
+  SLAB_LIST_PARTIAL = 0,
+  SLAB_LIST_FULL    = 1,
+  SLAB_LIST_NONE    = 2,  /* Not on any list */
 } SlabListId;
+
+/* Slab cache state (lifecycle, protected by cache_lock or sc->lock) */
+typedef enum SlabCacheState {
+  SLAB_ACTIVE      = 0,  /* In use (on partial/full list) */
+  SLAB_CACHED      = 1,  /* In slab_cache array */
+  SLAB_OVERFLOWED  = 2,  /* In cache_overflow list */
+} SlabCacheState;
 
 /* Forward declarations */
 typedef struct Slab Slab;
@@ -46,8 +53,11 @@ struct Slab {
 
   /* List membership for O(1) moves (protected by size-class mutex) */
   SlabListId list_id;
-
-  uint8_t _pad[3];
+  
+  /* Cache state for lifecycle tracking */
+  SlabCacheState cache_state;
+  
+  uint8_t _pad[2];
 };
 
 /* Intrusive doubly-linked list */
