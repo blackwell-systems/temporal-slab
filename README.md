@@ -1,47 +1,115 @@
-# ZNS-Slab: Lock-Free Slab Allocator
+# ZNS-Slab
 
-A production-ready slab allocator for sub-512 byte objects with lock-free fast path and bounded memory usage.
+A high-performance slab allocator designed for **sustained allocation/free churn with bounded RSS and predictable latency**.
 
-## Features
+ZNS-Slab provides a lock-free fast path for allocation, conservative recycling for correctness, and explicit safety guarantees for real-world service workloads.
 
-- **Lock-free allocation fast path** - Single atomic load for cache hits
-- **Sub-100ns median latency** - 70ns alloc, 12ns free (Intel Core Ultra 7)
-- **Bounded RSS** - Overflow list prevents memory leaks under pressure
-- **Safe handle validation** - Slabs stay mapped, stale handles detected
-- **97% cache hit rate** - Per-size-class slab cache (32 pages each)
-- **Provably safe recycling** - FULL-only recycling eliminates race conditions
-- **Two APIs** - Handle-based (low-level) and malloc-style (drop-in)
+## Why ZNS-Slab
+
+Most general-purpose allocators optimize for throughput, not stability under churn. In long-running services, this leads to:
+- RSS growth over time
+- Tail latency spikes from mmap/munmap
+- Undefined behavior on stale or double frees
+
+ZNS-Slab is built for the opposite trade-off: **predictability, safety, and bounded memory usage under sustained churn**.
+
+**Key outcomes:**
+- Bounded RSS under churn (2.2% growth over 1000 cycles)
+- Lock-free allocation fast path (70ns median)
+- No crashes on stale or invalid frees
+- Explicit, documented safety invariants
+
+## Safety Contract
+
+ZNS-Slab makes the following guarantees:
+
+- **No runtime `munmap()`**  
+  Slabs remain mapped for the lifetime of the allocator. Memory is only released in `allocator_destroy()`.
+
+- **Stale handles are safe**  
+  `free_obj()` validates slab magic and slot state. Invalid or double frees return `false` and never crash.
+
+- **Conservative recycling**  
+  Only slabs that were previously FULL are recycled. PARTIAL slabs are never recycled, preventing use-after-free races.
+
+- **Bounded memory**  
+  RSS is bounded by `(partial + full + cache + overflow) = working set`. Cache overflow list prevents unbounded growth.
+
+- **Thread safety**  
+  Allocation fast path is lock-free. Slow-path operations use per-size-class mutexes with no global locks.
+
+These guarantees prioritize correctness and observability over aggressive reclamation.
 
 ## Quick Start
+
+### Handle-based API (explicit control)
 
 ```c
 #include <slab_alloc.h>
 
-// Create allocator
 SlabAllocator* alloc = slab_allocator_create();
 
-// Option 1: malloc-style API (recommended)
-void* ptr = slab_malloc(alloc, 128);
-slab_free(alloc, ptr);
-
-// Option 2: Handle-based API (explicit control)
 SlabHandle h;
-void* obj = alloc_obj(alloc, 128, &h);
+void* p = alloc_obj(alloc, 128, &h);
+// use p
 free_obj(alloc, h);
 
-// Cleanup
 slab_allocator_free(alloc);
 ```
 
-## Build and Test
+### Malloc-style API (drop-in replacement)
 
+```c
+#include <slab_alloc.h>
+
+SlabAllocator* alloc = slab_allocator_create();
+
+void* p = slab_malloc(alloc, 128);
+// use p
+slab_free(alloc, p);
+
+slab_allocator_free(alloc);
+```
+
+**Build:**
 ```bash
 cd src/
-make                    # Build all tests
-./smoke_tests          # Basic correctness (single/multi-thread)
-./churn_test           # RSS bounds validation
-./test_malloc_wrapper  # malloc/free API tests
+make
+./smoke_tests    # Validate correctness
+./churn_test     # Validate RSS bounds
 ```
+
+## Core Design Highlights
+
+- **Lock-free allocation fast path** - Atomic `current_partial` slab pointer, no mutex in common case
+- **Lock-free bitmap operations** - CAS loops for slot allocation/freeing within slabs
+- **O(1) list operations** - Direct list membership tracking via `slab->list_id` (no linear search)
+- **FULL-only recycling** - Provably safe empty slab reuse (no race conditions)
+- **Bounded RSS** - Cache + overflow lists prevent memory leaks under pressure
+- **Opaque handles** - 64-bit encoding hides implementation details
+- **Dual API** - Handle-based (zero overhead) and malloc-style (8-byte header)
+
+## Performance Summary
+
+**Platform:** Intel Core Ultra 7 165H, Linux, GCC 13.3.0 -O3
+
+**Latency (128-byte objects):**
+- Allocation: **70ns** average
+- Free: **12ns** average
+- Cache hit rate: **97%+**
+
+**Memory efficiency:**
+- RSS growth under churn: **2.2%** (15.30 → 15.64 MiB, 1000 cycles)
+- Zero cache overflows (optimal cache utilization)
+
+**Concurrency:**
+- Validated with 8 threads × 500K iterations
+- Zero allocator-internal failures
+
+**Interpretation:**
+- Median latency stays sub-100ns under contention
+- RSS remains stable under sustained churn
+- No memory leaks or unbounded growth
 
 ## Size Classes
 
@@ -70,43 +138,10 @@ Fixed size classes optimized for common object sizes:
 3. Return pointer (no locks in common case)
 
 ### Recycling Strategy
-- **FULL list** - Slabs with zero free slots (never published)
+- **FULL list** - Slabs with zero free slots (never published to `current_partial`)
 - **Recycling** - Only from FULL list (provably safe, no races)
 - **PARTIAL slabs** - Stay on list when empty, reused naturally
 - **Result** - Bounded RSS without recycling race conditions
-
-## Safety Contract
-
-### Never munmap During Runtime
-Slabs remain mapped for the allocator's lifetime, enabling:
-- Safe validation of stale handles (no segfaults)
-- Lock-free handle checking in free path
-- Guaranteed bounded RSS (cache + overflow + active slabs)
-
-### Handle Validation
-- Handles encode slab pointer + slot + size class (64-bit opaque)
-- `free_obj` validates magic number before freeing
-- Double-free and stale handle detection without crashes
-
-### Memory Bounds
-RSS bounded by: `(partial + full + cache + overflow) = working set`
-
-Typical growth under sustained churn: **<3%** over 1000 cycles
-
-## Performance
-
-**Platform**: Intel Core Ultra 7 165H, Linux, GCC 13.3.0 -O3
-
-**Latency** (128-byte objects):
-- Allocation: 70ns avg
-- Free: 12ns avg
-
-**Memory Efficiency**:
-- Cache hit rate: 97%+
-- RSS growth under churn: 2.2% (15.30 → 15.64 MiB, 1000 cycles)
-- Zero cache overflows (optimal cache utilization)
-
-**Concurrency**: Validated with 8 threads × 500K iterations
 
 ## API Reference
 
@@ -119,16 +154,7 @@ void allocator_init(SlabAllocator* alloc);    // For custom storage
 void allocator_destroy(SlabAllocator* alloc);
 ```
 
-### Malloc-Style API
-```c
-void* slab_malloc(SlabAllocator* alloc, size_t size);
-void slab_free(SlabAllocator* alloc, void* ptr);
-```
-- 8-byte header overhead per allocation
-- Max size: 504 bytes
-- NULL-safe: `slab_free(a, NULL)` is no-op
-
-### Handle-Based API
+### Handle-Based API (zero overhead)
 ```c
 void* alloc_obj(SlabAllocator* alloc, uint32_t size, SlabHandle* out_handle);
 bool free_obj(SlabAllocator* alloc, SlabHandle handle);
@@ -136,6 +162,15 @@ bool free_obj(SlabAllocator* alloc, SlabHandle handle);
 - Zero overhead (no hidden headers)
 - Explicit handle management
 - Returns false on invalid/stale handles
+
+### Malloc-Style API (8-byte overhead)
+```c
+void* slab_malloc(SlabAllocator* alloc, size_t size);
+void slab_free(SlabAllocator* alloc, void* ptr);
+```
+- 8-byte header overhead per allocation
+- Max size: 504 bytes
+- NULL-safe: `slab_free(a, NULL)` is no-op
 
 ### Performance Counters
 ```c
@@ -153,12 +188,21 @@ typedef struct PerfCounters {
 void get_perf_counters(SlabAllocator* alloc, uint32_t size_class, PerfCounters* out);
 ```
 
-## Thread Safety
+## Project Status
 
-- **Fast path** - Lock-free (atomic operations only)
-- **Slow path** - Per-size-class mutex
-- **Cache operations** - Separate cache_lock per size class
-- **No global locks** - All contention is size-class local
+ZNS-Slab is stable and production-ready for:
+- Fixed-size object allocation
+- Long-running services with sustained churn
+- Systems requiring predictable RSS behavior
+
+**Test coverage:**
+- Single-thread correctness: PASS
+- Multi-thread correctness: PASS (8 threads × 500K iterations)
+- Handle validation: PASS
+- Malloc wrapper: PASS
+- RSS bounds: PASS (2.2% growth over 1000 cycles)
+
+Future work is incremental and opt-in (additional size classes, optional wrappers).
 
 ## Limitations
 
@@ -167,6 +211,31 @@ void get_perf_counters(SlabAllocator* alloc, uint32_t size_class, PerfCounters* 
 - **No realloc** - Size changes require alloc + copy + free
 - **Linux only** - RSS measurement uses /proc/self/statm
 - **No NUMA awareness** - Single allocator for all threads
+
+## Use Cases
+
+ZNS-Slab is designed for subsystems with fixed-size allocation patterns:
+- Session stores
+- Connection metadata
+- Cache entries
+- Message queues
+- Packet buffers
+
+**Not recommended for:**
+- Variable-size allocations (use jemalloc/tcmalloc)
+- Objects >512 bytes
+- Systems requiring NUMA-local allocation
+
+## Build and Test
+
+```bash
+cd src/
+make                    # Build all tests
+./smoke_tests          # Correctness tests
+./churn_test           # RSS bounds validation
+./test_malloc_wrapper  # malloc/free API tests
+./benchmark_accurate   # Performance measurement
+```
 
 ## Project Structure
 
@@ -183,21 +252,10 @@ src/
   Makefile               - Build system
 ```
 
-## Testing
-
-- **smoke_tests** - Single-thread, multi-thread (8×500K), micro-benchmark
-- **churn_test** - 1000 cycles of alloc/free churn, RSS tracking
-- **test_malloc_wrapper** - malloc/free API correctness
-
-All tests validate:
-- Correctness under concurrency
-- Bounded memory growth
-- API safety (NULL, stale handles, double-free)
-
 ## Design Principles
 
-1. **Correctness over optimization** - FULL-only recycling eliminates races
-2. **Conservative safety** - Never munmap during runtime
-3. **Explicit state** - Separate list_id + cache_state for clarity
-4. **Opaque handles** - 64-bit encoding hides implementation details
+1. **Safety over optimization** - FULL-only recycling eliminates races
+2. **Explicit contracts** - Never munmap during runtime, bounded RSS
+3. **Observable behavior** - Invalid frees return false, never crash
+4. **Lock-free fast path** - Atomic operations only, no mutex contention
 5. **Bounded resources** - Cache + overflow guarantee RSS limits
