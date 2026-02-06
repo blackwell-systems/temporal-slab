@@ -141,10 +141,11 @@ temporal-slab delivers three key properties for latency-sensitive workloads:
 
 | Metric | Value | Comparison |
 |--------|-------|------------|
-| p50 allocation | 70ns | Competitive with jemalloc |
-| p99 allocation | 1.7µs | 2-3 orders of magnitude better than compacting allocators |
-| RSS growth (1000 cycles) | 2.4% | 10-20x better than malloc/tcmalloc |
+| p50 allocation | 30ns | Slightly slower than system_malloc (21ns) |
+| p99 allocation | 374ns | **3.3x better than system_malloc** (1,238ns) |
+| RSS growth (steady-state churn) | **0%** | Perfect stability over 100 cycles |
 | Space efficiency | 88.9% | Reasonable for fixed size classes |
+| Memory overhead | +37% | Higher baseline RSS vs system_malloc (21.8 MiB vs 15.9 MiB) |
 | Thread scaling | Linear to 4 threads | Lock-free fast path, cache coherence limits beyond 8 threads |
 
 **Important:** temporal-slab does not attempt to outperform general-purpose allocators everywhere. It eliminates latency variance and RSS drift for fixed-size, churn-heavy workloads.
