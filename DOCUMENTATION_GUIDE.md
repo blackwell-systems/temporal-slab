@@ -9,6 +9,7 @@ ZNS-Slab/
 ├── README.md                    # Project overview and quick start
 ├── EXECUTIVE_SUMMARY.md         # High-level explanation for all audiences
 ├── INNOVATION_FRONTIERS.md      # Market opportunity and broken assumptions
+├── USE_CASES.md                 # 10 domains where small objects dominate
 ├── TECHNICAL_DESIGN.md          # Complete implementation specification
 └── DOCUMENTATION_GUIDE.md       # This file - navigation help
 ```
@@ -44,15 +45,21 @@ Also see: [README.md Resume Impact section](./README.md#resume-impact)
 ---
 
 ### 🔍 "I want to understand the market opportunity"
-→ [INNOVATION_FRONTIERS.md](./INNOVATION_FRONTIERS.md)
+→ [INNOVATION_FRONTIERS.md](./INNOVATION_FRONTIERS.md) + [USE_CASES.md](./USE_CASES.md)
 
-Covers:
-- Three major innovation frontiers in cache databases
+**Innovation Frontiers** covers:
+- Three major innovation frontiers in cache systems
 - What assumptions broke (not just new tech)
 - How ZNS-Slab fits into the landscape
 - Competitive analysis vs Redis/Memcached/RocksDB
 
-**Read this if you want to understand WHY this matters.**
+**Use Cases** covers:
+- 10 specific domains (auth, control planes, counters, AI, gaming, etc.)
+- Why small objects dominate each domain
+- Real-world scale examples
+- Market sizing and growth drivers
+
+**Read these if you want to understand WHY this matters and WHERE it applies.**
 
 ---
 
@@ -128,9 +135,10 @@ Read in this order:
 ## Reading Time Estimates
 
 | Document | Audience | Time | Purpose |
-|----------|----------|------|---------|
+|----------|----------|---------|---------|
 | README.md | Everyone | 3 min | Project overview |
 | EXECUTIVE_SUMMARY.md | Non-technical | 5 min | High-level understanding |
+| USE_CASES.md | Product/Business | 10 min | Real-world applications |
 | INNOVATION_FRONTIERS.md | Strategic | 15 min | Market context |
 | TECHNICAL_DESIGN.md | Engineers | 30 min | Implementation |
 
@@ -178,7 +186,7 @@ This is the foundational insight everything else builds on.
 → [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)
 
 **Q: What workloads is this for?**
-→ [EXECUTIVE_SUMMARY.md Use Cases](./EXECUTIVE_SUMMARY.md#why-it-matters)
+→ [USE_CASES.md](./USE_CASES.md) (comprehensive) or [EXECUTIVE_SUMMARY.md Use Cases](./EXECUTIVE_SUMMARY.md#why-it-matters) (quick summary)
 
 **Q: What are the performance targets?**
 → [TECHNICAL_DESIGN.md Performance Targets](./TECHNICAL_DESIGN.md#performance-targets)
@@ -200,6 +208,7 @@ This is the foundational insight everything else builds on.
 |----------|--------|-------|
 | README.md | ✅ Stable | Entry point, regularly updated |
 | EXECUTIVE_SUMMARY.md | ✅ Stable | Use for presentations |
+| USE_CASES.md | ✅ Stable | Market validation |
 | INNOVATION_FRONTIERS.md | ✅ Stable | Strategic context |
 | TECHNICAL_DESIGN.md | ✅ Stable | Implementation spec |
 | DOCUMENTATION_GUIDE.md | ✅ Stable | This file |
