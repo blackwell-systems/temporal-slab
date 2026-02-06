@@ -41,8 +41,13 @@ This document builds the theoretical foundation for temporal-slab from first pri
 **Implementation Techniques**
 - [Fast Path vs Slow Path](#fast-path-vs-slow-path)
 - [Lock-Free Allocation](#lock-free-allocation)
+- [Lock Contention](#lock-contention)
 - [Compare-and-Swap (CAS)](#compare-and-swap-cas)
 - [Atomic Operations](#atomic-operations)
+- [Memory Barriers and Fences](#memory-barriers-and-fences)
+- [Cache Coherence](#cache-coherence)
+- [Memory Alignment](#memory-alignment)
+- [Compiler Barriers](#compiler-barriers)
 - [Bounded RSS Through Conservative Recycling](#bounded-rss-through-conservative-recycling)
 - [Hazard Pointers and Reference Counting](#hazard-pointers-and-reference-counting)
 - [Slab Cache](#slab-cache)
@@ -1443,6 +1448,161 @@ The allocator maintains a `current_partial` pointer (the active slab for fast-pa
 
 This achieves sub-100ns allocation latency in the common case with no lock contention.
 
+## Lock Contention
+
+Lock contention occurs when multiple threads compete to acquire the same mutex (mutual exclusion lock). When one thread holds a lock, other threads attempting to acquire it must wait. The more threads competing for the lock, the longer the average wait time—this is contention.
+
+**How mutexes work:**
+
+A mutex is a synchronization primitive that ensures only one thread can execute a critical section at a time:
+
+```c
+pthread_mutex_t lock;
+
+Thread A:                          Thread B:
+1. pthread_mutex_lock(&lock)       1. pthread_mutex_lock(&lock)
+2. // Critical section               → BLOCKED (lock held by A)
+3. counter++;                       
+4. pthread_mutex_unlock(&lock)     
+                                   2. → UNBLOCKED, acquires lock
+                                   3. // Critical section
+                                   4. counter++;
+                                   5. pthread_mutex_unlock(&lock)
+```
+
+When Thread B tries to acquire a lock held by Thread A, the kernel blocks Thread B—removing it from the CPU scheduler and putting it to sleep. When Thread A releases the lock, the kernel wakes Thread B. This context switch (save Thread B's state, schedule another thread, then later restore Thread B) is expensive: 1,000-10,000 cycles (~300ns-3µs).
+
+**Types of lock contention:**
+
+**1. Uncontended lock (fast path):**
+```
+Only one thread accesses lock:
+pthread_mutex_lock()   → 50-100 cycles (~20-30ns)
+// critical section
+pthread_mutex_unlock() → 50-100 cycles (~20-30ns)
+Total: 100-200 cycles (~50-100ns)
+```
+
+**2. Lightly contended lock:**
+```
+Thread A holds lock, Thread B tries to acquire:
+Thread B: pthread_mutex_lock()
+→ Spin briefly (~100 cycles) waiting for Thread A to release
+→ Thread A releases, Thread B acquires without kernel involvement
+Total delay: 100-500 cycles (~50-150ns)
+```
+
+**3. Heavily contended lock:**
+```
+Thread A holds lock, Threads B-H all try to acquire:
+Each blocked thread:
+1. Spin briefly (100 cycles)
+2. Kernel blocks thread (1,000 cycles syscall)
+3. Context switch to another thread (1,000 cycles)
+4. Later: Kernel wakes thread (1,000 cycles)
+5. Context switch back (1,000 cycles)
+6. Thread resumes, retries lock
+Total delay: 4,000-10,000 cycles (~1-3µs per thread)
+
+Aggregate cost for 8 threads: 32,000-80,000 cycles wasted
+```
+
+**Why contention destroys performance:**
+
+```
+Web server: 10,000 requests/second, mutex-protected allocator
+
+Uncontended (1 thread):
+- 10,000 allocations × 100 cycles/allocation = 1M cycles
+- At 3GHz: 0.3ms CPU time (negligible)
+
+Heavily contended (8 threads):
+- Each allocation waits for lock: 1,000 cycles average
+- 10,000 allocations × 1,000 cycles = 10M cycles
+- At 3GHz: 3ms CPU time (10× worse)
+- Wasted CPU cycles: 9M cycles spent waiting, not working
+```
+
+**Lock-free algorithms avoid contention:**
+
+Instead of blocking threads with mutexes, lock-free algorithms use atomic operations (CAS, fetch-add) that never block:
+
+```c
+// Lock-based counter (contention bottleneck)
+pthread_mutex_lock(&lock);
+counter++;
+pthread_mutex_unlock(&lock);
+Cost: 100-10,000 cycles (depends on contention)
+
+// Lock-free counter (no contention)
+atomic_fetch_add(&counter, 1);
+Cost: 20-40 cycles (constant, regardless of threads)
+```
+
+**Why temporal-slab uses lock-free fast path:**
+
+```
+Fast path (99% of allocations):
+- Lock-free CAS on bitmap (20-40 cycles)
+- No mutex, no blocking, no contention
+- Scales to ~4 threads before cache coherence limits kick in
+
+Slow path (<1% of allocations):
+- Mutex-protected slab allocation (100-1,000 cycles)
+- Acceptable because rare (1% of 1,000 cycles = 10 cycle average overhead)
+- Contention is minimal (slow path infrequent)
+```
+
+**The contention equation:**
+
+```
+Average allocation time with mutex:
+T_avg = lock_acquire_time + critical_section_time + lock_release_time
+
+Where lock_acquire_time depends on contention:
+- 0 threads waiting: 50 cycles (fast path)
+- 1-2 threads waiting: 100-500 cycles (spin wait)
+- 3+ threads waiting: 1,000-10,000 cycles (kernel blocking)
+
+With lock-free fast path:
+T_avg = atomic_CAS_time = 20-40 cycles (constant)
+```
+
+**Measuring contention:**
+
+You can detect contention by comparing lock hold time vs wait time:
+
+```c
+uint64_t t0 = now_ns();
+pthread_mutex_lock(&lock);
+uint64_t t1 = now_ns();
+// critical section
+pthread_mutex_unlock(&lock);
+
+uint64_t wait_time = t1 - t0;
+if (wait_time > 1000ns) {
+  printf("High contention: waited %lu ns for lock\n", wait_time);
+}
+```
+
+**Why contention matters for allocators:**
+
+Traditional allocators like malloc use a global lock (or per-arena locks). Under high thread count, every allocation blocks on the lock:
+
+```
+malloc() with 16 threads:
+- Thread 1 allocates, holds lock (100 cycles)
+- Threads 2-16 wait (15 threads × 1,000 cycles = 15,000 cycles wasted)
+- Throughput: 1 allocation per 1,100 cycles (serialized)
+
+temporal-slab with 16 threads:
+- All threads allocate concurrently via lock-free CAS
+- Throughput: 16 allocations per 40 cycles (parallel)
+- 400× better throughput (until cache coherence limits hit)
+```
+
+Lock contention is why "thread-safe" doesn't mean "scalable." A mutex-protected allocator is correct under concurrent access but becomes a bottleneck as thread count increases. Lock-free algorithms eliminate contention but introduce new challenges (ABA problem, memory ordering, retry loops).
+
 ## Compare-and-Swap (CAS)
 
 Compare-and-swap (CAS) is an atomic CPU instruction that enables lock-free programming. CAS takes three arguments: a memory location, an expected value, and a new value. It atomically performs:
@@ -1552,6 +1712,741 @@ Lock-free allocation requires atomics for:
 - Updating reference counts (track slab usage across threads)
 
 Without atomics, race conditions cause double allocations, memory corruption, and crashes. With atomics, lock-free code is both safe and fast.
+
+## Memory Barriers and Fences
+
+Memory barriers (also called memory fences) are synchronization primitives that control the order in which memory operations become visible to other threads. They are critical for correctness in lock-free programming.
+
+**The problem: Memory reordering**
+
+Modern CPUs and compilers reorder memory operations for performance. This creates subtle bugs in concurrent code:
+
+```c
+// Thread A
+data = 42;          // Write 1
+ready = true;       // Write 2
+
+// Thread B
+if (ready) {        // Read 2
+  use(data);        // Read 1 - expects to see 42
+}
+```
+
+Without barriers, the CPU might reorder Thread A's writes:
+```
+Thread A (reordered):
+ready = true;       // Write 2 happens first!
+data = 42;          // Write 1 happens second
+
+Thread B sees:
+ready == true, but data == 0 (old value)
+→ BUG: Thread B reads stale data
+```
+
+**Why CPUs reorder memory:**
+
+CPUs use out-of-order execution to maximize throughput. If Write 2 can execute before Write 1 (because its operands are ready first), the CPU will reorder them. This is safe for single-threaded code but breaks concurrent code that depends on ordering.
+
+Compilers also reorder for optimization:
+```c
+// Original code
+x = 1;
+y = 2;
+z = 3;
+
+// Compiler might reorder to:
+y = 2;  // Reorder for better register allocation
+x = 1;
+z = 3;
+```
+
+**Memory ordering guarantees:**
+
+Different memory operations have different ordering guarantees:
+
+**1. Relaxed ordering:**
+```c
+atomic_store_explicit(&flag, 1, memory_order_relaxed);
+```
+- No ordering guarantees
+- Only atomicity (operation is indivisible)
+- Fastest (no memory fences)
+- Use when order doesn't matter (e.g., simple counters)
+
+**2. Acquire ordering:**
+```c
+int value = atomic_load_explicit(&ptr, memory_order_acquire);
+```
+- All subsequent reads/writes happen AFTER this load
+- Prevents later operations from moving before the acquire
+- Used when loading shared data: ensures data is visible before use
+
+**3. Release ordering:**
+```c
+atomic_store_explicit(&ptr, value, memory_order_release);
+```
+- All prior reads/writes happen BEFORE this store
+- Prevents earlier operations from moving after the release
+- Used when publishing shared data: ensures data is finalized before visible
+
+**4. Acquire-release ordering:**
+```c
+atomic_exchange_explicit(&ptr, new_val, memory_order_acq_rel);
+```
+- Combination of acquire and release
+- Prior writes happen before, subsequent reads happen after
+- Used for read-modify-write operations (CAS, fetch-add)
+
+**5. Sequential consistency:**
+```c
+atomic_store(&ptr, value);  // Default: memory_order_seq_cst
+```
+- Strongest guarantee: total order across all threads
+- All threads see the same sequence of operations
+- Slowest (full memory fence on every operation)
+- Use when correctness is unclear (fallback)
+
+**Explicit memory fences:**
+
+Sometimes you need a fence without an atomic operation:
+
+```c
+atomic_thread_fence(memory_order_acquire);  // All subsequent ops happen after
+atomic_thread_fence(memory_order_release);  // All prior ops happen before
+atomic_thread_fence(memory_order_seq_cst);  // Full barrier
+```
+
+**Concrete example: Publishing initialized data**
+
+```c
+// Thread A: Initialize and publish
+struct Data {
+  int x, y, z;
+};
+
+Data* data = malloc(sizeof(Data));
+data->x = 1;
+data->y = 2;
+data->z = 3;
+
+// Release fence: ensure x, y, z writes complete before publishing
+atomic_store_explicit(&global_ptr, data, memory_order_release);
+
+// Thread B: Load and use
+Data* p = atomic_load_explicit(&global_ptr, memory_order_acquire);
+if (p) {
+  // Acquire fence: ensure we see x, y, z writes
+  use(p->x, p->y, p->z);  // Guaranteed to see 1, 2, 3
+}
+```
+
+Without barriers:
+```
+Thread A writes might be reordered:
+atomic_store(&global_ptr, data);  // Published before initialized!
+data->x = 1;  // Not visible yet
+data->y = 2;
+data->z = 3;
+
+Thread B might see:
+p != NULL, but p->x == 0 (uninitialized memory)
+→ BUG: Published incomplete data
+```
+
+**Why temporal-slab uses acquire/release:**
+
+```c
+// Slow path: Initialize slab and publish to fast path
+Slab* slab = allocate_slab();
+slab->magic = SLAB_MAGIC;
+slab->free_count = object_count;
+slab->bitmap = 0;  // All slots free
+
+// Release: ensure slab is fully initialized before publishing
+atomic_store_explicit(&current_partial, slab, memory_order_release);
+
+// Fast path: Load and use
+Slab* s = atomic_load_explicit(&current_partial, memory_order_acquire);
+// Acquire: guaranteed to see initialized magic, free_count, bitmap
+if (s && s->free_count > 0) {
+  allocate_from_slab(s);
+}
+```
+
+**Performance cost of memory barriers:**
+
+| Operation | Cycles | Notes |
+|-----------|--------|-------|
+| **Relaxed atomic** | 1-2 | No fence, like normal load/store |
+| **Acquire load** | 1-2 | No fence on x86 (implicit in load) |
+| **Release store** | 1-2 | No fence on x86 (implicit in store) |
+| **CAS (acq_rel)** | 20-40 | LOCK prefix implies full fence |
+| **Full fence** | 20-100 | mfence instruction, flushes store buffer |
+
+On x86-64, acquire/release have zero cost—the hardware already provides these guarantees. On ARM/PowerPC, acquire/release require explicit fence instructions (dmb, sync) costing 10-50 cycles.
+
+**Memory barrier vs compiler barrier:**
+
+- **Memory barrier:** CPU instruction preventing hardware reordering (e.g., mfence, dmb)
+- **Compiler barrier:** Directive preventing compiler reordering (e.g., `asm volatile("" ::: "memory")`)
+
+atomic_thread_fence() inserts both. This prevents:
+1. Compiler from reordering (at compile time)
+2. CPU from reordering (at runtime)
+
+**Why "volatile" is not enough:**
+
+```c
+volatile int ready;  // Does NOT provide memory barriers
+data = 42;
+ready = 1;  // Compiler won't reorder, but CPU still might
+```
+
+`volatile` only prevents compiler optimization. It does NOT insert memory barriers. Use atomics with proper memory ordering instead.
+
+## Cache Coherence
+
+Cache coherence is the hardware mechanism that keeps CPU caches synchronized across multiple cores. When one core modifies a cache line, all other cores' caches holding that line must be notified so they don't use stale data.
+
+**The problem without cache coherence:**
+
+```
+Modern CPU: 8 cores, each with private L1/L2 cache, shared L3
+
+Initial state:
+RAM address 0x1000: value = 0
+
+Core 0:                         Core 1:
+1. Read 0x1000                  1. Read 0x1000
+   → Load into L1: value = 0       → Load into L1: value = 0
+2. Write 0x1000 = 42            2. Read 0x1000
+   → Update L1: value = 42         → Read from L1: value = 0 (STALE!)
+
+Without coherence: Core 1 sees old value even after Core 0 updated it
+```
+
+This would make concurrent programming impossible—every shared variable would require explicit cache flushes.
+
+**How cache coherence works (MESI protocol):**
+
+Modern CPUs use the MESI protocol (or variants like MESIF, MOESI) to track cache line states:
+
+**M - Modified:** This core modified the line, other caches don't have it
+**E - Exclusive:** This core has the line, no other caches have it, matches RAM
+**S - Shared:** Multiple cores have the line, matches RAM, read-only
+**I - Invalid:** This core's cached copy is stale, must reload
+
+**Example: Coherence in action**
+
+```
+Address 0x1000 initially in RAM: value = 0
+
+Core 0:                         Core 1:                    State
+------------------------------------------------------------------------
+Read 0x1000                                                Core 0: S
+                                                          (loaded, shared)
+
+                                Read 0x1000                Core 0: S
+                                                          Core 1: S
+                                                          (both shared)
+
+Write 0x1000 = 42                                         Core 0: M
+  → Sends invalidate to Core 1                            Core 1: I
+  → Core 1's cache marked invalid                         (Core 1 invalidated)
+
+                                Read 0x1000                Core 0: S
+                                  → Cache miss!            Core 1: S
+                                  → Request from Core 0    (Core 0 wrote back,
+                                  → Gets value = 42         both now shared)
+```
+
+**Coherence message types:**
+
+When cores modify shared data, they exchange coherence messages over the memory bus:
+
+**1. Read request:** "I need address 0x1000"
+- Response: Data from RAM or owning core
+
+**2. Invalidate:** "I'm writing to 0x1000, invalidate your copies"
+- All other cores mark their cache line as Invalid
+- Next read triggers cache miss
+
+**3. Writeback:** "I'm evicting modified 0x1000, here's the data"
+- Core writes dirty cache line back to RAM
+- Other cores can now read the updated value
+
+**Cost of cache coherence:**
+
+Each coherence message takes time:
+
+| Operation | Cycles | Description |
+|-----------|--------|-------------|
+| **L1 hit** | 4 | Data in this core's L1 cache |
+| **L2 hit** | 12 | Data in this core's L2 cache |
+| **L3 hit** | 40 | Data in shared L3 cache |
+| **Cache line invalidation** | 40-100 | Invalidate message to other cores |
+| **Cache line transfer** | 100-200 | Load from another core's cache |
+| **DRAM access** | 100-200 | Load from main memory |
+
+**False sharing: The performance killer**
+
+False sharing occurs when two threads modify different variables that happen to be in the same 64-byte cache line:
+
+```c
+struct CounterPair {
+  int counter_a;  // Byte 0-3
+  int counter_b;  // Byte 4-7 (SAME CACHE LINE!)
+};
+
+// Thread A (Core 0)
+counter_a++;  // Modifies cache line
+              // → Invalidates Core 1's cache
+
+// Thread B (Core 1)
+counter_b++;  // Modifies same cache line
+              // → Invalidates Core 0's cache
+              // → Cache line bounces between cores
+```
+
+**Result:**
+- Each increment triggers cache line transfer (~100 cycles)
+- No actual data dependency, but hardware can't tell
+- Performance degrades as if variables were shared
+
+**Fixing false sharing with padding:**
+
+```c
+struct CounterPairFixed {
+  int counter_a;
+  char pad[60];       // Pad to 64-byte cache line
+  int counter_b;      // Now on different cache line
+  char pad2[60];
+};
+
+// Thread A and Thread B now modify different cache lines
+// No false sharing, no cache line bouncing
+```
+
+**Why temporal-slab scales to only 4-8 threads:**
+
+Lock-free doesn't mean cache-coherence-free. The atomic CAS operations still cause cache line bouncing:
+
+```
+8 threads allocating concurrently:
+Each thread does CAS on slab->bitmap (same cache line)
+
+Thread 1: CAS(&slab->bitmap)
+  → Core 0 loads cache line (Shared)
+  → Core 0 modifies (Modified)
+  → Invalidates Cores 1-7
+
+Thread 2: CAS(&slab->bitmap)
+  → Core 1 requests cache line from Core 0 (100 cycles)
+  → Core 1 modifies (Modified)
+  → Invalidates Cores 0, 2-7
+
+Result: Cache line bounces between cores on every CAS
+Throughput degrades beyond 4-8 threads due to coherence traffic
+```
+
+**Coherence traffic grows quadratically:**
+
+```
+With N threads modifying same cache line:
+- Each modification invalidates N-1 other caches
+- Total invalidations: N × (N-1) ≈ N²
+
+1 thread:  0 invalidations
+2 threads: 2 invalidations (2× cost)
+4 threads: 12 invalidations (6× cost)
+8 threads: 56 invalidations (28× cost)
+16 threads: 240 invalidations (120× cost!)
+```
+
+This is why lock-free allocators don't scale infinitely—cache coherence becomes the bottleneck.
+
+**Measuring cache coherence effects:**
+
+Use hardware performance counters:
+```bash
+perf stat -e LLC-load-misses,LLC-store-misses ./benchmark_threads
+
+# High LLC misses = cache coherence overhead
+```
+
+**Why cache coherence is mandatory:**
+
+Without hardware cache coherence, programmers would need explicit cache management:
+
+```c
+// Without coherence (nightmare)
+x = 42;
+flush_cache_line(&x);  // Manual flush
+send_invalidate_to_all_cores(&x);
+
+// With coherence (automatic)
+atomic_store(&x, 42);  // Hardware handles coherence
+```
+
+Cache coherence makes concurrent programming tractable, but it's not free. Lock-free algorithms trade lock contention for cache coherence overhead—both have limits.
+
+## Memory Alignment
+
+Memory alignment is the requirement that data be stored at addresses that are multiples of the data's size. Aligned memory accesses are faster (or required) on most CPUs.
+
+**What is alignment?**
+
+An N-byte value is "N-byte aligned" if its address is a multiple of N:
+
+```
+8-byte aligned addresses: 0x0, 0x8, 0x10, 0x18, 0x20, ...
+4-byte aligned addresses: 0x0, 0x4, 0x8, 0xC, 0x10, ...
+2-byte aligned addresses: 0x0, 0x2, 0x4, 0x6, 0x8, ...
+```
+
+**Aligned vs unaligned:**
+
+```c
+// Aligned (fast)
+char buffer[16];
+uint64_t* ptr = (uint64_t*)&buffer[0];  // Address 0x0 (8-byte aligned)
+*ptr = 42;  // Single memory access
+
+// Unaligned (slow or crashes)
+uint64_t* ptr = (uint64_t*)&buffer[1];  // Address 0x1 (NOT 8-byte aligned)
+*ptr = 42;  // May require 2 memory accesses or trigger fault
+```
+
+**Why alignment matters:**
+
+**1. Performance:**
+
+CPUs fetch memory in aligned chunks. Unaligned accesses may span cache lines:
+
+```
+Cache line boundaries (64 bytes): 0x0, 0x40, 0x80, ...
+
+Aligned 8-byte load at 0x38:
+[======== Cache Line 0 ========]
+                        [8 bytes]
+→ 1 cache line access (fast)
+
+Unaligned 8-byte load at 0x3D:
+[======== Cache Line 0 ========][======== Cache Line 1 ========]
+                     [4B][4B]
+→ 2 cache line accesses (slow!)
+```
+
+**Cost:**
+- Aligned load: 4 cycles (L1 hit)
+- Unaligned load: 8+ cycles (may access 2 cache lines)
+
+**2. Correctness:**
+
+Some CPUs require aligned access. Unaligned access triggers hardware fault:
+
+```c
+// On SPARC, ARM (without unaligned support), RISC-V:
+uint64_t* ptr = (uint64_t*)0x1001;  // Unaligned address
+*ptr = 42;  // → Bus error, process terminates
+```
+
+x86-64 tolerates unaligned access (penalty, no fault). ARM/SPARC crash.
+
+**3. Atomicity:**
+
+Aligned atomic operations are guaranteed atomic. Unaligned atomics may not be:
+
+```c
+_Atomic uint64_t x;  // At address 0x8 (aligned)
+atomic_store(&x, 42);  // Guaranteed atomic (single CPU instruction)
+
+_Atomic uint64_t y;  // At address 0x9 (unaligned)
+atomic_store(&y, 42);  // NOT atomic (may require multiple instructions)
+                       // Other threads could see half-written value!
+```
+
+**Alignment requirements by type:**
+
+| Type | Size | Alignment | Address must be multiple of |
+|------|------|-----------|------------------------------|
+| `char` | 1 | 1 | Any address (no restriction) |
+| `short` | 2 | 2 | 2 (0x0, 0x2, 0x4, ...) |
+| `int` | 4 | 4 | 4 (0x0, 0x4, 0x8, ...) |
+| `long` | 8 | 8 | 8 (0x0, 0x8, 0x10, ...) |
+| `double` | 8 | 8 | 8 |
+| `void*` | 8 | 8 | 8 (on 64-bit systems) |
+
+**How compilers ensure alignment:**
+
+```c
+struct Example {
+  char a;      // 1 byte at offset 0
+  // 3 bytes padding inserted here
+  int b;       // 4 bytes at offset 4 (4-byte aligned)
+  char c;      // 1 byte at offset 8
+  // 7 bytes padding inserted here
+  double d;    // 8 bytes at offset 16 (8-byte aligned)
+};
+
+sizeof(struct Example) = 24 bytes (not 14!)
+Padding ensures each field is properly aligned
+```
+
+**Forcing alignment with `alignas`:**
+
+```c
+// Align to cache line boundary (64 bytes) to prevent false sharing
+struct alignas(64) ThreadLocal {
+  int counter;
+  // 60 bytes padding added by compiler
+};
+
+// Each thread's counter on different cache line
+ThreadLocal thread_data[16];  // 16 * 64 = 1024 bytes
+```
+
+**Why temporal-slab cares about alignment:**
+
+**1. Handle encoding assumes aligned pointers:**
+
+```c
+// Handle format: [slab_ptr:48][slot:8][class:8]
+// Assumes slab pointers are page-aligned (low 12 bits = 0)
+
+Slab* slab = mmap(..., 4096, ...);  // OS returns page-aligned (0x...000)
+SlabHandle h = ((uint64_t)slab << 16) | (slot << 8) | class;
+
+// If slab were unaligned (low bits != 0), encoding would corrupt slot/class
+```
+
+**2. All allocations 8-byte aligned:**
+
+```c
+void* alloc_obj(alloc, size, &h) {
+  // Returns 8-byte aligned pointer
+  // Ensures atomic operations on user data are safe
+  // Ensures double/long/pointer types are naturally aligned
+}
+```
+
+**3. Slab header structure alignment:**
+
+```c
+struct Slab {
+  Slab* prev;            // 8 bytes, offset 0 (8-byte aligned)
+  Slab* next;            // 8 bytes, offset 8 (8-byte aligned)
+  _Atomic uint32_t magic; // 4 bytes, offset 16 (4-byte aligned)
+  uint32_t object_size;  // 4 bytes, offset 20 (4-byte aligned)
+  // Compiler ensures each field is aligned for atomic operations
+};
+```
+
+**Checking alignment at runtime:**
+
+```c
+bool is_aligned(void* ptr, size_t alignment) {
+  return ((uintptr_t)ptr % alignment) == 0;
+}
+
+assert(is_aligned(slab, 4096));  // Slab is page-aligned
+assert(is_aligned(ptr, 8));      // Allocation is 8-byte aligned
+```
+
+**The alignment-size trade-off:**
+
+```c
+// Option 1: Tight packing (unaligned, slow)
+struct Tight {
+  char a;   // offset 0
+  int b;    // offset 1 (UNALIGNED!)
+  char c;   // offset 5
+};
+sizeof(Tight) = 6 bytes (if packed)
+Access to b requires 2 memory operations (slow)
+
+// Option 2: Aligned (padding, fast)
+struct Aligned {
+  char a;   // offset 0
+  // 3 bytes padding
+  int b;    // offset 4 (aligned!)
+  char c;   // offset 8
+};
+sizeof(Aligned) = 12 bytes (wasted 5 bytes)
+Access to b requires 1 memory operation (fast)
+```
+
+Allocators choose alignment to maximize performance, accepting some wasted space from padding.
+
+## Compiler Barriers
+
+Compiler barriers prevent the compiler from reordering instructions across the barrier at compile time. They are distinct from memory barriers (which prevent CPU reordering at runtime).
+
+**The problem: Compiler optimization**
+
+Compilers reorder and optimize code for performance. This breaks benchmarks and low-level concurrent code:
+
+```c
+// Original code
+uint64_t t0 = now_ns();
+void* ptr = alloc_obj(alloc, 128, &h);
+uint64_t t1 = now_ns();
+printf("Latency: %lu ns\n", t1 - t0);
+
+// Compiler might optimize to:
+uint64_t t0 = now_ns();
+uint64_t t1 = now_ns();  // Reordered before alloc_obj!
+void* ptr = alloc_obj(alloc, 128, &h);
+printf("Latency: %lu ns\n", t1 - t0);  // Measures 0 ns (wrong!)
+```
+
+The compiler sees no dependency between `alloc_obj()` and `t1 = now_ns()`, so it reorders to improve register allocation. This produces incorrect benchmark results.
+
+**Compiler barrier implementation:**
+
+```c
+#define compiler_barrier() asm volatile("" ::: "memory")
+```
+
+This is an inline assembly directive that:
+1. `asm volatile` - Tells compiler not to optimize away or reorder
+2. `""` - Empty assembly (no actual CPU instruction)
+3. `::: "memory"` - Clobbers memory (compiler assumes all memory changed)
+
+**How it works:**
+
+```c
+uint64_t t0 = now_ns();
+compiler_barrier();  // Compiler cannot move code before this line past it
+void* ptr = alloc_obj(alloc, 128, &h);
+compiler_barrier();  // Compiler cannot move code after this line before it
+uint64_t t1 = now_ns();
+```
+
+The compiler treats the barrier as if it reads/writes all memory. Any memory operation before the barrier must stay before. Any after must stay after.
+
+**Compiler barrier vs memory barrier:**
+
+| Barrier Type | Prevents | Cost | Example |
+|--------------|----------|------|---------|
+| **Compiler barrier** | Compile-time reordering | 0 cycles (no code) | `asm volatile("" ::: "memory")` |
+| **Memory barrier** | Runtime CPU reordering | 20-100 cycles | `atomic_thread_fence()`, `mfence` |
+
+**When to use compiler barriers:**
+
+**1. Benchmarking:**
+
+```c
+// Prevent compiler from reordering benchmark timing
+compiler_barrier();
+uint64_t t0 = now_ns();
+compiler_barrier();
+operation_under_test();
+compiler_barrier();
+uint64_t t1 = now_ns();
+compiler_barrier();
+```
+
+**2. Volatile access patterns:**
+
+```c
+volatile int* mmio_reg = (volatile int*)0xFF00;  // Memory-mapped I/O
+
+*mmio_reg = 1;  // Write to hardware register
+compiler_barrier();  // Ensure write happens before read
+int status = *mmio_reg;  // Read hardware status
+```
+
+**3. Preventing dead code elimination:**
+
+```c
+void benchmark_alloc() {
+  void* ptr = alloc_obj(alloc, 128, &h);
+  // Without barrier, compiler might eliminate alloc_obj if ptr unused
+  compiler_barrier();  // Force ptr to be "used"
+  free_obj(alloc, h);
+}
+```
+
+**Why temporal-slab benchmarks use compiler barriers:**
+
+```c
+// From benchmark_accurate.c
+static inline void barrier(void) {
+  asm volatile("" ::: "memory");
+}
+
+void benchmark_latency() {
+  barrier();  // Prevent timing code from being reordered
+  uint64_t t0 = now_ns();
+  barrier();  // Separate timing from allocation
+  
+  void* ptr = slab_malloc_epoch(alloc, size, 0);
+  
+  barrier();  // Prevent allocation from being reordered
+  uint64_t t1 = now_ns();
+  barrier();  // Separate timing from cleanup
+  
+  latency_ns = t1 - t0;  // Accurate measurement
+}
+```
+
+Without barriers, the compiler might:
+- Hoist `t1 = now_ns()` before the allocation
+- Sink `t0 = now_ns()` after the allocation
+- Eliminate the allocation entirely if `ptr` appears unused
+- Merge multiple `now_ns()` calls
+
+**Common mistake: Thinking volatile is enough**
+
+```c
+volatile uint64_t timestamp;
+
+timestamp = now_ns();  // volatile prevents optimization of read
+alloc_obj(...);
+timestamp = now_ns();  // But doesn't prevent reordering!
+```
+
+`volatile` tells the compiler "this memory might change unexpectedly, don't optimize it away." It does NOT prevent reordering. Use explicit barriers.
+
+**Full memory barrier (atomic_thread_fence) includes compiler barrier:**
+
+```c
+atomic_thread_fence(memory_order_seq_cst);
+// Implies both:
+// 1. Compiler barrier (no compile-time reordering)
+// 2. CPU memory barrier (no runtime reordering)
+```
+
+So you don't need both:
+```c
+// Redundant:
+compiler_barrier();
+atomic_thread_fence(memory_order_seq_cst);
+
+// Sufficient:
+atomic_thread_fence(memory_order_seq_cst);
+```
+
+**Zero-cost abstraction:**
+
+Compiler barriers are a zero-cost abstraction—they affect what code the compiler generates but add no runtime instructions:
+
+```assembly
+; Without barrier:
+mov rax, [time]    ; t0 = now_ns()
+call alloc_obj     ; alloc_obj()
+mov rbx, [time]    ; t1 = now_ns()
+
+; With barrier:
+mov rax, [time]    ; t0 = now_ns()
+; <no instruction here for barrier>
+call alloc_obj     ; alloc_obj()
+; <no instruction here for barrier>
+mov rbx, [time]    ; t1 = now_ns()
+```
+
+The barrier affects instruction ordering but compiles to zero bytes.
 
 ## Bounded RSS Through Conservative Recycling
 
