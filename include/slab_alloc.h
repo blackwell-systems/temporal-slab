@@ -6,15 +6,17 @@
 #include <stddef.h>
 
 /*
- * ZNS-Slab Phase 1.5 - Public API
+ * ZNS-Slab Phase 1.6 - Public API
  * 
  * Specialized slab allocator for sub-4KB objects.
  * 
- * USAGE: Stack-allocate SlabAllocator, call allocator_init(), use alloc_obj/free_obj.
+ * USAGE (opaque API): 
+ *   SlabAllocator* a = slab_allocator_create();
+ *   void* p = alloc_obj(a, size, &handle);
+ *   free_obj(a, handle);
+ *   slab_allocator_free(a);
  * 
- * IMPORTANT: SlabAllocator internal fields are PRIVATE.
- * Do not access fields directly. Treat as opaque and use provided API only.
- * Internal layout will change in Phase 1.6 (full opaque types).
+ * SlabAllocator is opaque - internal layout is private and may change.
  */
 
 /* Configuration constants */
@@ -40,13 +42,17 @@ typedef struct PerfCounters {
   uint64_t current_partial_full;  /* fast path saw full current_partial */
 } PerfCounters;
 
-/* -------------------- Core API -------------------- */
+/* -------------------- Lifetime -------------------- */
 
-/* Initialize allocator - call before use */
+/* Create/destroy - opaque API for external users */
+SlabAllocator* slab_allocator_create(void);
+void slab_allocator_free(SlabAllocator* alloc);
+
+/* Init/destroy - for internal use or when caller provides storage */
 void allocator_init(SlabAllocator* alloc);
-
-/* Destroy allocator - frees all resources */
 void allocator_destroy(SlabAllocator* alloc);
+
+/* -------------------- Core API -------------------- */
 
 /* Allocate object, returns pointer or NULL on failure */
 void* alloc_obj(SlabAllocator* alloc, uint32_t size, SlabHandle* out_handle);

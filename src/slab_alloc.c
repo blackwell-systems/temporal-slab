@@ -227,10 +227,23 @@ static bool slab_free_slot_atomic(Slab* s, uint32_t idx, uint32_t* out_prev_fc) 
   }
 }
 
-/* ------------------------------ Allocator Internal ------------------------------ */
+/* ------------------------------ Allocator Lifetime ------------------------------ */
 
-/* Note: Struct definitions moved to slab_alloc_internal.h */
+/* Opaque API: create/free for external users */
+SlabAllocator* slab_allocator_create(void) {
+  SlabAllocator* a = (SlabAllocator*)calloc(1, sizeof(SlabAllocator));
+  if (!a) return NULL;
+  allocator_init(a);
+  return a;
+}
 
+void slab_allocator_free(SlabAllocator* a) {
+  if (!a) return;
+  allocator_destroy(a);
+  free(a);
+}
+
+/* Init/destroy: for internal use or when caller provides storage */
 void allocator_init(SlabAllocator* a) {
   memset(a, 0, sizeof(*a));
   for (size_t i = 0; i < k_num_classes; i++) {
@@ -476,7 +489,7 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   if (h.size_class >= (uint32_t)k_num_classes) return false;
 
   SizeClassAlloc* sc = &a->classes[h.size_class];
-  Slab* s = h.slab;
+  Slab* s = (Slab*)h.slab;  /* Cast from void* (public) to Slab* (internal) */
   if (s->magic != SLAB_MAGIC) return false;
 
   /* Precise transition detection: get previous free_count from fetch_add */
