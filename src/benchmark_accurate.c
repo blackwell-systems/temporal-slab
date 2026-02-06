@@ -52,6 +52,32 @@ static inline void barrier(void) {
   g_sink++;
 }
 
+/* ------------------------------ CSV Export ------------------------------ */
+
+static FILE* g_csv_file = NULL;
+
+static void csv_write_header_latency(void) {
+  if (!g_csv_file) return;
+  fprintf(g_csv_file, "allocator,threads,size_class,op,avg_ns,p50_ns,p95_ns,p99_ns,p999_ns\n");
+}
+
+static void csv_write_latency(const char* op, double avg, uint64_t p50, uint64_t p95, uint64_t p99, uint64_t p999) {
+  if (!g_csv_file) return;
+  fprintf(g_csv_file, "temporal-slab,1,128,%s,%.1f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+          op, avg, p50, p95, p99, p999);
+}
+
+static void csv_write_header_fragmentation(void) {
+  if (!g_csv_file) return;
+  fprintf(g_csv_file, "allocator,size_class,requested,rounded,wasted,efficiency_pct\n");
+}
+
+static void csv_write_fragmentation(uint32_t requested, uint32_t rounded, uint32_t wasted, double efficiency) {
+  if (!g_csv_file) return;
+  fprintf(g_csv_file, "temporal-slab,%u,%u,%u,%u,%.1f\n",
+          rounded, requested, rounded, wasted, efficiency);
+}
+
 /* ------------------------------ Accurate RSS Benchmark ------------------------------ */
 
 static void benchmark_rss_accurate(void) {
@@ -244,6 +270,12 @@ static void benchmark_latency_accurate(void) {
   printf("p50:     %" PRIu64 " ns\n", free_p50);
   printf("p99:     %" PRIu64 " ns\n", free_p99);
   printf("p999:    %" PRIu64 " ns\n", free_p999);
+  
+  /* Export to CSV if enabled */
+  uint64_t alloc_p95 = percentile(alloc_times, N, 0.95);
+  uint64_t free_p95 = percentile(free_times, N, 0.95);
+  csv_write_latency("alloc", alloc_avg, alloc_p50, alloc_p95, alloc_p99, alloc_p999);
+  csv_write_latency("free", free_avg, free_p50, free_p95, free_p99, free_p999);
 
   /* Get performance counters for 128B size class (index 1) */
   PerfCounters counters;
@@ -341,6 +373,7 @@ static void benchmark_fragmentation(void) {
     total_wasted += wasted;
     
     printf("%-12u %-12u %-12u %.1f%%\n", requested, rounded, wasted, efficiency);
+    csv_write_fragmentation(requested, rounded, wasted, efficiency);
   }
   
   double avg_efficiency = (double)total_requested / (double)(total_requested + total_wasted) * 100.0;
@@ -354,13 +387,49 @@ static void benchmark_fragmentation(void) {
 
 /* ------------------------------ Main ------------------------------ */
 
-int main(void) {
+int main(int argc, char** argv) {
+  /* Parse arguments */
+  const char* csv_path = NULL;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
+      csv_path = argv[i + 1];
+      i++;
+    }
+  }
+  
+  /* Open CSV file if requested */
+  if (csv_path) {
+    g_csv_file = fopen(csv_path, "w");
+    if (!g_csv_file) {
+      fprintf(stderr, "Failed to open CSV file: %s\n", csv_path);
+      return 1;
+    }
+    csv_write_header_latency();
+  }
+  
   printf("temporal-slab Phase 1 - Accurate Benchmarks\n");
   printf("======================================\n");
   
   benchmark_rss_accurate();
   benchmark_latency_accurate();
+  
+  /* Switch to fragmentation CSV if needed */
+  if (g_csv_file) {
+    fclose(g_csv_file);
+    /* Append fragmentation data to same file */
+    g_csv_file = fopen(csv_path, "a");
+    if (g_csv_file) {
+      fprintf(g_csv_file, "\n");
+      csv_write_header_fragmentation();
+    }
+  }
+  
   benchmark_fragmentation();
+  
+  if (g_csv_file) {
+    fclose(g_csv_file);
+    printf("\nCSV written to: %s\n", csv_path);
+  }
   
   printf("\n=== All Benchmarks Complete ===\n");
   return 0;

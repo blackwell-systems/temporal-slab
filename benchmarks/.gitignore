@@ -1,0 +1,6 @@
+# Benchmark output (regenerable)
+results/*.csv
+results/*.json
+
+# Baseline runs (large, optional)
+baseline/*/results/*.csv
