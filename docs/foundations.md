@@ -1,270 +1,200 @@
 # Foundations: Memory Allocation and Lifetime-Aware Design
 
-This document provides the theoretical and practical background necessary to understand temporal-slab's design decisions. It assumes no prior knowledge of memory allocator internals.
+This document builds the theoretical foundation for temporal-slab from first principles, defining each concept before using it to explain the next. It assumes no prior knowledge of memory allocator internals.
 
-## Chapter 1: What is Memory Allocation?
+---
 
-When a program runs, it needs memory to store data. The operating system provides memory to processes in large chunks called pages, typically 4096 bytes (4KB) on modern systems. However, programs rarely need exactly 4KB at a time. A web server might need 80 bytes to store a user session, 256 bytes for a request object, or 512 bytes for a response buffer. The gap between what the operating system provides (pages) and what applications need (arbitrary-sized objects) is filled by memory allocators.
+## Page
 
-A memory allocator is a subsystem that manages a pool of memory, satisfying allocation requests of various sizes and reclaiming memory when it is no longer needed. The canonical interface is malloc and free in C, but the same problem exists in every programming language. The allocator's job is to answer two questions: where should this new allocation go, and when can freed memory be reused?
+A page is the smallest unit of memory the operating system manages. On most modern systems (x86-64, ARM64), a page is 4096 bytes (4KB). When a program requests memory, the OS allocates entire pages. The program may request 80 bytes, but the OS grants at least one page. Pages are the fundamental currency of memory management—they can be mapped into a process's address space, unmapped to return them to the OS, or marked with protection attributes (read, write, execute).
 
-### The Spatial Problem
+## Virtual Memory vs Physical Memory
 
-Consider a simple allocator that starts with a 4KB page and hands out memory sequentially. A program allocates 100 bytes, then 200 bytes, then 50 bytes. The allocator places them end-to-end. So far, 350 bytes are used. Now the program frees the 200-byte allocation in the middle. The allocator has a hole: 100 bytes of used memory, then 200 bytes free, then 50 bytes used. If the next allocation request is for 300 bytes, it will not fit in the 200-byte hole, even though there is sufficient free memory in aggregate. This is spatial fragmentation.
+When a program requests memory, the OS grants virtual memory—address space the program can reference. Virtual addresses are not physical RAM addresses. They are references into a virtual address space managed by the OS. The mapping from virtual to physical addresses happens through page tables maintained by the CPU's memory management unit (MMU).
 
-Traditional allocators respond to spatial fragmentation with increasingly sophisticated bookkeeping. They maintain free lists organized by size, use tree structures to find best-fit holes, or apply heuristics like splitting large holes into smaller chunks. This works well for general-purpose workloads, but the complexity accumulates over time. As allocations and frees interleave, the allocator's metadata grows, search times increase, and memory becomes fragmented across many small, unusable holes.
+Virtual memory enables isolation (each process has its own address space) and overcommitment (the OS can grant more virtual memory than physical RAM exists). Physical pages are allocated lazily: when a program first accesses a virtual page, a page fault occurs, the OS allocates a physical page, and the MMU updates the page table to map the virtual address to the physical address.
 
-### The Temporal Problem
+## Resident Set Size (RSS)
 
-Spatial fragmentation is visible and well understood. Temporal fragmentation is subtler and more damaging in long-running systems.
+RSS is the amount of physical memory a process currently occupies. When a virtual page is faulted in, it becomes resident—it occupies a physical page in RAM. RSS measures how many pages are resident at any given moment.
 
-Imagine a memory page containing four objects: A, B, C, and D. A is a session object that will live for hours. B is a request object that will be freed in milliseconds. C is a cache entry that might live for minutes. D is a logging buffer that will be freed immediately after writing. These objects have vastly different lifetimes, but they share the same page.
+RSS is distinct from virtual memory size (which includes unmapped pages and pages the OS has swapped out) and distinct from the working set (the set of pages the program actively uses). A program might have gigabytes of virtual memory but only megabytes of RSS. RSS is what matters for system performance—it determines memory pressure, whether the system swaps, and whether the system runs out of physical memory.
 
-When B and D are freed, the page is not empty—A and C are still alive. The operating system cannot reclaim the page because it contains live data. The page remains resident in memory, even though half of it is unused. Over time, as the program continues to allocate and free, pages accumulate a mixture of live and dead objects. The program's resident set size (RSS) grows even though the working set of live objects remains constant. This is temporal fragmentation.
+## Memory Allocator
 
-Temporal fragmentation cannot be solved by better bookkeeping. The problem is not that the allocator cannot find space—it is that the space cannot be reclaimed. The page is pinned by a single long-lived object, preventing the operating system from reusing it. Traditional allocators respond with compaction: they move live objects to new locations, consolidating them into fewer pages so old pages can be released. But compaction is expensive, unpredictable, and incompatible with systems that expect stable pointers.
+A memory allocator bridges the gap between what the OS provides (pages) and what programs need (arbitrary-sized objects). The OS gives memory in 4KB chunks. A web server needs 80 bytes for a session, 256 bytes for a request, 512 bytes for a response. The allocator subdivides pages into smaller allocations.
 
-## Chapter 2: Fragmentation as Entropy
+The canonical allocator interface is `malloc(size)` and `free(ptr)`. The allocator's job is to maintain a pool of pages, satisfy allocation requests by finding or creating space, and reclaim space when objects are freed. The allocator must answer: where should this allocation go? When can freed memory be reused? How can pages be returned to the OS when they are no longer needed?
 
-In thermodynamics, entropy measures disorder. A system with low entropy is organized—energy is concentrated and useful. A system with high entropy is disordered—energy is dispersed and unusable. Over time, without external work, entropy increases. This is the second law of thermodynamics.
+## Spatial Fragmentation
 
-Memory fragmentation follows the same pattern. At startup, memory is organized: all pages are empty or all pages are full. As the program runs, allocations and frees interleave randomly. Pages accumulate a mixture of live and dead objects. The system becomes disordered. Memory is dispersed across many pages, but much of it cannot be reclaimed. Fragmentation is entropy.
+Spatial fragmentation occurs when free memory exists but is scattered into unusable fragments. Consider a 4KB page. A program allocates 100 bytes, then 200 bytes, then 50 bytes. They are placed end-to-end. The program frees the 200-byte allocation in the middle. Now there is a hole: 100 bytes used, 200 bytes free, 50 bytes used. If the next allocation is 300 bytes, it will not fit in the 200-byte hole, even though 200 bytes are free.
 
-Traditional allocators treat fragmentation as an engineering problem: a consequence of poor data structures or suboptimal heuristics. If we implement a better search algorithm, or use a smarter free list organization, we can reduce fragmentation. This is true to a point. But fundamentally, if allocations and frees are uncorrelated with object lifetimes, fragmentation is inevitable. The allocator can delay it, but it cannot prevent it.
+Over time, as allocations and frees interleave, memory resembles Swiss cheese: plenty of free space in aggregate, but scattered into holes too small to satisfy requests. Allocation cost rises because the allocator must search for suitable holes. Cache locality degrades because objects are scattered. Metadata grows because the allocator must track many small fragments.
 
-### The Allocator's Dilemma
+Traditional allocators respond with free lists (tracking available holes by size), tree structures (efficiently finding best-fit holes), and splitting (dividing large holes to satisfy small requests). This works for general-purpose workloads, but the complexity accumulates, and search times grow.
 
-The traditional allocator's goal is to find space for each allocation request. It optimizes for utilization: maximize the fraction of allocated memory that is actually used. This leads to a policy of filling holes aggressively. If there is a 200-byte hole, use it. If there is a 500-byte hole and a 100-byte request, split the hole and use part of it. This is the first-fit or best-fit strategy.
+## Temporal Fragmentation
 
-The problem is that this policy ignores lifetimes. A short-lived allocation placed next to a long-lived allocation creates a temporal fragment. When the short-lived object is freed, the page is pinned by the long-lived object. The allocator has optimized for spatial efficiency at the expense of temporal efficiency.
+Temporal fragmentation is subtler and more damaging than spatial fragmentation. It occurs when objects with vastly different lifetimes share the same page.
 
-The correct optimization is not "fill holes efficiently." It is "group objects by expected lifetime." If short-lived objects are allocated together, they will die together, and their pages can be reclaimed as a unit. If long-lived objects are allocated together, their pages remain full and useful. The allocator does not fight entropy—it manages entropy by ensuring objects expire in an organized way.
+Consider a page containing four objects: A (a session object living for hours), B (a request object living milliseconds), C (a cache entry living minutes), D (a logging buffer freed immediately). When B and D are freed, the page is not empty—A and C are still alive. The OS cannot reclaim the page because it contains live data. The page remains resident, even though half of it is unused.
 
-## Chapter 3: The Slab Allocation Model
+Over time, as allocations and frees continue, pages accumulate mixtures of live and dead objects. RSS grows even though the working set remains constant. Pages cannot be returned to the OS because they are pinned by even a single long-lived object. This is temporal fragmentation: memory that is allocated but not fully utilized, scattered across pages that cannot be reclaimed.
 
-The slab allocator was introduced by Jeff Bonwick in 1994 for the Solaris kernel. The insight was simple: if the kernel frequently allocates objects of a fixed size (e.g., process descriptors, file handles), maintain a dedicated pool of pages for each size class. A slab is a single page subdivided into slots of a fixed size. When a process descriptor is needed, allocate a slot from the process descriptor slab. When it is freed, mark the slot as available. No search is necessary—slots are uniform and pre-allocated.
+Traditional allocators respond with compaction: moving live objects to consolidate them into fewer pages so old pages can be released. But compaction is expensive (requires copying), unpredictable (causes latency spikes), and incompatible with systems expecting stable pointers (pointers become invalid after compaction).
 
-Bonwick's design solved three problems. First, it eliminated search overhead. There are no free lists or complex heuristics. Allocation is finding the next available slot in a bitmap. Second, it eliminated metadata overhead. Traditional allocators store metadata in headers before each allocation. Slabs store metadata in a separate header, reducing per-object cost. Third, it improved cache locality. Objects of the same type are physically adjacent, so accessing one object likely brings related objects into cache.
+## Fragmentation as Entropy
 
-Bonwick's slab allocator was designed for kernel objects with predictable lifetimes. Kernel objects are typically created in response to system calls and freed shortly afterward. The implicit assumption was that most slabs would cycle between "empty" and "partially full" relatively quickly. If a slab became full, it was set aside. If it became empty, it could be reused immediately.
+In thermodynamics, entropy measures disorder. A low-entropy system is organized—energy is concentrated and useful. A high-entropy system is disordered—energy is dispersed and unusable. Without external work, entropy increases (second law of thermodynamics).
 
-### The Object Lifetime Assumption
+Memory fragmentation follows the same pattern. At startup, memory is organized: pages are either empty or full. As the program runs, allocations and frees interleave. Pages accumulate mixtures of live and dead objects. The system becomes disordered. Memory is dispersed across many pages, much of it unreclaimable. Fragmentation is entropy.
 
-The slab model depends on a critical assumption: objects in a slab have correlated lifetimes. If all objects in a slab are allocated around the same time and freed around the same time, the slab will become empty as a unit and can be recycled cleanly. This is the ideal case.
+Traditional allocators treat fragmentation as an engineering problem—better data structures or heuristics can reduce it. This is true to a point. But if allocations and frees are uncorrelated with object lifetimes, fragmentation is inevitable. The allocator can delay it but cannot prevent it without reorganizing memory (compaction), which is itself expensive.
 
-If objects have uncorrelated lifetimes, the slab model degrades. Consider a slab with 32 slots. Thirty-one objects are freed, but one remains alive. The slab cannot be recycled because it contains live data. The slab occupies a full page (4KB) but provides only 1/32 of its capacity. This is no better than traditional fragmentation—worse, in fact, because the allocator has no mechanism to move the remaining object elsewhere.
+The insight is that the allocator should not fight entropy by constantly reordering memory. It should manage entropy by ensuring objects expire in an organized way—grouping objects with similar lifetimes so that when their lifetimes end, entire pages become empty and can be reclaimed as a unit.
 
-The question is: how can the allocator ensure that objects in a slab have correlated lifetimes?
+## Lifetime Affinity
 
-## Chapter 4: Lifetime Affinity Through Allocation Order
+Lifetime affinity is the principle that objects with similar lifetimes should be placed in the same page. If short-lived objects are grouped together, they die together, and their page can be reclaimed. If long-lived objects are grouped together, their page remains full and useful. The page does not become pinned by a mixture of live and dead objects.
 
-Bonwick's slab allocator did not attempt to predict object lifetimes. It relied on the kernel's behavior: objects allocated in response to the same system call would likely be freed around the same time. The allocator's job was not to guess lifetimes but to group allocations that occurred close together in time.
+The problem is that the allocator does not know object lifetimes in advance. A session object and a request object have the same type signature—they are both allocations of N bytes. The allocator cannot predict that one will live hours and the other milliseconds.
 
-This is allocation-order affinity. If a slab is filled sequentially with objects allocated in a short time window, those objects are likely to have similar lifetimes. Not because the allocator is smart, but because programs exhibit temporal locality. A web server handling a request allocates a request object, a response object, a buffer, and a session token. These objects are causally related—they were created for the same request. When the request completes, they are all freed. If they were allocated from the same slab, that slab becomes empty.
+The solution is allocation-order affinity: group allocations that occur close together in time. Programs exhibit temporal locality—allocations that occur around the same time are often causally related and thus have correlated lifetimes. A web server handling a request allocates a request object, a response object, a buffer, and a session token. These are allocated in quick succession. They are causally related—created for the same request. When the request completes, they are all freed. If they are in the same page, that page becomes empty.
 
-This principle generalizes beyond kernels. Any system where allocations are clustered in time will benefit from allocation-order affinity. A cache system allocates many entries at startup, then allocates new entries sporadically as old ones are evicted. If startup entries are grouped in slabs separate from runtime entries, the allocator naturally separates long-lived from short-lived data.
+Allocation-order affinity does not require the allocator to predict lifetimes. It requires the allocator to allocate sequentially within pages, so objects allocated in the same epoch end up in the same page. Lifetime correlation emerges naturally from allocation patterns, not from explicit hints.
 
-### Why Traditional Allocators Fail Here
+## Slab
 
-Traditional allocators do not group allocations by time. They group allocations by size, searching for the best-fit hole. If a 100-byte object is allocated at startup, and another 100-byte object is allocated five minutes later, a traditional allocator might place them in the same hole if it is the best fit. These objects are spatially adjacent but temporally unrelated. When the short-lived object is freed, the page is pinned by the long-lived object.
+A slab is a fixed-size subdivision of a page. Instead of treating a page as a pool of arbitrary-sized allocations, a slab divides a page into uniform slots of a fixed size. A 4KB page with 64-byte slots yields 63 slots (after accounting for metadata). A page with 128-byte slots yields 31 slots.
 
-Slab allocators avoid this by refusing to fill holes. A slab allocator does not search for space—it allocates sequentially within a slab. If a slab is full, it allocates a new slab. This means allocations are naturally ordered by time. Objects allocated in the same epoch end up in the same slab.
+A slab allocator maintains separate slabs for each size class. To allocate a 100-byte object, the allocator rounds up to the next size class (e.g., 128 bytes) and allocates a slot from a 128-byte slab. Allocation is finding an available slot (no search required—a bitmap tracks slot state). Free marks the slot as available.
 
-## Chapter 5: The Slab Lifecycle
+Slabs solve two problems. First, they eliminate spatial fragmentation. There are no holes to search—slots are uniform and pre-allocated. Allocation is O(1) (find first free bit in bitmap). Second, they naturally group allocations by time. A slab is filled sequentially. Objects allocated around the same time end up in the same slab. If those objects have correlated lifetimes (allocation-order affinity), they die together, and the slab becomes empty as a unit.
 
-A slab moves through three states during its lifetime: partial, full, and empty.
+## Size Class
 
-When a slab is first created, it is empty. All slots are available. The allocator places it on the partial list, meaning it has at least one free slot and at least zero allocated slots. As allocations proceed, slots are claimed one by one. When the last free slot is allocated, the slab transitions to the full state. It is moved from the partial list to the full list.
+A size class is a fixed allocation size supported by the slab allocator. A program requests 100 bytes. The allocator rounds up to the next size class, e.g., 128 bytes. The allocator maintains separate slabs for each size class: slabs for 64-byte objects, slabs for 128-byte objects, slabs for 256-byte objects.
 
-Eventually, objects in the slab are freed. When the first object is freed, the slab transitions back to partial—it now has one free slot. It is moved from the full list back to the partial list. As more objects are freed, the slab empties. When the last object is freed, the slab is completely empty. At this point, the allocator has a choice: keep the slab on the partial list for reuse, or destroy the slab and return the page to the operating system.
+The choice of size classes is a trade-off. If classes are too coarse (e.g., 64, 256, 1024), internal fragmentation is high—a 65-byte request wastes 191 bytes in a 256-byte slot (74% waste). If classes are too fine (e.g., 64, 65, 66, ...), the allocator requires many slab pools, increasing metadata and reducing reuse.
 
-Bonwick's design cached empty slabs. Destroying and recreating slabs is expensive—it involves system calls (munmap and mmap) and TLB invalidations. Instead, the allocator maintains a small cache of empty slabs per size class. If a new slab is needed, the allocator checks the cache first. If the cache is empty, it allocates a new page. If the cache is full and another slab becomes empty, the oldest cached slab is destroyed to prevent unbounded growth.
+temporal-slab uses 8 size classes: 64, 96, 128, 192, 256, 384, 512, 768 bytes. This progression is approximately exponential (ratio ~1.5x) but adjusted to align with common object sizes. This achieves 88.9% average efficiency across realistic workloads (11.1% internal fragmentation).
 
-This design is conservative. Slabs are only recycled when they are completely empty. Partially empty slabs remain on the partial list indefinitely, even if they are mostly empty. This avoids the risk of recycling a slab that still contains live objects, but it also means that memory is not released aggressively. The allocator prioritizes correctness and predictability over utilization.
+## Internal Fragmentation
 
-## Chapter 6: Concurrency and Lock-Free Fast Paths
+Internal fragmentation is wasted space within an allocation. A program requests 72 bytes. The allocator rounds to 96 bytes (smallest size class that fits). 24 bytes are wasted (33% overhead). This is internal fragmentation—space allocated but not used.
 
-In a single-threaded program, slab allocation is trivial. The allocator maintains a pointer to the current partial slab. Allocation scans the slab's bitmap for a free slot, marks it as allocated, and returns a pointer to the slot. Free marks the slot as available. No synchronization is needed.
+Internal fragmentation is the cost of using fixed size classes. The benefit is eliminating spatial fragmentation (no holes, no search). The trade-off is deliberate: waste a predictable, bounded amount of space per allocation in exchange for O(1) allocation, elimination of search overhead, and guaranteed lifetime grouping.
 
-In a multi-threaded program, multiple threads may allocate and free concurrently. The naive solution is to protect the allocator with a mutex. Before allocating or freeing, acquire the lock. This is correct but slow. Lock contention becomes a bottleneck, especially in high-frequency allocation workloads.
+The key is choosing size classes to minimize waste. If 80% of allocations are between 65-96 bytes, a 96-byte size class reduces waste significantly compared to a 128-byte class.
 
-The solution is to make the fast path lock-free. The fast path is the common case: allocating from a slab that already has free slots. The slow path is the rare case: allocating a new slab when the current one is full, or moving slabs between lists. The goal is to make the fast path proceed without blocking, deferring synchronization to the slow path.
+## Slab Lifecycle
 
-### Atomic Operations and Compare-and-Swap
+A slab moves through three states: partial, full, empty.
 
-Modern CPUs provide atomic instructions that operate on memory without locks. The most important is compare-and-swap (CAS). CAS takes three arguments: a memory address, an expected value, and a new value. If the current value at the address matches the expected value, replace it with the new value and return success. Otherwise, return failure without modifying memory. CAS is atomic—no other thread can observe an intermediate state.
+**Partial:** The slab has at least one free slot and at least one allocated slot. It is available for new allocations. The allocator maintains a partial list—a linked list of all partial slabs for a size class.
 
-CAS enables lock-free data structures. Instead of acquiring a lock, a thread reads a shared variable, computes a new value, and attempts to update the variable with CAS. If another thread modified the variable in the meantime, CAS fails. The thread retries, reading the updated value and attempting CAS again. This is called a CAS loop.
+**Full:** Every slot in the slab is allocated. The slab is moved from the partial list to the full list. It is no longer considered for allocation. Full slabs remain mapped but are set aside.
 
-CAS loops are not always faster than locks. If contention is high, threads waste CPU time retrying. But in low-to-moderate contention, CAS loops are dramatically faster than locks because they avoid kernel transitions and cache coherence overhead.
+**Empty:** All slots are free. The slab has no live objects. At this point, the allocator can destroy the slab (unmap the page, return it to the OS) or cache the slab for reuse (keep it mapped, push it to a cache for fast reallocation).
 
-### Lock-Free Slab Allocation
+Transitions:
+- New slab → Partial (first allocation)
+- Partial → Full (last free slot allocated)
+- Full → Partial (first slot freed)
+- Partial → Empty (last allocated slot freed)
 
-temporal-slab uses a lock-free fast path based on atomic operations. Each size class maintains a `current_partial` pointer, which points to the currently active slab. This pointer is shared across all threads. Allocation proceeds as follows:
+The lifecycle ensures that only completely empty slabs are candidates for recycling or destruction. Partially empty slabs remain on the partial list, available for reuse.
 
-1. Load `current_partial` with an atomic acquire. This ensures the pointer and the slab's contents are visible.
-2. Attempt to allocate a slot from the slab by finding a free bit in the bitmap and setting it with CAS.
-3. If CAS succeeds, return the slot pointer. If CAS fails (another thread claimed the slot), retry step 2.
-4. If the slab has no free slots (all bits set), fall back to the slow path.
+## Lock-Free Allocation
 
-The slow path acquires a per-size-class mutex and selects a new slab from the partial list. This is rare—it only happens when the current slab is exhausted. Once a new slab is selected, it is published to `current_partial` with an atomic store, and the fast path resumes.
+In multi-threaded programs, multiple threads may allocate concurrently. The naive approach is to protect the allocator with a mutex. Before allocating, acquire the lock. This is correct but slow—lock contention becomes a bottleneck.
 
-Free also uses a lock-free approach. Each slot's state is encoded in the slab's bitmap. Freeing a slot sets the corresponding bit with an atomic operation. No lock is required unless the slab transitions between states (e.g., from full to partial), which requires updating the partial and full lists under a mutex.
+The solution is to make the fast path lock-free. The fast path is the common case: allocating from a slab that already has free slots. The slow path is the rare case: allocating a new slab when the current one is full.
 
-This design achieves sub-100 nanosecond allocation latency in the common case while maintaining correctness under concurrency.
+Lock-free allocation uses atomic operations—CPU instructions that modify memory without locks. The key primitive is compare-and-swap (CAS): atomically check if a memory location equals an expected value, and if so, replace it with a new value. If another thread modified it, CAS fails. The thread retries.
 
-## Chapter 7: Fragmentation and the Recycling Problem
+The allocator maintains a `current_partial` pointer (the active slab for fast-path allocations). Allocation:
+1. Load `current_partial` atomically.
+2. Find a free bit in the slab's bitmap and attempt to set it with CAS.
+3. If CAS succeeds, return the slot pointer.
+4. If CAS fails (another thread took the slot), retry.
+5. If the slab is full (no free bits), fall back to the slow path (acquire mutex, select a new slab).
 
-The slab model solves spatial fragmentation by eliminating search. But it does not inherently solve temporal fragmentation. If a slab contains one long-lived object and 31 short-lived objects, the slab remains pinned after the short-lived objects are freed. The allocator cannot reclaim the page because it contains live data.
+This achieves sub-100ns allocation latency in the common case with no lock contention.
 
-Traditional slab allocators tolerate this. The assumption is that most slabs will either stay full or become empty relatively quickly. Partially empty slabs are expected to refill from new allocations. Over time, the working set stabilizes, and the allocator reaches equilibrium. This works well in steady-state systems like kernel allocators, where object lifetimes are predictable and churn is moderate.
+## Bounded RSS Through Conservative Recycling
 
-In high-churn systems, this assumption breaks down. A cache system might allocate millions of entries, evict them in batches, and allocate new entries. A session store might create thousands of sessions per second and expire them hours later. In these workloads, slabs do not stabilize—they churn continuously. Partially empty slabs accumulate, RSS grows, and the system runs out of memory despite low utilization.
+RSS grows unboundedly if slabs accumulate indefinitely. The allocator must recycle empty slabs—reuse them for new allocations or destroy them to return memory to the OS.
 
-### The FULL-Only Recycling Invariant
-
-temporal-slab addresses this with a conservative recycling policy: only slabs on the full list are eligible for recycling. A slab reaches the full list when every slot is allocated. Once full, the slab is never published to `current_partial` again—it is set aside. When objects in a full slab are freed, the slab transitions back to partial. If all objects in a full slab are freed, the slab becomes empty and is pushed to the slab cache or overflow list.
-
-This policy has a critical property: only slabs that were once full are recycled. Slabs that were on the partial list when they became empty are not recycled. They remain on the partial list, available for immediate reuse.
-
-Why does this matter? Because it eliminates a race condition. Consider the following scenario:
+The naive approach is to recycle any empty slab immediately. The problem is a race condition:
 
 1. Thread A loads `current_partial`, obtaining a pointer to slab S.
 2. Thread B frees the last object in slab S, making it empty.
-3. The allocator recycles slab S, pushing it to the cache.
-4. Thread C pops slab S from the cache and fills it with new objects.
-5. Thread A attempts to allocate from slab S, unaware that it has been recycled.
+3. The allocator recycles S, pushing it to the cache or destroying it.
+4. Thread C pops S from the cache and fills it with new objects.
+5. Thread A attempts to allocate from S, unaware it was recycled.
 
-Thread A holds a stale pointer to a slab that has been repurposed. If the bitmap positions line up, Thread A might overwrite Thread C's data. This is a use-after-free race, and it is catastrophic.
+Thread A holds a stale pointer to a slab that has been repurposed. This is a use-after-free race—catastrophic.
 
-The FULL-only invariant prevents this. If a slab is on the partial list, it is published to `current_partial`, and threads may hold pointers to it. Such slabs are never recycled, even if they become empty. They remain on the partial list indefinitely. Only slabs on the full list—slabs that are not published to `current_partial`—are eligible for recycling. Since no thread holds pointers to full slabs, recycling them is safe.
+The solution is conservative recycling: only recycle slabs that are not published to `current_partial`. Slabs on the partial list may be held by threads in the lock-free fast path. Such slabs are never recycled, even if they become empty. They remain on the partial list indefinitely.
 
-This policy sacrifices some memory efficiency. A partially empty slab on the partial list will not be recycled even if it is 90% empty. But it guarantees correctness without requiring hazard pointers, reference counting, or other complex synchronization mechanisms. The trade-off is deliberate: predictable behavior over aggressive reclamation.
+Only slabs on the full list (slabs never published to `current_partial`) are eligible for recycling. Since no thread holds pointers to full slabs, recycling them is safe.
 
-## Chapter 8: Bounded RSS and Cache Pressure
+This sacrifices some memory efficiency—a 90% empty slab on the partial list will not be recycled. But it guarantees correctness without complex synchronization (no hazard pointers, no reference counting). The trade-off: predictable behavior over aggressive reclamation.
 
-A key property of temporal-slab is bounded RSS. RSS (resident set size) is the amount of physical memory a process occupies at any given moment. When a program requests memory from the operating system, the OS grants virtual memory—address space that the program can reference. But virtual memory is not physical memory. The OS only allocates physical pages when the program actually touches the memory, triggering a page fault. Once a page is faulted in, it remains in physical memory (resident) until the OS decides to evict it or the program unmaps it.
+## Slab Cache
 
-RSS measures how many pages are currently resident in physical RAM. This is distinct from virtual memory size, which includes unmapped pages, and distinct from the program's working set, which is the set of pages the program actively uses. A program might have gigabytes of virtual memory but only megabytes of RSS. RSS is what matters for system performance—it determines memory pressure, swap behavior, and whether the system runs out of physical memory.
+When a slab becomes empty, it is not immediately destroyed. Instead, it is pushed to a per-size-class cache. The cache has fixed capacity (e.g., 32 slabs). When a new slab is needed, the allocator checks the cache first. If non-empty, pop a slab from the cache (fast, no syscall). If empty, allocate a new slab via mmap (slow, syscall).
 
-In traditional allocators, RSS can grow unboundedly under churn, even if the working set remains constant. Temporal fragmentation causes pages to accumulate live and dead objects. Pages cannot be released because they contain at least one live object. Over time, RSS grows to reflect the high-water mark of allocations, not the current working set. A program that briefly allocated 10GB but now uses only 1GB may still have 10GB RSS because the allocator cannot return pages to the OS without compaction.
+The cache absorbs transient fluctuations in allocation rate. A workload that allocates 1 million objects, frees them, allocates 1 million more can reuse slabs from the cache without mmap/munmap churn.
 
-temporal-slab bounds RSS through three mechanisms: slab caching, overflow tracking, and refusal to unmap.
+If the cache is full and another slab becomes empty, it is pushed to an overflow list. The overflow list has unbounded capacity. Slabs on the overflow list remain mapped—they are not unmapped (no munmap).
 
-### Slab Caching
+## Refusal to Unmap
 
-When a slab becomes empty, it is not immediately destroyed. Instead, it is pushed to a per-size-class cache. The cache has a fixed capacity (e.g., 32 slabs per size class). If the cache is full and another slab becomes empty, the new slab is pushed to an overflow list instead. The overflow list has unbounded capacity but is intended to remain small.
+temporal-slab never unmaps slabs during runtime. When a slab becomes empty, it is pushed to the cache or overflow list but remains mapped. Unmapping only occurs during allocator destruction.
 
-When a new slab is needed, the allocator first checks the cache. If the cache is non-empty, it pops a slab from the cache and reuses it. This avoids system calls (mmap) and page faults, reducing allocation latency. The cache acts as a buffer, absorbing transient fluctuations in allocation rate.
+This design choice has two benefits:
 
-The cache capacity determines the minimum RSS. If each size class caches 32 slabs, and each slab is 4KB, the minimum RSS is 32 × 4KB × (number of size classes). For 8 size classes, this is 1MB. This is the baseline memory cost, independent of workload.
+1. **Safe handle validation.** temporal-slab uses opaque handles encoding a slab pointer, slot index, and size class. When freeing a handle, the allocator checks the slab's magic number and slot state. If the handle is invalid (double-free, wrong allocator, corrupted), the check fails and returns an error. But this only works if the slab remains mapped. If unmapped, dereferencing the handle triggers a segmentation fault.
 
-### Overflow Tracking
+2. **Bounded RSS.** RSS is bounded by the high-water mark of allocations. If a workload briefly allocates 10GB then stabilizes at 1GB, RSS is 10GB. This is deliberate: RSS reflects the maximum working set observed, not the current working set. Unmapping slabs would reduce RSS but at the cost of mmap/munmap churn and the inability to validate handles.
 
-If the cache is full and another slab becomes empty, the slab is pushed to the overflow list. The overflow list is a linked list of empty slabs. Unlike the cache, the overflow list has no capacity limit. Slabs on the overflow list remain mapped—they are not returned to the operating system.
+## O(1) Deterministic Class Selection
 
-This design choice is deliberate. Unmapping pages (munmap) is expensive—it requires a system call, TLB invalidation, and page table updates. More importantly, unmapping pages breaks the allocator's ability to validate stale handles. temporal-slab uses opaque handles that encode a slab pointer, slot index, and size class. If a handle is freed twice (double-free), or freed with the wrong allocator, the allocator can detect this by checking the slab's magic number and slot state. But this check only works if the slab remains mapped. If the slab is unmapped, dereferencing the handle triggers a segmentation fault.
+To allocate an object, the allocator must map the requested size to a size class. The naive approach is a linear scan: iterate over size classes and return the first that fits. For 8 size classes, this is up to 8 comparisons—8 conditional branches.
 
-By refusing to unmap, temporal-slab guarantees that invalid handles never cause crashes. They return an error code instead. This property is essential for debugging and fault tolerance in production systems.
+Branch mispredictions are expensive (10-20 cycles on modern CPUs). If the requested size varies unpredictably, every allocation incurs 8 mispredicted branches (~100 cycles, ~30ns). This is not large in absolute terms, but it is unpredictable—a source of jitter.
 
-The cost is that RSS includes all slabs that have ever been allocated. If the workload experiences a transient spike—allocating millions of objects and then freeing them—RSS will reflect the peak, not the steady-state. This is a conscious trade-off: predictable RSS growth over aggressive reclamation.
-
-### Why RSS Growth is Bounded
-
-Under sustained churn, RSS grows until the overflow list stabilizes. At that point, slabs are recycled from the overflow list instead of being newly allocated. The allocator reaches equilibrium: the number of slabs allocated equals the number recycled. RSS plateaus.
-
-The key insight is that RSS is bounded by the maximum working set, not by the total number of allocations. If a workload allocates 10 million objects over its lifetime but never has more than 1 million live at once, RSS is determined by the 1 million live objects, not the 10 million total. Temporal fragmentation is eliminated because slabs are recycled as a unit when they become empty.
-
-## Chapter 9: Internal Fragmentation and Size Classes
-
-Slab allocators trade external fragmentation (holes between allocations) for internal fragmentation (wasted space within allocations). A program that needs 72 bytes must allocate from a size class that provides at least 72 bytes. If the smallest size class that fits is 96 bytes, 24 bytes are wasted. This is internal fragmentation.
-
-The question is: how should size classes be chosen?
-
-### The Granularity Trade-Off
-
-If size classes are too coarse, internal fragmentation is high. A system with size classes {64, 256, 1024} wastes up to 75% of each allocation (e.g., a 65-byte allocation uses a 256-byte slot). If size classes are too fine, the allocator requires many slabs, increasing metadata overhead and reducing cache hit rates.
-
-temporal-slab uses 8 size classes: 64, 96, 128, 192, 256, 384, 512, and 768 bytes. These are not chosen arbitrarily. The progression is approximately exponential with ratio 1.5x, but adjusted to align with common object sizes. The 96-byte class covers objects in the 65-96 range, which are common in network protocols (e.g., TCP headers, small JSON payloads). The 192-byte class covers structures in the 129-192 range, common in cache metadata. The 384-byte class covers mid-size buffers.
-
-This distribution achieves 88.9% average space efficiency across a realistic workload. For comparison, a system with 4 size classes {64, 128, 256, 512} achieves ~75% efficiency. The additional granularity reduces waste by 13.9 percentage points.
-
-### Objects Per Slab and Cache Alignment
-
-Each slab is a single 4KB page. The number of objects per slab depends on object size. A 64-byte size class yields 63 objects per slab (after accounting for the slab header and bitmap). A 768-byte size class yields 5 objects per slab. Fewer objects per slab means more slabs are required for the same number of allocations, increasing overhead.
-
-This is an unavoidable trade-off. Large size classes are necessary to support large objects, but they reduce slab utilization. The choice of 768 bytes as the maximum size is deliberate. It provides reasonable coverage for mid-size objects while avoiding pathological cases where only one or two objects fit per slab.
-
-## Chapter 10: Deterministic Performance and O(1) Class Selection
-
-In high-frequency trading (HFT) and real-time systems, predictability is more important than average-case performance. An allocator with 50ns average latency and 1ms tail latency is useless if the tail latency occurs unpredictably. The system cannot tolerate jitter.
-
-Traditional allocators have multiple sources of jitter. Lock contention causes threads to block. Search algorithms have variable cost depending on free list state. Compaction causes latency spikes when the system decides to reorganize memory. These are not bugs—they are inherent to the design.
-
-temporal-slab eliminates jitter through deterministic operations. Allocation is lock-free in the fast path, so there is no blocking. Bitmap operations are constant time, so there is no search cost. No compaction occurs, so there are no background pauses. The remaining source of variability is class selection: mapping a requested size to a size class.
-
-### The Linear Scan Problem
-
-The naive approach is to iterate over the size class array and return the first class that fits. For 8 size classes, this requires up to 8 comparisons. Each comparison is a conditional branch, and branch mispredictions are expensive on modern CPUs. If the requested size varies unpredictably, branch prediction fails, and each allocation incurs 8 mispredicted branches. On a modern CPU, this costs ~100 cycles, or ~30ns.
-
-This is not a large cost in absolute terms, but it is unpredictable. If the workload always requests the same size, the branch predictor learns the pattern, and the cost drops to a few cycles. If the workload requests varying sizes, the cost remains high. This variability is jitter.
-
-### O(1) Lookup Table
-
-temporal-slab replaces the linear scan with a precomputed lookup table. At initialization, the allocator builds a 768-entry array mapping each possible size (1-768 bytes) to the corresponding size class index. Allocation performs a single array lookup:
+The solution is a precomputed lookup table. At initialization, build a 768-entry array mapping each possible size (1-768 bytes) to the corresponding size class index. Allocation performs a single array lookup:
 
 ```c
 uint8_t class_idx = k_class_lookup[size];
 ```
 
-This is O(1) with zero branches. The cost is constant regardless of size or workload pattern. The lookup table occupies 768 bytes, which fits in L1 cache. The first access faults the cache line; subsequent accesses are cache hits.
+This is O(1) with zero branches. The cost is constant regardless of size or workload pattern. The lookup table occupies 768 bytes (fits in L1 cache). The benefit is deterministic latency—no jitter from class selection.
 
-This design eliminates class selection as a source of jitter. The cost is 768 bytes of memory per process—negligible—and the table is initialized once at startup. The benefit is deterministic latency: every allocation pays the same cost for class selection.
+## Handle-Based API vs Malloc-Style API
 
-## Chapter 11: Handles and Validation
+temporal-slab provides two APIs:
 
-temporal-slab provides two APIs: a handle-based API and a malloc-style API. The handle-based API is lower-level and more explicit. The malloc-style API is a convenience wrapper.
+**Handle-based:** `alloc_obj(alloc, size, &handle)` returns a pointer and an opaque handle. `free_obj(alloc, handle)` frees by handle. The handle encodes the slab pointer, slot index, and size class. No per-allocation metadata is stored (zero overhead). The application must track handles alongside pointers.
 
-A handle is a 64-bit opaque value encoding three pieces of information: the slab pointer (48 bits), the slot index within the slab (8 bits), and the size class (8 bits). This encoding allows the allocator to validate handles at free time without dereferencing arbitrary pointers.
+**Malloc-style:** `slab_malloc(alloc, size)` returns a pointer. The handle is stored in an 8-byte header before the pointer. `slab_free(alloc, ptr)` reads the header, extracts the handle, and calls `free_obj` internally. This trades 8 bytes overhead per allocation for API compatibility.
 
-### Why Handles?
+The handle-based API is suitable for performance-critical code where zero overhead is required and explicit handle management is acceptable. The malloc-style API is suitable for drop-in replacement where 8 bytes overhead is tolerable.
 
-In a traditional malloc/free API, free takes a pointer returned by malloc. The allocator must determine which allocation the pointer belongs to, typically by storing metadata in a header before the allocation. This has two costs. First, the header consumes 8-16 bytes per allocation, increasing overhead. Second, dereferencing an invalid pointer (e.g., a dangling pointer, a double-free, or a pointer from another allocator) triggers a segmentation fault. The program crashes.
+## What You Should Understand Now
 
-Handles avoid both costs. The handle encodes all information necessary to locate the allocation, so no per-allocation metadata is required (zero overhead). Validating a handle checks the slab's magic number and the slot's state. If the handle is invalid, the allocator returns an error instead of crashing. This makes the system fault-tolerant.
+At this point, you understand the foundational concepts:
 
-### The Malloc Wrapper
+Memory allocation bridges the gap between OS-provided pages and application-needed objects. Allocators face two fragmentation problems: spatial (free space scattered into unusable holes) and temporal (pages pinned by mixtures of live and dead objects). Temporal fragmentation is entropy—inevitable without organizing allocations by lifetime.
 
-The malloc-style API stores the handle in an 8-byte header before the returned pointer. When slab_free is called, the allocator reads the header, extracts the handle, and calls free_obj internally. This trades 8 bytes of overhead per allocation for a familiar API.
+Slab allocation solves this by dividing pages into fixed-size slots (size classes) and filling slabs sequentially. Objects allocated around the same time end up in the same slab. If they have correlated lifetimes (allocation-order affinity), they die together, and the slab can be recycled as a unit. This manages entropy by grouping objects to expire in an organized way.
 
-The malloc wrapper is suitable for drop-in replacement scenarios where code expects malloc/free semantics. The handle-based API is suitable for performance-critical code where zero overhead is required.
+temporal-slab extends this with lock-free fast-path allocation (sub-100ns latency), conservative recycling (only full slabs are recycled, eliminating use-after-free races), refusal to unmap (enabling safe handle validation and bounded RSS), and O(1) class selection (eliminating jitter).
 
-## Chapter 12: Why temporal-slab Exists
+The allocator does not predict lifetimes or require application hints. Lifetime alignment emerges naturally from allocation patterns. This is substrate, not policy—a foundation for higher-level systems to build on.
 
-temporal-slab is inspired by Zoned Namespace (ZNS) SSDs, a storage technology that exposes zones—contiguous regions of storage—that must be written sequentially. ZNS SSDs eliminate random writes, reducing write amplification and improving endurance. The key insight is that sequential writes align with data lifetimes. Data written together is likely to be deleted together. By writing data sequentially by zone, the SSD naturally groups data with similar lifetimes, enabling efficient reclamation.
-
-temporal-slab applies the same principle to memory. Instead of treating memory as a random-access space where allocations can occur anywhere, it organizes memory into slabs—sequential allocation units. Objects allocated in the same slab are temporally related. When their lifetimes end, the slab is reclaimed as a unit. This is sequential allocation applied to DRAM.
-
-The name "temporal-slab" reflects this connection. Like ZNS SSDs, the allocator is ZNS-inspired rather than ZNS-dependent. It does not require ZNS hardware. The lifetime-aware placement strategy is the organizing principle, applicable to any memory hierarchy.
-
-### The Missing Middle
-
-Existing ZNS systems operate at file or extent granularity—megabytes to gigabytes. At small object sizes (64-256 bytes), metadata costs dominate, and zone-based placement becomes impractical. temporal-slab fills the gap by bringing lifetime-aware placement to the allocator layer, where object-scale decisions are cheap and precise.
-
-This makes temporal-slab a substrate—a foundation on which higher-level systems can be built. A cache system can use temporal-slab for metadata allocation, gaining bounded RSS and predictable latency without implementing its own allocator. A tiered storage system can use slabs as the unit of promotion between DRAM, persistent memory, and NVMe, leveraging the fact that slabs naturally separate hot and cold data.
-
-temporal-slab is not a complete system. It is the kernel of a system. The allocator provides mechanism, not policy. Higher layers decide what to cache, when to evict, and how to tier. The allocator ensures that those decisions are implemented efficiently and correctly.
-
-## Chapter 13: What You Should Understand Now
-
-At this point, you should understand the following:
-
-Memory allocators bridge the gap between what operating systems provide (pages) and what programs need (arbitrary-sized objects). Traditional allocators optimize for spatial efficiency, filling holes in fragmented memory. This leads to temporal fragmentation, where pages contain a mix of live and dead objects and cannot be reclaimed. Temporal fragmentation is entropy—a natural consequence of uncorrelated allocation and free patterns.
-
-Slab allocators address this by grouping allocations by size and time. A slab is a page subdivided into fixed-size slots. Allocation proceeds sequentially within a slab, grouping objects allocated around the same time. If those objects have correlated lifetimes—as is common in many workloads—they die together, and the slab can be recycled as a unit.
-
-temporal-slab extends the slab model with three key properties. First, it uses a lock-free fast path based on atomic operations, achieving sub-100ns allocation latency. Second, it uses a FULL-only recycling policy, ensuring that only slabs not currently in use are recycled, eliminating use-after-free races. Third, it refuses to unmap slabs during runtime, bounding RSS and enabling safe handle validation.
-
-These properties make temporal-slab suitable for high-frequency, latency-sensitive workloads where predictability is paramount. The allocator does not guess object lifetimes or require application hints. Lifetime alignment emerges naturally from allocation order. This is substrate, not policy.
-
-The next step is to understand the implementation: how bitmaps encode slot state, how atomic CAS loops allocate slots, how list membership is tracked for O(1) moves, and how performance counters attribute tail latency. Those details are in the source code. This document provides the foundation to understand why those details exist.
+The implementation details—how bitmaps encode slot state, how atomic CAS loops allocate slots, how list membership is tracked—follow from these foundational concepts. Those details are in the source code. This document provides the foundation to understand why they exist.
