@@ -21,6 +21,12 @@
 /* Epoch configuration */
 #define EPOCH_COUNT 16u  /* Ring buffer size (power of 2 for fast modulo) */
 
+/* Epoch lifecycle state */
+typedef enum EpochLifecycleState {
+  EPOCH_ACTIVE  = 0,  /* Accepting new allocations */
+  EPOCH_CLOSING = 1,  /* No new allocations, draining only */
+} EpochLifecycleState;
+
 /* Slab list membership (partial/full lists, protected by sc->lock) */
 typedef enum SlabListId {
   SLAB_LIST_PARTIAL = 0,
@@ -123,6 +129,9 @@ struct SlabAllocator {
   /* Global epoch state */
   _Atomic uint32_t current_epoch;  /* Active epoch for new allocations */
   uint32_t epoch_count;            /* Number of epochs (EPOCH_COUNT) */
+  
+  /* Per-epoch lifecycle state (ACTIVE=0 or CLOSING=1) */
+  _Atomic uint32_t epoch_state[EPOCH_COUNT];
 };
 
 #endif /* SLAB_ALLOC_INTERNAL_H */
