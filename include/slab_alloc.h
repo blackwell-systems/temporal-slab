@@ -25,12 +25,17 @@
 /* Opaque allocator - definition in slab_alloc_internal.h */
 typedef struct SlabAllocator SlabAllocator;
 
-/* Handle for allocated objects */
-typedef struct SlabHandle {
-  void* slab;           /* PRIVATE */
-  uint32_t slot;        /* PRIVATE */
-  uint32_t size_class;  /* PRIVATE */
-} SlabHandle;
+/* Opaque handle for allocated objects
+ * 
+ * Handle encoding (64-bit):
+ *   [63:16] Slab pointer (48 bits, user-space addresses)
+ *   [15:8]  Slot index (8 bits, max 255 objects/slab)
+ *   [7:0]   Size class (8 bits, currently 0-3)
+ * 
+ * Zero handle is invalid (NULL sentinel).
+ * Handles remain valid for validation even after free (slabs stay mapped).
+ */
+typedef uint64_t SlabHandle;
 
 /* Performance counters snapshot (read-only) */
 typedef struct PerfCounters {
