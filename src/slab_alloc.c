@@ -295,27 +295,27 @@ static Slab* cache_pop(SizeClassAlloc* sc) {
 /* Phase 2: Push empty slab to cache (or overflow if cache full) */
 static void cache_push(SizeClassAlloc* sc, Slab* s) {
   pthread_mutex_lock(&sc->cache_lock);
+  
+  s->list_id = SLAB_LIST_NONE;  /* Not on partial/full list anymore */
+  
   if (sc->cache_size < sc->cache_capacity) {
     sc->slab_cache[sc->cache_size++] = s;
+    s->cache_state = SLAB_CACHED;
     atomic_fetch_add_explicit(&sc->empty_slab_recycled, 1, memory_order_relaxed);
-    s = NULL;
-  }
-  
-  /* CONSERVATIVE SAFETY: Never munmap() during runtime.
-   * Reason: SlabHandle stores raw Slab* pointers that callers may hold
-   * indefinitely (stale handles, double-free attempts). If we munmap,
-   * free_obj() will segfault when checking magic.
-   * 
-   * When cache is full, push to overflow list instead of dropping.
-   * This keeps slabs mapped and tracked, preventing leaks while
-   * maintaining safe stale-handle validation.
-   * 
-   * RSS is bounded by (partial + full + cache + overflow) = working set.
-   * Only munmap() during allocator_destroy(). */
-  if (s) {
-    /* Cache full - push to overflow list */
+  } else {
+    /* CONSERVATIVE SAFETY: Never munmap() during runtime.
+     * Reason: SlabHandle stores raw Slab* pointers that callers may hold
+     * indefinitely (stale handles, double-free attempts). If we munmap,
+     * free_obj() will segfault when checking magic.
+     * 
+     * When cache is full, push to overflow list instead of dropping.
+     * This keeps slabs mapped and tracked, preventing leaks while
+     * maintaining safe stale-handle validation.
+     * 
+     * RSS is bounded by (partial + full + cache + overflow) = working set.
+     * Only munmap() during allocator_destroy(). */
     list_push_back(&sc->cache_overflow, s);
-    s->list_id = SLAB_LIST_NONE;  /* Mark as cached */
+    s->cache_state = SLAB_OVERFLOWED;
     atomic_fetch_add_explicit(&sc->empty_slab_cache_overflowed, 1, memory_order_relaxed);
   }
   
@@ -342,6 +342,7 @@ static Slab* new_slab(SizeClassAlloc* sc) {
     s->prev = NULL;
     s->next = NULL;
     s->list_id = SLAB_LIST_NONE;
+    s->cache_state = SLAB_ACTIVE;  /* Will be added to partial list */
     atomic_store_explicit(&s->free_count, s->object_count, memory_order_relaxed);
     
     /* Clear bitmap */
@@ -376,6 +377,7 @@ static Slab* new_slab(SizeClassAlloc* sc) {
   s->object_count = count;
   atomic_store_explicit(&s->free_count, count, memory_order_relaxed);
   s->list_id = SLAB_LIST_NONE;
+  s->cache_state = SLAB_ACTIVE;  /* Will be added to partial list */
 
   _Atomic uint32_t* bm = slab_bitmap_ptr(s);
   uint32_t words = slab_bitmap_words(count);
