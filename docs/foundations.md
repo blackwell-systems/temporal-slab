@@ -9,6 +9,9 @@ This document builds the theoretical foundation for temporal-slab from first pri
 - [Virtual Memory vs Physical Memory](#virtual-memory-vs-physical-memory)
 - [Overcommitment](#overcommitment)
 - [Page Fault](#page-fault)
+- [Translation Lookaside Buffer (TLB)](#translation-lookaside-buffer-tlb)
+- [Cache Line and Cache Locality](#cache-line-and-cache-locality)
+- [System Call (syscall)](#system-call-syscall)
 - [Resident Set Size (RSS)](#resident-set-size-rss)
 - [Anonymous Memory vs File-Backed Memory](#anonymous-memory-vs-file-backed-memory)
 - [mmap and munmap](#mmap-and-munmap)
@@ -40,6 +43,7 @@ This document builds the theoretical foundation for temporal-slab from first pri
 - [Compare-and-Swap (CAS)](#compare-and-swap-cas)
 - [Atomic Operations](#atomic-operations)
 - [Bounded RSS Through Conservative Recycling](#bounded-rss-through-conservative-recycling)
+- [Hazard Pointers and Reference Counting](#hazard-pointers-and-reference-counting)
 - [Slab Cache](#slab-cache)
 - [Refusal to Unmap](#refusal-to-unmap)
 - [O(1) Deterministic Class Selection](#o1-deterministic-class-selection)
@@ -67,7 +71,67 @@ Overcommitment is the operating system's ability to grant more virtual memory th
 
 Consider a system with 8GB of physical RAM. Three processes each request 4GB of virtual memory. The OS grants all three requests, allocating 12GB of virtual memory—50% more than physical RAM. This is overcommitment. The system has promised 12GB but only has 8GB to deliver.
 
-How can this work? Most programs allocate more memory than they actually use. A program might request a 1GB buffer but only write to the first 100MB. Or it might fork child processes that inherit the parent's address space but only modify a small portion (copy-on-write optimizes this further). Overcommitment exploits this gap between allocated and used memory.
+How can this work? Most programs allocate more memory than they actually use. A program might request a 1GB buffer but only write to the first 100MB. Or it might fork child processes that inherit the parent's address space but only modify a small portion. Overcommitment exploits this gap between allocated and used memory.
+
+**Copy-on-write (COW) amplifies overcommitment benefits:**
+
+When a process calls fork(), the child process is an exact copy of the parent. Naive implementation would copy all memory:
+
+```
+Parent process: 4GB memory
+fork() → Copy 4GB to child
+Result: 8GB physical RAM needed
+```
+
+But most forked processes modify very little memory before calling exec() to run a different program. Copy-on-write defers the copy:
+
+```
+Parent has 4GB memory mapped to physical frames
+
+fork():
+1. Child gets same page table as parent (same virtual → physical mappings)
+2. All pages marked read-only in both parent and child
+3. No physical memory copied (0 bytes!)
+4. Physical RAM usage: Still 4GB (shared between parent and child)
+
+Child writes to page:
+1. Write triggers page fault (page is read-only)
+2. OS allocates new physical page
+3. OS copies contents from parent's page to child's page
+4. OS updates child's page table to point to new page
+5. OS marks both pages writable
+6. Child's write succeeds
+
+Now: Parent has original page, child has private copy of that page
+Physical RAM: 4GB + 4KB (only 1 page copied)
+```
+
+Copy-on-write means fork() is nearly free—the physical copy happens lazily, one page at a time, only for pages that are actually modified. If the child only modifies 100MB before calling exec(), only 100MB is copied. The remaining 3.9GB is shared between parent and child.
+
+This is overcommitment in action: the OS granted 8GB of virtual memory (4GB parent + 4GB child) but uses only 4.1GB physical RAM (4GB shared + 100MB child-modified).
+
+**Zero-page optimization:**
+
+Copy-on-write also applies to newly allocated anonymous memory:
+
+```
+mmap(1GB, MAP_ANONYMOUS):
+1. OS allocates 1GB virtual address space
+2. All pages map to a single shared zero page (physical page filled with zeros)
+3. All pages marked read-only
+4. Physical RAM used: 4KB (one shared zero page)
+
+Program writes to page 0:
+1. Write triggers page fault (read-only)
+2. OS allocates new physical page, fills with zeros
+3. OS updates page table
+4. Physical RAM used: 4KB + 4KB = 8KB (zero page + 1 allocated page)
+
+Program writes to 10,000 pages:
+Physical RAM used: 4KB + 40MB (zero page + 10,000 pages)
+```
+
+The OS can grant terabytes of virtual anonymous memory with negligible physical cost—every page initially maps to the shared zero page. Only pages that are written consume physical RAM.
 
 **Why overcommitment matters for allocators:**
 
@@ -96,6 +160,436 @@ There are three types of page faults:
 When an allocator mmaps a 1GB region, that memory is virtual—accessing it before touching it will not fault. The first write to each 4KB page triggers a minor fault. If the allocator touches 1 million pages at startup, that's 1 million page faults—potentially seconds of latency. Well-designed allocators either tolerate the lazy faulting cost (spreading it across many allocations) or explicitly pre-fault pages if startup latency is critical.
 
 temporal-slab tolerates minor page faults naturally: each slab is faulted in when first used. Since slabs are allocated on-demand over time, page faults are amortized across the workload. Slab creation cost includes ~1 page fault per slab (~1-2 microseconds), which is acceptable in the slow path.
+
+## Translation Lookaside Buffer (TLB)
+
+The Translation Lookaside Buffer (TLB) is a small, fast cache in the CPU that stores recent virtual-to-physical address translations. It is the hardware mechanism that makes paging practical—without the TLB, address translation would make every memory access 5× slower.
+
+**The problem without TLB:**
+
+Every memory access requires translating a virtual address to a physical address. On x86-64 with four-level paging, this means:
+
+```
+Virtual address access (no TLB):
+1. Access PML4 table in RAM (100 cycles)
+2. Access PDPT table in RAM (100 cycles)
+3. Access PD table in RAM (100 cycles)
+4. Access PT table in RAM (100 cycles)
+5. Access actual data in RAM (100 cycles)
+Total: 500 cycles per memory access
+
+If the program accesses 1000 variables:
+1000 × 500 = 500,000 cycles = ~160 microseconds at 3GHz
+```
+
+This is catastrophic. A simple loop reading an array would spend 80% of its time walking page tables, not accessing data.
+
+**How TLB solves this:**
+
+The TLB caches recent translations. When the CPU needs to translate a virtual address, it checks the TLB first:
+
+```
+TLB hit (common case):
+1. Check TLB for translation (1 cycle) → Found!
+2. Access actual data in RAM (100 cycles)
+Total: 101 cycles per memory access
+
+TLB miss (rare case):
+1. Check TLB for translation (1 cycle) → Not found
+2. Walk page tables in RAM (400 cycles for 4-level walk)
+3. Store translation in TLB
+4. Access actual data in RAM (100 cycles)
+Total: 501 cycles per memory access
+```
+
+**TLB hit rate determines performance:**
+
+If 99% of accesses hit the TLB:
+
+```
+Average memory access time:
+0.99 × 101 cycles (TLB hit) + 0.01 × 501 cycles (TLB miss)
+= 99.99 + 5.01
+= 105 cycles
+
+Overhead: 5 cycles (5% slower than direct physical access)
+Without TLB: 500 cycles (5× slower!)
+```
+
+**TLB structure:**
+
+A typical TLB on modern CPUs:
+- **Size:** 64-512 entries (very small cache)
+- **Coverage:** With 4KB pages, 512 entries cover 2MB of address space
+- **Levels:** L1 TLB (tiny, fast), L2 TLB (larger, slower but still faster than page table walk)
+- **Associativity:** Fully associative (can store any translation anywhere)
+- **Flushed on:** Context switches (switching processes invalidates all translations)
+
+**Why TLB is small:**
+
+TLB must be extremely fast (1-cycle lookup). To achieve this, it's implemented in expensive SRAM on the CPU die. Only 64-512 entries fit. This means the TLB can only cache translations for a small portion of the address space at any time.
+
+**TLB thrashing:**
+
+If a program accesses more unique pages than the TLB can hold, it starts thrashing—constantly evicting translations and reloading them:
+
+```
+Program accesses 1024 unique pages in a loop
+TLB holds 512 entries
+
+First iteration:
+- All 1024 accesses miss TLB (cold TLB)
+- Load 1024 translations, evicting old entries
+- Cost: 1024 × 500 cycles = 512,000 cycles
+
+Second iteration:
+- Still miss! (only last 512 translations cached)
+- Cost: 512,000 cycles again
+
+With TLB thrashing: Every iteration costs 512,000 cycles
+With TLB hits: Every iteration costs 104,000 cycles (5× faster)
+```
+
+**Why TLB matters for allocators:**
+
+Allocators influence TLB behavior through spatial layout:
+
+**Bad:** Objects scattered across many pages
+```
+1000 objects, each on a different page (1000 unique pages)
+Accessing all objects: 1000 TLB misses
+```
+
+**Good:** Objects grouped on few pages
+```
+1000 objects packed into 50 pages (50 unique pages, fits in TLB)
+Accessing all objects: 50 TLB misses (first access), then all hits
+```
+
+temporal-slab improves TLB behavior through temporal grouping: objects allocated together are placed in the same slabs (same pages). If those objects are accessed together (temporal locality → spatial locality), they share TLB entries. A web server processing a request might allocate 10 objects in the same epoch—all 10 end up on the same page, requiring only 1 TLB entry instead of 10.
+
+**TLB and huge pages:**
+
+Modern CPUs support huge pages (2MB or 1GB) which drastically reduce TLB pressure:
+
+```
+Standard 4KB pages:
+512-entry TLB covers 2MB (512 × 4KB)
+100,000 objects @ 4KB per page = 100,000 pages
+TLB hit rate: <1% (catastrophic)
+
+Huge 2MB pages:
+512-entry TLB covers 1GB (512 × 2MB)
+100,000 objects @ 2MB per page = 50 pages
+TLB hit rate: >99% (excellent)
+```
+
+Some allocators use huge pages for metadata-heavy structures. temporal-slab uses standard 4KB pages but achieves good TLB behavior through object grouping.
+
+**The TLB equation:**
+
+```
+Effective memory access time = 
+    TLB_hit_rate × (TLB_lookup + memory_access) +
+    TLB_miss_rate × (TLB_lookup + page_walk + memory_access)
+
+With 99% hit rate:
+= 0.99 × (1 + 100) + 0.01 × (1 + 400 + 100)
+= 99.99 + 5.01
+= 105 cycles (5% overhead)
+
+With 50% hit rate (TLB thrashing):
+= 0.50 × (1 + 100) + 0.50 × (1 + 400 + 100)
+= 50.5 + 250.5
+= 301 cycles (3× slower!)
+```
+
+TLB hit rate is critical to performance. Allocators that scatter objects across many pages destroy TLB efficiency.
+
+## Cache Line and Cache Locality
+
+A cache line is the smallest unit of data transferred between RAM and CPU cache. On modern CPUs, a cache line is 64 bytes. Understanding cache lines is essential to understanding why object placement affects performance beyond just RSS.
+
+**What is a cache line?**
+
+When the CPU reads a single byte from RAM, it doesn't fetch just that byte—it fetches the entire 64-byte cache line containing that byte:
+
+```
+RAM:
+Address 0x1000: [byte 0][byte 1][byte 2]...[byte 63]  ← One cache line (64 bytes)
+Address 0x1040: [byte 64][byte 65]...[byte 127]      ← Next cache line
+
+CPU reads byte at 0x1008:
+→ Fetches entire cache line [0x1000-0x103F] (all 64 bytes)
+→ Stores cache line in L1 cache
+→ Returns byte at 0x1008
+
+Next read of byte at 0x1010:
+→ Already in cache! (same cache line)
+→ 4 cycles (L1 hit) instead of 100 cycles (DRAM)
+```
+
+**Cache hierarchy:**
+
+Modern CPUs have multiple cache levels:
+
+| Cache | Size | Latency | Bandwidth |
+|-------|------|---------|-----------|
+| **L1** | 32-64 KB per core | 4 cycles (~1ns) | ~1 TB/s |
+| **L2** | 256-512 KB per core | 12 cycles (~4ns) | ~500 GB/s |
+| **L3** | 8-32 MB shared | 40 cycles (~14ns) | ~200 GB/s |
+| **DRAM** | 8-64 GB | 100 cycles (~35ns) | ~50 GB/s |
+
+The difference between L1 hit (4 cycles) and DRAM miss (100 cycles) is 25×. Cache locality—keeping frequently accessed data in cache—is critical for performance.
+
+**Spatial locality:**
+
+Spatial locality is the principle that if you access memory address X, you're likely to access nearby addresses soon:
+
+```
+Good spatial locality (array traversal):
+for (int i = 0; i < 1000; i++) {
+    sum += array[i];  // Access sequential addresses
+}
+
+Each cache line holds 16 integers (64 bytes / 4 bytes per int)
+1000 integers = 63 cache lines
+First access to each cache line: Miss (63 misses)
+Remaining accesses: Hit (937 hits)
+Hit rate: 93.7%
+```
+
+```
+Bad spatial locality (random access):
+for (int i = 0; i < 1000; i++) {
+    sum += array[random()];  // Access random addresses
+}
+
+Each access likely hits a different cache line
+1000 accesses = ~1000 cache line loads
+Hit rate: ~0%
+```
+
+**Temporal locality:**
+
+Temporal locality is the principle that if you access memory address X, you're likely to access it again soon:
+
+```
+Good temporal locality:
+for (int iter = 0; iter < 100; iter++) {
+    process(data);  // Repeatedly access same data
+}
+
+data cache line loaded once, hit 99 more times
+Hit rate: 99%
+```
+
+```
+Bad temporal locality:
+for (int i = 0; i < 1000000; i++) {
+    process(&huge_array[i]);  // Touch each element once
+}
+
+huge_array is 1M elements × 4 bytes = 4MB
+L3 cache is 8MB, but working set is 4MB (50% of cache)
+Many cache lines evicted before reuse
+Hit rate: poor
+```
+
+**Why cache locality matters for allocators:**
+
+Allocators determine spatial layout. Objects allocated together can be placed together (good locality) or scattered (bad locality).
+
+**Example: Session store with poor locality**
+
+```
+Traditional allocator (scattered allocation):
+
+Sessions for Request 1:
+- Connection handle at 0x10000 (page 1)
+- Request object at 0x25000 (page 37)
+- Response buffer at 0x48000 (page 72)
+
+Processing Request 1:
+- Access 0x10000 → Cache miss, load page 1
+- Access 0x25000 → Cache miss, load page 37
+- Access 0x48000 → Cache miss, load page 72
+= 3 cache misses per request
+```
+
+**Example: Session store with good locality**
+
+```
+temporal-slab (temporal grouping):
+
+Sessions for Request 1 (all in same epoch):
+- Connection handle at 0x10000 (page 1)
+- Request object at 0x10040 (page 1, same cache line!)
+- Response buffer at 0x10080 (page 1, same cache line!)
+
+Processing Request 1:
+- Access 0x10000 → Cache miss, load page 1 (loads entire cache line)
+- Access 0x10040 → Cache hit (same cache line)
+- Access 0x10080 → Cache hit (same cache line)
+= 1 cache miss per request (3× fewer!)
+```
+
+**Quantifying the benefit:**
+
+```
+Web server: 10,000 requests/second, 3 objects per request
+
+Poor locality:
+30,000 object accesses × 100 cycles (cache miss) = 3,000,000 cycles/request
+At 3GHz: 1ms per request
+
+Good locality:
+10,000 cache misses × 100 cycles + 20,000 cache hits × 4 cycles = 1,080,000 cycles/request
+At 3GHz: 0.36ms per request (2.8× faster!)
+```
+
+**Cache line false sharing:**
+
+When multiple threads write to different variables in the same cache line, cache coherence forces cache line bouncing between cores:
+
+```
+Struct with false sharing:
+struct {
+    int thread1_counter;  // Byte 0-3
+    int thread2_counter;  // Byte 4-7 (SAME CACHE LINE!)
+} shared;
+
+Thread 1: shared.thread1_counter++ (writes cache line, invalidates Thread 2's cache)
+Thread 2: shared.thread2_counter++ (writes cache line, invalidates Thread 1's cache)
+→ Cache line ping-pongs between cores (expensive!)
+```
+
+```
+Fix: Pad to separate cache lines:
+struct {
+    int thread1_counter;
+    char pad1[60];        // Pad to 64 bytes
+    int thread2_counter;
+    char pad2[60];        // Pad to 64 bytes
+};
+
+Thread 1 and Thread 2 now write to different cache lines (no bouncing)
+```
+
+**Why temporal-slab improves cache locality:**
+
+Objects allocated in the same epoch are placed in the same slabs (same pages). If those objects are accessed together (which is likely—they were created for the same request/transaction), they share cache lines:
+
+- **Spatial locality:** Objects are adjacent in memory
+- **Temporal locality:** Objects created together are often accessed together
+- **Result:** Higher cache hit rate, lower memory bandwidth, better performance
+
+This is a second-order effect beyond RSS stability, but it matters: temporal-slab's lifetime grouping improves not just memory usage but also cache behavior.
+
+## System Call (syscall)
+
+A system call (syscall) is a request from a user program to the operating system kernel to perform a privileged operation. System calls are the boundary between userspace (where programs run) and kernel space (where the OS runs). They are expensive—much more expensive than regular function calls.
+
+**What is a syscall?**
+
+Programs run in userspace with restricted privileges. They cannot directly access hardware, modify page tables, or allocate physical memory. To perform these operations, programs must ask the kernel via a syscall:
+
+```c
+// Userspace code
+void* ptr = mmap(NULL, 4096, PROT_READ | PROT_WRITE, 
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+// → Issues mmap syscall
+// → Kernel allocates virtual address space
+// → Kernel returns pointer
+```
+
+**How syscalls work:**
+
+```
+1. Program executes syscall instruction (e.g., SYSCALL on x86-64)
+2. CPU switches from user mode to kernel mode
+3. CPU saves user registers and switches to kernel stack
+4. Kernel syscall handler runs (e.g., sys_mmap)
+5. Kernel performs privileged operation
+6. Kernel prepares return value
+7. CPU switches from kernel mode back to user mode
+8. CPU restores user registers
+9. Program continues with return value
+```
+
+This mode switch is expensive because:
+- **Context save/restore:** ~100 cycles (save/restore 16+ registers)
+- **TLB flush (sometimes):** If switching address spaces, TLB is flushed
+- **Cache pollution:** Kernel code evicts user code from instruction cache
+- **Speculation barriers:** Security mitigations (Spectre/Meltdown) add overhead
+
+**Syscall costs:**
+
+| Operation | Cycles | Time @ 3GHz |
+|-----------|--------|-------------|
+| **Function call** | 5-10 | 2-3 ns |
+| **Simple syscall (getpid)** | 1,000-1,500 | 300-500 ns |
+| **mmap (no fault)** | 2,000-5,000 | 700ns-1.7µs |
+| **munmap** | 2,000-5,000 | 700ns-1.7µs |
+| **mmap (with fault)** | 3,000-10,000 | 1-3 µs |
+
+A syscall is 100-1000× more expensive than a function call!
+
+**Why syscalls matter for allocators:**
+
+Allocators must obtain memory from the OS via mmap (syscall) and can return it via munmap (syscall). Frequent mmap/munmap is catastrophic:
+
+```
+Naive allocator (no caching):
+malloc(128):  mmap(4096) → 3µs
+free(ptr):    munmap(4096) → 3µs
+Total: 6µs per allocation cycle
+
+With 10,000 allocations/second:
+10,000 × 6µs = 60ms = 6% of one CPU core spent in syscalls!
+```
+
+```
+Smart allocator (caching):
+malloc(128):  Pop from cache → 50ns (no syscall)
+free(ptr):    Push to cache → 50ns (no syscall)
+Total: 100ns per allocation cycle
+
+With 10,000 allocations/second:
+10,000 × 100ns = 1ms = 0.1% of CPU core (60× better!)
+```
+
+**How temporal-slab avoids syscalls:**
+
+1. **Slab cache:** Empty slabs are cached (32 per size class). Allocating a new slab hits the cache (no mmap syscall).
+
+2. **Refusal to unmap:** Slabs are never unmapped during runtime. Once mmapped, they remain mapped even when empty. This trades higher RSS floor for zero munmap syscalls.
+
+3. **Batch allocation:** When cache is empty, allocate slabs in small batches (amortize mmap cost).
+
+**Syscall cost in context:**
+
+```
+temporal-slab allocation (fast path):
+- Bitmap lookup: 10 cycles
+- CAS operation: 20 cycles
+- Total: 30 cycles (~10ns)
+
+If we unmapped empty slabs:
+- Allocation might require mmap: 3000 cycles (~1µs)
+- 100× slower!
+```
+
+**Common syscalls in allocators:**
+
+| Syscall | Purpose | Cost | How allocators avoid it |
+|---------|---------|------|------------------------|
+| **mmap** | Obtain memory | 2-5µs | Cache empty slabs, batch allocate |
+| **munmap** | Return memory | 2-5µs | Never unmap (temporal-slab) or cache empty pages |
+| **brk/sbrk** | Grow heap | 1-3µs | Deprecated, use mmap instead |
+| **madvise** | Hint to OS | 1-2µs | Tell OS pages are unused (MADV_DONTNEED) |
+
+Syscalls are the enemy of low-latency allocators. Caching is essential.
 
 ## Resident Set Size (RSS)
 
@@ -909,6 +1403,151 @@ The solution is conservative recycling: only recycle slabs that are not publishe
 Only slabs on the full list (slabs never published to `current_partial`) are eligible for recycling. Since no thread holds pointers to full slabs, recycling them is safe.
 
 This sacrifices some memory efficiency—a 90% empty slab on the partial list will not be recycled. But it guarantees correctness without complex synchronization (no hazard pointers, no reference counting). The trade-off: predictable behavior over aggressive reclamation.
+
+## Hazard Pointers and Reference Counting
+
+Hazard pointers and reference counting are two techniques for safe memory reclamation in lock-free data structures. They solve the same problem: how do you safely free memory when threads might still be accessing it? temporal-slab avoids both techniques through conservative recycling, which is simpler but less aggressive.
+
+**The problem: Safe memory reclamation**
+
+In lock-free code, a thread can load a pointer to an object, then be preempted (paused) for milliseconds. While paused, another thread might free that object and return its memory to the allocator. When the first thread resumes and dereferences its pointer, it accesses freed memory—use-after-free, resulting in crashes or corruption.
+
+```
+Thread A:                          Thread B:
+1. Load ptr to slab S
+2. [PREEMPTED]                    3. Free last object in S
+                                  4. S becomes empty
+                                  5. Recycle S, return to cache
+                                  6. Allocate new slab, reuse S
+                                  7. S now contains different data
+8. Resume, access S
+9. CRASH (S was recycled!)
+```
+
+The challenge: how does Thread B know it's safe to recycle S? Thread A holds a pointer but hasn't published it anywhere—Thread B has no way to detect this.
+
+**Technique 1: Hazard Pointers**
+
+Hazard pointers are a lock-free technique where threads publish pointers they're currently using in a global "hazard list." Before freeing memory, a thread checks if any hazard pointer references it. If so, defer the free.
+
+```c
+// Thread A accessing object
+void access_object(Object* obj) {
+    hazard_ptr[thread_id] = obj;  // Publish: "I'm using this"
+    atomic_thread_fence();         // Ensure published before use
+    
+    // Use object safely (no one can free it)
+    obj->data = 42;
+    
+    hazard_ptr[thread_id] = NULL;  // Unpublish
+}
+
+// Thread B freeing object
+void free_object(Object* obj) {
+    // Check all hazard pointers
+    for (int i = 0; i < num_threads; i++) {
+        if (hazard_ptr[i] == obj) {
+            // Someone is using it! Defer free
+            retire_list_push(obj);
+            return;
+        }
+    }
+    // No one using it, safe to free
+    actual_free(obj);
+}
+```
+
+**Hazard pointer overhead:**
+
+Every access requires:
+1. Publishing pointer to hazard list (atomic store)
+2. Memory fence (ensure visibility)
+3. Unpublishing pointer after use (atomic store)
+
+Every free requires:
+1. Scanning all threads' hazard pointers (N threads = N loads)
+2. If hazardous, push to retire list (deferred free)
+3. Periodically retry retiring objects (scan again)
+
+Cost: ~20-50 cycles per access (atomic stores + fences), O(N) per free (scan N threads). For N=32 threads, every free scans 32 hazard pointers—expensive.
+
+**Technique 2: Reference Counting**
+
+Reference counting tracks how many threads hold pointers to an object. When the count reaches zero, the object is safe to free.
+
+```c
+struct Object {
+    atomic_int refcount;
+    Data data;
+};
+
+// Thread A accesses object
+Object* obj = load_object();
+atomic_fetch_add(&obj->refcount, 1);  // Increment
+
+// Use object
+obj->data = 42;
+
+atomic_fetch_sub(&obj->refcount, 1);  // Decrement
+if (obj->refcount == 0) {
+    free_object(obj);  // Last reference, safe to free
+}
+```
+
+**Reference counting overhead:**
+
+Every access requires:
+1. Atomic increment on load (20-40 cycles)
+2. Atomic decrement on release (20-40 cycles)
+
+Cost: 40-80 cycles per access. For short-lived accesses (allocate → use → free), this overhead doubles the cost.
+
+**Cyclic references:** If objects reference each other (A → B → A), refcount never reaches zero. Requires cycle detection (expensive) or weak references (complex).
+
+**Contention:** If many threads access the same object, they all atomic-increment the same refcount. The cache line containing the refcount bounces between cores (false sharing). This can be worse than mutex contention.
+
+**Why temporal-slab avoids both:**
+
+temporal-slab uses conservative recycling instead:
+
+**Conservative recycling rule:** Only recycle slabs that are **provably unreachable** by any thread in the fast path.
+
+```
+Slabs on PARTIAL list:
+- Published to current_partial
+- Threads may hold pointers
+- NEVER recycled (even if empty)
+
+Slabs on FULL list:
+- Never published to current_partial
+- No thread can hold pointers (no way to obtain them)
+- Safe to recycle immediately when empty
+```
+
+This avoids complexity:
+- **No per-access overhead:** Threads don't publish/unpublish pointers (no hazard pointer cost)
+- **No per-object refcounts:** No atomic increments on every access
+- **No scanning:** No need to check if pointers are live (only FULL slabs are recycled)
+- **No retire lists:** Recycling is immediate for FULL slabs (no deferred free queue)
+
+**The tradeoff:**
+
+Hazard pointers / reference counting enable aggressive recycling:
+- Can recycle any empty slab immediately
+- Lower RSS (no "stranded" empty slabs on PARTIAL list)
+- Cost: 20-80 cycles overhead per access
+
+Conservative recycling enables simple, fast allocation:
+- Zero per-access overhead (no hazard pointer stores, no refcount increments)
+- Slightly higher RSS (empty PARTIAL slabs not recycled)
+- Cost: Some empty slabs remain allocated (but RSS is still bounded)
+
+temporal-slab chooses simplicity and predictability: a 90% empty slab on the PARTIAL list contributes to RSS, but this is acceptable because:
+1. RSS is still bounded (no drift over time)
+2. The slab will be refilled quickly under churn (temporal reuse)
+3. Worst case: RSS = 2× ideal (if every PARTIAL slab is 50% empty)
+
+In practice, under high churn, PARTIAL slabs refill faster than they drain—the 0% recycling observed in benchmarks is expected behavior, not a bug. The epoch mechanism prevents RSS growth by ensuring new cohorts use fresh slabs, not by aggressively recycling old ones.
 
 ## Slab Cache
 
