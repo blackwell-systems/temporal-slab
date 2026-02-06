@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -O3 -std=c11 -pthread -Wall -Wextra -pedantic
+CFLAGS = -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include
 
 all: slab_alloc benchmark_accurate
 

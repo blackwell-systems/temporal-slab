@@ -38,7 +38,7 @@ static const size_t   k_num_classes   = sizeof(k_size_classes) / sizeof(k_size_c
 
 /* ------------------------------ Utilities ------------------------------ */
 
-static inline uint64_t now_ns(void) {
+uint64_t now_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -112,7 +112,7 @@ static inline void* slab_slot_ptr(Slab* s, uint32_t slot_index) {
   return (void*)(slab_data_ptr(s) + ((size_t)slot_index * (size_t)s->object_size));
 }
 
-static inline uint32_t slab_object_count(uint32_t obj_size) {
+uint32_t slab_object_count(uint32_t obj_size) {
   const size_t hdr = slab_header_size();
   size_t available = SLAB_PAGE_SIZE - hdr;
   uint32_t count = (uint32_t)(available / obj_size);
@@ -231,7 +231,7 @@ static bool slab_free_slot_atomic(Slab* s, uint32_t idx, uint32_t* out_prev_fc) 
 
 /* Note: Struct definitions moved to slab_alloc_internal.h */
 
-static void allocator_init(SlabAllocator* a) {
+void allocator_init(SlabAllocator* a) {
   memset(a, 0, sizeof(*a));
   for (size_t i = 0; i < k_num_classes; i++) {
     a->classes[i].object_size = k_size_classes[i];
@@ -246,7 +246,8 @@ static void allocator_init(SlabAllocator* a) {
     atomic_store_explicit(&a->classes[i].new_slab_count, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].list_move_partial_to_full, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].list_move_full_to_partial, 0, memory_order_relaxed);
-    atomic_store_explicit(&a->classes[i].current_partial_miss, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].current_partial_null, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].current_partial_full, 0, memory_order_relaxed);
 
     /* Initialize slab cache (32 pages per size class = 128KB) */
     a->classes[i].cache_capacity = 32;
@@ -269,7 +270,7 @@ static Slab* cache_pop(SizeClassAlloc* sc) {
 }
 
 /* Note: cache_push will be used in Phase 2 when implementing slab recycling on empty */
-static void cache_push(SizeClassAlloc* sc, Slab* s) {
+static void __attribute__((unused)) cache_push(SizeClassAlloc* sc, Slab* s) {
   pthread_mutex_lock(&sc->cache_lock);
   if (sc->cache_size < sc->cache_capacity) {
     sc->slab_cache[sc->cache_size++] = s;
@@ -283,11 +284,6 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
   }
 }
 
-/* Suppress unused warning - used in Phase 2 for empty slab recycling */
-static inline void __attribute__((unused)) suppress_cache_push_warning(void) {
-  cache_push(NULL, NULL);
-}
-
 /* ------------------------------ Slab allocation ------------------------------ */
 
 static Slab* new_slab(SizeClassAlloc* sc) {
@@ -296,6 +292,13 @@ static Slab* new_slab(SizeClassAlloc* sc) {
   /* Try to pop from cache first */
   Slab* s = cache_pop(sc);
   if (s) {
+    /* Phase 1.6: Validate cached slab metadata (catches corruption early) */
+    assert(s->magic == SLAB_MAGIC && "cached slab has invalid magic");
+    assert(s->object_size == obj_size && "cached slab has wrong object_size");
+    
+    uint32_t expected_count = slab_object_count(obj_size);
+    assert(s->object_count == expected_count && "cached slab has wrong object_count");
+    
     /* Reinitialize the cached slab */
     s->prev = NULL;
     s->next = NULL;
@@ -345,11 +348,7 @@ static Slab* new_slab(SizeClassAlloc* sc) {
   return s;
 }
 
-typedef struct SlabHandle {
-  Slab* slab;
-  uint32_t slot;
-  uint32_t size_class;
-} SlabHandle;
+/* Note: SlabHandle now defined in public header (include/slab_alloc.h) */
 
 /*
   Phase 1.5 Allocation Strategy:
@@ -359,7 +358,7 @@ typedef struct SlabHandle {
        - On failure: CAS current_partial to NULL (best-effort), go to slow path
     3) Slow path: lock, pick/create slab, store_release to current_partial
 */
-static void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
+void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
   int ci = class_index_for_size(size);
   if (ci < 0) return NULL;
 
@@ -400,11 +399,14 @@ static void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
     }
     
     /* Allocation failed (slab was full) - null current_partial and go slow */
-    atomic_fetch_add_explicit(&sc->current_partial_miss, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&sc->current_partial_full, 1, memory_order_relaxed);
     Slab* expected = cur;
     atomic_compare_exchange_strong_explicit(
       &sc->current_partial, &expected, NULL,
       memory_order_release, memory_order_relaxed);
+  } else if (!cur) {
+    /* current_partial was NULL - count this miss */
+    atomic_fetch_add_explicit(&sc->current_partial_null, 1, memory_order_relaxed);
   }
 
   /* Slow path: need mutex to pick/create slab (use loop, not recursion) */
@@ -469,7 +471,7 @@ static void* alloc_obj(SlabAllocator* a, uint32_t size, SlabHandle* out) {
     - CAS-clear bitmap bit (returns previous free_count)
     - If we caused 0->1 transition, move FULL->PARTIAL
 */
-static bool free_obj(SlabAllocator* a, SlabHandle h) {
+bool free_obj(SlabAllocator* a, SlabHandle h) {
   if (!h.slab) return false;
   if (h.size_class >= (uint32_t)k_num_classes) return false;
 
@@ -502,7 +504,7 @@ static bool free_obj(SlabAllocator* a, SlabHandle h) {
   return true;
 }
 
-static void allocator_destroy(SlabAllocator* a) {
+void allocator_destroy(SlabAllocator* a) {
   for (size_t i = 0; i < k_num_classes; i++) {
     SizeClassAlloc* sc = &a->classes[i];
 
@@ -545,7 +547,7 @@ static void allocator_destroy(SlabAllocator* a) {
 
 /* ------------------------------ Performance counters ------------------------------ */
 
-static void get_perf_counters(SlabAllocator* a, uint32_t size_class, PerfCounters* out) {
+void get_perf_counters(SlabAllocator* a, uint32_t size_class, PerfCounters* out) {
   if (size_class >= 4 || !out) return;
   
   SizeClassAlloc* sc = &a->classes[size_class];
@@ -553,12 +555,13 @@ static void get_perf_counters(SlabAllocator* a, uint32_t size_class, PerfCounter
   out->new_slab_count = atomic_load_explicit(&sc->new_slab_count, memory_order_relaxed);
   out->list_move_partial_to_full = atomic_load_explicit(&sc->list_move_partial_to_full, memory_order_relaxed);
   out->list_move_full_to_partial = atomic_load_explicit(&sc->list_move_full_to_partial, memory_order_relaxed);
-  out->current_partial_miss = atomic_load_explicit(&sc->current_partial_miss, memory_order_relaxed);
+  out->current_partial_null = atomic_load_explicit(&sc->current_partial_null, memory_order_relaxed);
+  out->current_partial_full = atomic_load_explicit(&sc->current_partial_full, memory_order_relaxed);
 }
 
 /* ------------------------------ RSS (Linux) ------------------------------ */
 
-static uint64_t read_rss_bytes_linux(void) {
+uint64_t read_rss_bytes_linux(void) {
 #if defined(__linux__)
   FILE* f = fopen("/proc/self/statm", "r");
   if (!f) return 0;

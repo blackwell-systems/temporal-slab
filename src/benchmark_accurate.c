@@ -24,7 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "slab_alloc.h"
+#include "slab_alloc_internal.h"
 
 /* ------------------------------ Utilities ------------------------------ */
 
@@ -254,7 +254,8 @@ static void benchmark_latency_accurate(void) {
   printf("New slabs allocated:        %" PRIu64 "\n", counters.new_slab_count);
   printf("Moves PARTIAL->FULL:        %" PRIu64 "\n", counters.list_move_partial_to_full);
   printf("Moves FULL->PARTIAL:        %" PRIu64 "\n", counters.list_move_full_to_partial);
-  printf("current_partial misses:     %" PRIu64 "\n", counters.current_partial_miss);
+  printf("current_partial NULL:       %" PRIu64 " (no slab cached)\n", counters.current_partial_null);
+  printf("current_partial FULL:       %" PRIu64 " (cached slab was full)\n", counters.current_partial_full);
   
   /* Attribution explanation */
   printf("\nAttribution:\n");
