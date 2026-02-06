@@ -718,13 +718,14 @@ void* slab_malloc_epoch(SlabAllocator* a, size_t size, EpochId epoch) {
   /* Reserve 8 bytes for handle header */
   if (size == 0 || size > 504) return NULL;  /* Max: 512 - 8 = 504 bytes */
   
-  uint32_t alloc_size = (uint32_t)(size + sizeof(SlabHandle));
+  /* Round up to ensure SlabHandle and user pointer are both 8-byte aligned */
+  uint32_t alloc_size = (uint32_t)((size + sizeof(SlabHandle) + 7) & ~7u);
   SlabHandle h;
   void* obj = alloc_obj_epoch(a, alloc_size, epoch, &h);
   if (!obj) return NULL;
   
-  /* Store handle in first 8 bytes */
-  *(SlabHandle*)obj = h;
+  /* Store handle in first 8 bytes (use memcpy for unaligned safety) */
+  memcpy(obj, &h, sizeof(SlabHandle));
   
   /* Return pointer after header */
   return (void*)((uint8_t*)obj + sizeof(SlabHandle));
@@ -734,8 +735,9 @@ void* slab_malloc_epoch(SlabAllocator* a, size_t size, EpochId epoch) {
 void slab_free(SlabAllocator* a, void* ptr) {
   if (!ptr) return;
   
-  /* Read handle from 8 bytes before user pointer */
-  SlabHandle h = *(SlabHandle*)((uint8_t*)ptr - sizeof(SlabHandle));
+  /* Read handle from 8 bytes before user pointer (use memcpy for unaligned safety) */
+  SlabHandle h;
+  memcpy(&h, (uint8_t*)ptr - sizeof(SlabHandle), sizeof(SlabHandle));
   
   /* Free using handle (validates and frees) */
   free_obj(a, h);
