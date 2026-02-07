@@ -1,5 +1,25 @@
 # temporal-slab Architecture
 
+## Structural Determinism: A Third Way
+
+Most systems force a trade-off:
+- **Manual memory (malloc/free):** fast but fragile
+- **Automatic memory (GC):** safe but unpredictable
+
+temporal-slab introduces a third model: **Structural Determinism**.
+
+### You Don't Manage Objects—You Manage Lifetimes
+
+Memory is reclaimed when a **structure ends** (request, frame, batch, transaction), not when a pointer happens to be freed.
+
+Epoch Domains make these lifetimes explicit, scoped, and deterministic.
+
+**Key insight:** malloc and GC operate at the **object level**. temporal-slab operates at the **phase/structure level**.
+
+This isn't just optimization—it's a different computational model where memory follows program structure rather than pointer chasing.
+
+---
+
 ## Why This Exists
 
 Traditional allocators optimize for spatial reuse and hole-finding. temporal-slab optimizes for **temporal coherence**: grouping objects by lifetime so memory is reclaimed in whole slabs instead of fragments.

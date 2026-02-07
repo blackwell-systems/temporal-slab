@@ -74,37 +74,98 @@ epoch_close(alloc, epoch);               // Trigger RSS reclamation
 
 **Problem Solved**: Manual epoch lifecycle management is error-prone (forget to close → RSS leak).
 
-**Our Solution**: RAII wrappers with automatic cleanup:
+**Our Solution**: RAII wrappers with automatic cleanup.
+
+Epoch Domains demonstrate **three levels of lifetime control**, proving that Structural Determinism scales from simple to complex workloads:
+
+#### Level 1: The Death of the free() Call (Request Scope)
 
 ```c
-// Pattern 1: Auto-closing domain (request scope)
 epoch_domain_t* request = epoch_domain_create(alloc);
 epoch_domain_enter(request);
 {
     char* session = slab_malloc_epoch(alloc, 128, request->epoch_id);
-    // Use session...
+    char* cache = slab_malloc_epoch(alloc, 256, request->epoch_id);
+    char* buffer = slab_malloc_epoch(alloc, 504, request->epoch_id);
+    // No individual free() calls needed
 }
-epoch_domain_exit(request);  // Automatic epoch_close()
+epoch_domain_exit(request);  // All memory reclaimed
 epoch_domain_destroy(request);
-
-// Pattern 2: Reusable domain (game frames)
-epoch_advance(alloc);
-EpochId frame_epoch = epoch_current(alloc);
-epoch_domain_t* frame = epoch_domain_wrap(alloc, frame_epoch, false);
-
-for (int i = 0; i < 60; i++) {  // 60 FPS
-    epoch_domain_enter(frame);
-    {
-        // Allocate frame-local buffers...
-    }
-    epoch_domain_exit(frame);  // Deterministic reclamation
-}
-epoch_domain_destroy(frame);  // Manual cleanup when done
 ```
 
-**Key Insight**: `auto_close` flag controls lifecycle:
-- `true` (default): Domain closes epoch on last exit (single-use)
-- `false`: Domain allows reuse across multiple enter/exit cycles (reusable frames)
+**What this proves:** In high-throughput systems (RPC servers, API gateways), tracking what to free when is cognitive overhead. By binding allocations to request lifetime, you eliminate an entire class of resource leaks.
+
+**Malloc reality:** Every allocation is a promise you might break (leak) or fulfill twice (crash).  
+**temporal-slab reality:** Cleanup is structural, not manual.
+
+**The 2026 play:** Serverless functions (AWS Lambda, Cloudflare Workers) that must return memory after each invocation without cold-start bloat.
+
+---
+
+#### Level 2: Deterministic Nesting (Transactions > Queries)
+
+```c
+epoch_domain_t* transaction = epoch_domain_create(alloc);
+epoch_domain_enter(transaction);
+{
+    char* txn_log = slab_malloc_epoch(alloc, 512, transaction->epoch_id);
+    
+    // Nested query scope
+    epoch_domain_t* query = epoch_domain_create(alloc);
+    execute_query(query);  // Query metadata reclaimed immediately
+    epoch_domain_destroy(query);
+    
+    // Transaction continues with txn_log still valid
+    char* commit_data = slab_malloc_epoch(alloc, 256, transaction->epoch_id);
+}
+epoch_domain_exit(transaction);
+```
+
+**What this proves:** Short-lived lifetimes can nest inside longer-lived ones. A query domain ends while its transaction domain continues.
+
+This allows:
+- Immediate reclamation of query metadata
+- Preservation of transaction state
+- Zero fragmentation between concurrent lifetimes
+
+**The AWS RDS pitch:** Database query planning generates temporary metadata (parse trees, optimizer stats). Query domains reclaim planning metadata immediately while keeping result sets alive until commit/rollback.
+
+**The 2026 edge play:** Multiple concurrent AI agent "thoughts" that reclaim independently without poisoning each other's memory locality.
+
+---
+
+#### Level 3: Explicit Control (Batch Processing)
+
+```c
+epoch_advance(alloc);
+EpochId epoch = epoch_current(alloc);
+epoch_domain_t* domain = epoch_domain_wrap(alloc, epoch, false);  // Manual control
+
+for (int i = 0; i < 3; i++) {
+    epoch_domain_enter(domain);
+    {
+        char* buffer = slab_malloc_epoch(alloc, 128, epoch);
+        // Accumulate data across iterations
+    }
+    epoch_domain_exit(domain);
+    // Memory persists across enter/exit cycles
+}
+
+epoch_domain_force_close(domain);  // Explicit bulk reclamation
+epoch_domain_destroy(domain);
+```
+
+**What this proves:** The system adapts to workload needs instead of forcing a single philosophy.
+
+- `epoch_domain_create()` → automatic, RAII-style lifetimes
+- `epoch_domain_wrap()` → manual lifecycle control  
+- `epoch_domain_force_close()` → explicit reclamation when needed
+
+**The Databricks/Snowflake pitch:** ETL pipelines and log aggregation systems that batch rows into columnar formats need to accumulate allocations across stages, then bulk-free when complete.
+
+---
+
+**Summary:** These three levels prove that Epoch Domains aren't a niche optimization—they're a **design pattern** that works from simple (web requests) to complex (nested transactions with explicit control).
 
 ---
 
