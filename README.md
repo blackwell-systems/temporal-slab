@@ -72,13 +72,30 @@ In latency-sensitive systems, these outliers dominate SLA violations, frame drop
 * Cache metadata and session stores
 * Request-scoped allocation (web servers, RPC frameworks)
 * Frame- or batch-based systems (games, simulations, pipelines)
-* Latency-sensitive services that must not drift in memory usage
+* Latency-sensitive services requiring deterministic worst-case behavior
 
 ## Not Intended For
 
 * Mixed-size, mixed-lifetime workloads
 * General-purpose allocator replacement
 * Objects larger than **768 bytes**
+
+---
+
+## Lifetime Management
+
+temporal-slab supports **explicit lifetime control** in addition to raw allocation.
+
+- **Epochs** group allocations by temporal phase
+- **epoch_close()** deterministically reclaims memory at application-defined boundaries
+- **Epoch Domains** provide RAII-style scoped lifetimes for common patterns
+
+Typical use cases:
+- Request-scoped allocation (enter domain → handle request → exit domain)
+- Frame-based systems (manual domain control per frame)
+- Batch or pipeline stages with clear lifetime boundaries
+
+Epoch Domains are optional; applications may manage epochs manually when finer control is required.
 
 ---
 
@@ -228,6 +245,8 @@ make
 - **O(1) deterministic class selection** - Lookup table eliminates branching (HFT-critical)
 - **O(1) list operations** - Direct list membership tracking via `slab->list_id` (no linear search)
 - **FULL-only recycling** - Provably safe empty slab reuse (no race conditions)
+- **Epoch-based lifetimes** - Temporal grouping with deterministic reclamation
+- **Epoch Domains (RAII scopes)** - Optional scoped lifetimes for requests, frames, and batches
 - **Bounded RSS** - Cache + overflow lists prevent memory leaks under pressure
 - **Opaque handles** - 64-bit encoding hides implementation details
 - **Dual API** - Handle-based (zero overhead) and malloc-style (8-byte header)
