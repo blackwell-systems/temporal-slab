@@ -1210,7 +1210,8 @@ uint64_t read_rss_bytes_linux(void) {
 /* ------------------------------ Epoch API ------------------------------ */
 
 EpochId epoch_current(SlabAllocator* a) {
-  return atomic_load_explicit(&a->current_epoch, memory_order_relaxed);
+  uint32_t raw = atomic_load_explicit(&a->current_epoch, memory_order_relaxed);
+  return raw % a->epoch_count;  /* Return ring index (0-15), not monotonic counter */
 }
 
 void epoch_advance(SlabAllocator* a) {
