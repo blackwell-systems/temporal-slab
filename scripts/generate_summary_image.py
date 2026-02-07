@@ -24,17 +24,19 @@ ax.text(0.5, 0.89, thesis, fontsize=11, ha='center', va='top',
 latency_y = 0.81
 ax.text(0.1, latency_y, "Allocation Latency:", fontsize=14, fontweight='bold', 
         va='top', family='monospace')
-ax.text(0.12, latency_y - 0.04, "• p50:    30 ns     (median)", fontsize=12, 
+ax.text(0.12, latency_y - 0.04, "• p50:     31 ns     (median)", fontsize=12, 
         va='top', family='monospace')
-ax.text(0.12, latency_y - 0.08, "• p99:    374 ns    (3.3× better than malloc)", fontsize=12, 
+ax.text(0.12, latency_y - 0.08, "• p99:     77 ns     (14× better than malloc)", fontsize=12, 
         va='top', family='monospace', color='#27ae60', fontweight='bold')
-ax.text(0.12, latency_y - 0.12, "• p99.9:  1137 ns   (4.7× better than malloc)", fontsize=12, 
+ax.text(0.12, latency_y - 0.12, "• p99.9:   237 ns    (8.4× better than malloc)", fontsize=12, 
         va='top', family='monospace', color='#27ae60', fontweight='bold')
-ax.text(0.12, latency_y - 0.16, "• Variance: 19.6× (vs malloc 110.8×)", fontsize=12, 
+ax.text(0.12, latency_y - 0.16, "• p99.99:  2331 ns   (4.4× better than malloc)", fontsize=12, 
+        va='top', family='monospace', color='#27ae60', fontweight='bold')
+ax.text(0.12, latency_y - 0.20, "• Variance: 75× (vs malloc 485×)", fontsize=12, 
         va='top', family='monospace')
 
 # RSS Stability
-rss_y = 0.60
+rss_y = 0.56
 ax.text(0.1, rss_y, "RSS Stability:", fontsize=14, fontweight='bold', 
         va='top', family='monospace')
 ax.text(0.12, rss_y - 0.04, "• Steady-state churn: 0% growth (100 cycles)", fontsize=12, 
@@ -45,7 +47,7 @@ ax.text(0.12, rss_y - 0.12, "• Baseline RSS:       +37% vs malloc (explicit tr
         va='top', family='monospace')
 
 # Epoch-Scoped Reclamation
-reclaim_y = 0.43
+reclaim_y = 0.39
 ax.text(0.1, reclaim_y, "Epoch-Scoped RSS Reclamation:", fontsize=14, fontweight='bold', 
         va='top', family='monospace')
 ax.text(0.12, reclaim_y - 0.04, "• API: epoch_close() defines lifetime boundaries", fontsize=12, 
@@ -56,7 +58,7 @@ ax.text(0.12, reclaim_y - 0.12, "• Result: 19.15 MiB reclaimable, 100% slab re
         va='top', family='monospace', color='#27ae60', fontweight='bold')
 
 # Memory Efficiency
-mem_y = 0.26
+mem_y = 0.22
 ax.text(0.1, mem_y, "Memory Efficiency (Normalized):", fontsize=14, fontweight='bold', 
         va='top', family='monospace')
 ax.text(0.12, mem_y - 0.04, "• Average: 88.9% (11.1% internal fragmentation)", fontsize=12, 
@@ -65,7 +67,7 @@ ax.text(0.12, mem_y - 0.08, "• Waste:   Comparable to malloc (15-25%)", fontsi
         va='top', family='monospace')
 
 # Key Properties
-props_y = 0.18
+props_y = 0.14
 ax.text(0.1, props_y, "Key Properties:", fontsize=14, fontweight='bold', 
         va='top', family='monospace')
 ax.text(0.12, props_y - 0.04, "✓ O(1) deterministic class selection", fontsize=12, 
@@ -78,7 +80,7 @@ ax.text(0.12, props_y - 0.16, "✓ Application-controlled reclamation", fontsize
         va='top', family='monospace')
 
 # Target Workloads
-target_y = -0.02
+target_y = -0.06
 ax.text(0.1, target_y, "Target Workloads:", fontsize=14, fontweight='bold', 
         va='top', family='monospace')
 ax.text(0.12, target_y - 0.04, "• Request-scoped allocation (web servers, RPC)", fontsize=11, 
