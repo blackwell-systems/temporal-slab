@@ -131,6 +131,10 @@ typedef struct SlabEpochStats {
   uint64_t alloc_count;                /* Number of live allocations in this epoch */
   char label[32];                      /* Semantic label (e.g., "request:abc", "frame:1234") */
   
+  /* Phase 2.4: RSS delta tracking for reclamation quantification */
+  uint64_t rss_before_close;           /* RSS at start of epoch_close() (0=never closed) */
+  uint64_t rss_after_close;            /* RSS at end of epoch_close() (0=never closed) */
+  
   /* Slab counts (requires sc->lock) */
   uint32_t partial_slab_count;
   uint32_t full_slab_count;
