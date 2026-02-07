@@ -453,6 +453,13 @@ void allocator_init(SlabAllocator* a) {
     a->epoch_era[e] = 0;  /* Era 0 for all epochs at startup */
   }
   
+  /* Phase 2.3: Initialize epoch metadata for rich observability */
+  for (uint32_t e = 0; e < EPOCH_COUNT; e++) {
+    a->epoch_meta[e].open_since_ns = 0;  /* 0 = never opened */
+    atomic_store_explicit(&a->epoch_meta[e].alloc_count, 0, memory_order_relaxed);
+    a->epoch_meta[e].label[0] = '\0';  /* Empty label */
+  }
+  
   /* Zero out non-atomic fields (classes array) */
   for (size_t i = 0; i < k_num_classes; i++) {
     a->classes[i].epochs = NULL;
@@ -841,6 +848,10 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       if (out) {
         *out = encode_handle(cur, &a->reg, idx, (uint32_t)ci);
       }
+      
+      /* Phase 2.3: Increment epoch allocation count */
+      atomic_fetch_add_explicit(&a->epoch_meta[epoch].alloc_count, 1, memory_order_relaxed);
+      
       return p;
     }
     
@@ -918,6 +929,10 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     if (out) {
       *out = encode_handle(s, &a->reg, idx, (uint32_t)ci);
     }
+    
+    /* Phase 2.3: Increment epoch allocation count */
+    atomic_fetch_add_explicit(&a->epoch_meta[epoch].alloc_count, 1, memory_order_relaxed);
+    
     return p;
   }
 }
@@ -962,6 +977,9 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   /* Precise transition detection: get previous free_count from fetch_add */
   uint32_t prev_fc = 0;
   if (!slab_free_slot_atomic(s, slot, &prev_fc)) return false;
+  
+  /* Phase 2.3: Decrement epoch allocation count on successful free */
+  atomic_fetch_sub_explicit(&a->epoch_meta[epoch].alloc_count, 1, memory_order_relaxed);
 
   /* New free_count is prev_fc + 1 */
   uint32_t new_fc = prev_fc + 1;
@@ -1208,6 +1226,11 @@ void epoch_advance(SlabAllocator* a) {
   /* Phase 2.2: Stamp era for monotonic observability */
   uint64_t era = atomic_fetch_add_explicit(&a->epoch_era_counter, 1, memory_order_relaxed);
   a->epoch_era[new_epoch] = era + 1;
+  
+  /* Phase 2.3: Reset metadata for new epoch (overwrites previous rotation) */
+  a->epoch_meta[new_epoch].open_since_ns = now_ns();
+  atomic_store_explicit(&a->epoch_meta[new_epoch].alloc_count, 0, memory_order_relaxed);
+  a->epoch_meta[new_epoch].label[0] = '\0';  /* Clear label */
   
   /* Null current_partial for old epoch across all size classes
    * This ensures no thread will allocate from a published slab in CLOSING epoch */
