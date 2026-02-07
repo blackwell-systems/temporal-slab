@@ -6,6 +6,82 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Critical Correctness Fixes (2025-02-07)
+
+#### Fixed
+- **Bug 1 (CRITICAL)**: `epoch_current()` overflow after 16 advances
+  - Returned monotonic counter (16, 17, 18...) instead of ring index (0-15)
+  - Caused allocations to fail silently after 16 `epoch_advance()` calls
+  - Fix: Added modulo operation to return valid ring index
+- **Bug 5 (MEDIUM)**: `epoch_domain_create()` advanced on every call
+  - Created 20 domains → 20 advances → immediate ring wraparound
+  - Fix: Removed implicit advance, domains now wrap current epoch
+- **Bug 2 (HIGH)**: Semantic collision in `alloc_count` field
+  - Same field used for live allocations AND domain refcounts
+  - Prevented domain leak detection (10K objects vs 10K domains indistinguishable)
+  - Fix: Renamed to `domain_refcount`, removed hot-path allocation tracking
+- **Bug 3 (HIGH)**: Domain refcount not wired to allocator
+  - `epoch_domain_enter/exit` only updated local refcount
+  - Allocator always saw refcount=0 (observability broken)
+  - Fix: Wire enter/exit to `slab_epoch_inc/dec_refcount()` APIs
+- **Bug 4 (CRITICAL)**: Auto-close could close wrong epoch after wrap
+  - Domain stored epoch_id only (not era)
+  - After ring wrap, closed different epoch incarnation
+  - Fix: Added `epoch_era` to domain struct, validate before close
+- **Issue 6 (CRITICAL)**: Data race on `epoch_era` array
+  - Plain `uint64_t[]` accessed by multiple threads without synchronization
+  - Undefined behavior under concurrent access
+  - Fix: Changed to `_Atomic uint64_t[]` with proper memory ordering
+- **Issue 5 (CRITICAL)**: Registry growth corrupted free list
+  - `reg_alloc_id()` dropped existing free_ids on capacity growth
+  - Would cause double-allocation if ID recycling implemented
+  - Fix: Preserve free_count entries during reallocation
+- **Issue 4 (CRITICAL)**: `init_class_lookup()` not thread-safe
+  - Two threads could race to initialize lookup table
+  - Fix: Use `pthread_once()` for single-threaded initialization
+- **Issue 2 (HIGH)**: `epoch_domain_destroy()` missing era validation
+  - Could close wrong epoch after ring wrap
+  - Fix: Added era validation before auto-close
+- **Issue 3 (MEDIUM)**: `epoch_domain_force_close()` unsafe semantics
+  - Mutated refcount, no era validation, no safety checks
+  - Fix: Added refcount=0 assertion, era validation, TLS verification
+- **Issue 1 (HIGH)**: epoch_domain nesting broken
+  - Single TLS pointer, nested domains clobbered each other
+  - Example: `enter(A) → enter(B) → exit(B)` lost A's context
+  - Fix: TLS stack (32-element array) with LIFO enforcement
+
+#### Added
+- **Phase 2.3 Semantic Attribution APIs**:
+  - `slab_epoch_set_label()` - Set semantic label for debugging
+  - `slab_epoch_inc_refcount()` - Track domain enter boundaries
+  - `slab_epoch_dec_refcount()` - Track domain exit boundaries
+  - `slab_epoch_get_refcount()` - Query refcount for leak detection
+- **Thread-Local Contract** - Domains enforced as thread-local scopes:
+  - Added `pthread_t owner_tid` to `epoch_domain_t`
+  - All operations assert ownership via `pthread_equal()`
+  - TLS stack supports up to 32 nested domains (configurable)
+  - Debug mode validates LIFO unwind and stack consistency
+- **Per-Allocator Label Lock** - `pthread_mutex_t epoch_label_lock`
+  - Protects label writes (rare, cold path)
+  - Prevents cross-allocator contention
+
+#### Changed
+- **Default `auto_close`**: Changed from `true` to `false`
+  - Explicit `epoch_close()` is safer than implicit auto-close
+  - Prevents accidental premature closure with shared epochs
+- **EpochMetadata field rename**: `alloc_count` → `domain_refcount`
+  - Semantic clarity: tracks domain boundaries, not live allocations
+  - Enables clean domain leak detection signal
+
+#### Impact
+- Allocator now works reliably after 16+ epoch advances (was silently broken)
+- Domain nesting safe for request→transaction→query patterns
+- All data races eliminated (era, lookup table, registry growth)
+- Thread-local contract enforced with runtime assertions
+- Production-ready concurrency safety
+
+---
+
 ### Phase 2: Complete Observability System
 
 Complete observability implementation across 5 incremental phases, transforming epochs from opaque memory buckets into fully observable temporal windows for debugging production issues.
