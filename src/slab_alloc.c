@@ -458,6 +458,10 @@ void allocator_init(SlabAllocator* a) {
     a->epoch_meta[e].open_since_ns = 0;  /* 0 = never opened */
     atomic_store_explicit(&a->epoch_meta[e].alloc_count, 0, memory_order_relaxed);
     a->epoch_meta[e].label[0] = '\0';  /* Empty label */
+    
+    /* Phase 2.4: Initialize RSS delta tracking */
+    a->epoch_meta[e].rss_before_close = 0;  /* 0 = never closed */
+    a->epoch_meta[e].rss_after_close = 0;
   }
   
   /* Zero out non-atomic fields (classes array) */
@@ -1245,6 +1249,10 @@ void epoch_advance(SlabAllocator* a) {
 void epoch_close(SlabAllocator* a, EpochId epoch) {
   if (!a || epoch >= a->epoch_count) return;
   
+  /* Phase 2.4: Capture RSS before closing epoch (quantify reclamation impact) */
+  uint64_t rss_before = read_rss_bytes_linux();
+  a->epoch_meta[epoch].rss_before_close = rss_before;
+  
   /* Mark epoch as CLOSING - no new allocations allowed
    * 
    * This enables Phase 2 RSS reclamation: when slabs in this epoch become empty,
@@ -1351,6 +1359,10 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
       pthread_mutex_unlock(&sc->lock);
     }
   }
+  
+  /* Phase 2.4: Capture RSS after closing epoch (quantify reclamation impact) */
+  uint64_t rss_after = read_rss_bytes_linux();
+  a->epoch_meta[epoch].rss_after_close = rss_after;
   
   /* Epoch now drains: frees continue and empty slabs are aggressively recycled.
    * With RSS reclamation enabled, physical pages are returned to OS as slabs drain. */

@@ -189,6 +189,10 @@ typedef struct EpochMetadata {
   uint64_t open_since_ns;       /* Timestamp when epoch became ACTIVE (0 if never opened) */
   _Atomic uint64_t alloc_count; /* Number of live allocations in this epoch */
   char label[32];               /* Semantic label (e.g., "request_id:abc", "frame:1234") */
+  
+  /* Phase 2.4: RSS delta tracking for reclamation quantification */
+  uint64_t rss_before_close;    /* RSS snapshot at start of epoch_close() (0 if never closed) */
+  uint64_t rss_after_close;     /* RSS snapshot at end of epoch_close() (0 if never closed) */
 } EpochMetadata;
 
 /* Main allocator structure */
