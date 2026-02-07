@@ -413,34 +413,34 @@ epoch_domain_destroy(request);
 
 ## Current Implementation Status
 
-**Phase 1: Core allocator** ✅ Production-ready
+**Phase 1: Core allocator** - Production-ready
 - Lock-free fast path (76ns p99, 166ns p99.9)
 - 8 size classes (64-768 bytes)
 - Handle-based and malloc-style APIs
 - Conservative recycling (FULL-only)
 
-**Phase 2: RSS reclamation** ✅ Production-ready
+**Phase 2: RSS reclamation** - Production-ready
 - madvise(MADV_DONTNEED) on empty slabs
 - epoch_close() API for deterministic reclamation
 - Slab registry with 24-bit generation counters (ABA protection)
 - CachedNode architecture (madvise-safe reuse)
 - 19.15 MiB reclaimable per epoch test, 3.3% RSS drop, 100% cache hit rate
 
-**Phase 3: Observability** ✅ Production-ready
+**Phase 3: Observability** - Production-ready
 - Global, per-class, per-epoch stats APIs
 - Slow-path attribution (cache miss vs epoch closed)
 - RSS tracking (madvise calls/bytes/failures)
 - stats_dump utility with versioned JSON output (879-line reference doc)
 - Structural attribution (no emergent patterns)
 
-**Phase 4: Epoch domains** ✅ Production-ready
+**Phase 4: Epoch domains** - Production-ready
 - RAII-style scoped lifetimes
 - Automatic epoch_close() on domain exit
 - Refcount tracking for nested scopes
 - Thread-local context for implicit binding
 - Comprehensive pattern guide (EPOCH_DOMAINS.md)
 
-**Documentation** ✅ Complete
+**Documentation** - Complete
 - foundations.md (3,222 lines, first-principles theory)
 - EPOCH_DOMAINS.md (pattern catalog, safety contracts, anti-patterns)
 - VALUE_PROP.md (measured benchmark results, risk exchange)
@@ -451,8 +451,8 @@ epoch_domain_destroy(request);
 ## Recommended Next Steps
 
 For **this repo (temporal-slab)**:
-1. ✅ Core allocator, RSS reclamation, observability, domains - all complete
-2. ✅ Comprehensive documentation (5,000+ lines across 6 docs)
+1. Core allocator, RSS reclamation, observability, domains - all complete
+2. Comprehensive documentation (5,000+ lines across 6 docs)
 3. Production validation (Month 1-2 roadmap phase)
 4. Multi-platform testing (ARM64, macOS, additional Linux distributions)
 5. Integration examples (Redis module, Envoy filter, game server)
