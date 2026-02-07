@@ -59,7 +59,7 @@ static const size_t   k_num_classes   = sizeof(k_size_classes) / sizeof(k_size_c
  */
 #define MAX_ALLOC_SIZE 768u
 static uint8_t k_class_lookup[MAX_ALLOC_SIZE + 1];
-static bool k_lookup_initialized = false;
+static pthread_once_t k_lookup_once = PTHREAD_ONCE_INIT;
 
 /* ------------------------------ Utilities ------------------------------ */
 
@@ -84,10 +84,8 @@ static inline uint32_t ctz32(uint32_t x) {
 #endif
 }
 
-/* Initialize O(1) class lookup table at first use */
-static void init_class_lookup(void) {
-  if (k_lookup_initialized) return;
-  
+/* Initialize O(1) class lookup table (thread-safe via pthread_once) */
+static void init_class_lookup_impl(void) {
   /* For each byte size, find smallest class that fits */
   for (uint32_t sz = 1; sz <= MAX_ALLOC_SIZE; sz++) {
     uint8_t class_idx = 0xFF; /* invalid */
@@ -100,8 +98,10 @@ static void init_class_lookup(void) {
     k_class_lookup[sz] = class_idx;
   }
   k_class_lookup[0] = 0xFF; /* zero-size is invalid */
-  
-  k_lookup_initialized = true;
+}
+
+static void init_class_lookup(void) {
+  pthread_once(&k_lookup_once, init_class_lookup_impl);
 }
 
 /* O(1) class index lookup (deterministic, no branches per class) */
@@ -158,11 +158,15 @@ static uint32_t reg_alloc_id(SlabRegistry* r) {
     r->metas = nm;
     r->cap = new_cap;
     
-    /* Grow free_ids array too */
+    /* Grow free_ids array too (preserve existing free_count entries) */
     uint32_t* nf = (uint32_t*)calloc(new_cap, sizeof(uint32_t));
     if (!nf) {
       pthread_mutex_unlock(&r->lock);
       return UINT32_MAX;
+    }
+    /* Copy existing free IDs to new array */
+    for (size_t i = 0; i < r->free_count; i++) {
+      nf[i] = r->free_ids[i];
     }
     free(r->free_ids);
     r->free_ids = nf;
@@ -450,7 +454,7 @@ void allocator_init(SlabAllocator* a) {
   /* Phase 2.2: Initialize era tracking for monotonic observability */
   atomic_store_explicit(&a->epoch_era_counter, 0, memory_order_relaxed);
   for (uint32_t e = 0; e < EPOCH_COUNT; e++) {
-    a->epoch_era[e] = 0;  /* Era 0 for all epochs at startup */
+    atomic_store_explicit(&a->epoch_era[e], 0, memory_order_relaxed);  /* Era 0 for all epochs at startup */
   }
   
   /* Phase 2.3: Initialize epoch metadata for rich observability */
@@ -668,7 +672,7 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
     s->list_id = SLAB_LIST_NONE;
     s->cache_state = SLAB_ACTIVE;
     s->epoch_id = epoch_id;
-    s->era = a->epoch_era[epoch_id];  /* Phase 2.2: stamp era from epoch */
+    s->era = atomic_load_explicit(&a->epoch_era[epoch_id], memory_order_acquire);  /* Phase 2.2: stamp era from epoch */
     s->slab_id = cached_id;  /* Restore ID from cache */
     atomic_store_explicit(&s->free_count, expected_count, memory_order_relaxed);
     
@@ -1225,7 +1229,7 @@ void epoch_advance(SlabAllocator* a) {
   
   /* Phase 2.2: Stamp era for monotonic observability */
   uint64_t era = atomic_fetch_add_explicit(&a->epoch_era_counter, 1, memory_order_relaxed);
-  a->epoch_era[new_epoch] = era + 1;
+  atomic_store_explicit(&a->epoch_era[new_epoch], era + 1, memory_order_release);
   
   /* Phase 2.3: Reset metadata for new epoch (overwrites previous rotation) */
   a->epoch_meta[new_epoch].open_since_ns = now_ns();
