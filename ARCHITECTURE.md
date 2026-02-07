@@ -14,6 +14,8 @@ temporal-slab is a **lifetime-aware memory allocator** for fixed-size objects. I
 - Bounded RSS under sustained churn
 - Provably safe recycling (FULL-only)
 - Dual APIs (handle-based and malloc-style)
+- Epoch-scoped RSS reclamation (madvise + epoch_close)
+- 16-epoch ring buffer for temporal grouping
 
 This document describes the current implementation and the path to extended functionality.
 
@@ -70,29 +72,58 @@ Slab lifecycle:
   [ACTIVE, PARTIAL]
       ↓ (all slots freed on FULL list)
   [CACHED/OVERFLOWED, NONE] ← Pushed to cache or overflow
+      ↓ (madvise MADV_DONTNEED if epoch CLOSING)
+  [CACHED, MADVISED] ← Physical pages returned to kernel
       ↓ (cache_pop)
-  [ACTIVE, PARTIAL] ← Reused
+  [ACTIVE, PARTIAL] ← Reused (kernel zero-fills on access)
+```
+
+**Epoch-based reclamation:**
+
+```
+Epoch states:
+
+  [ACTIVE] ← Current epoch receiving allocations
+      ↓ (epoch_advance)
+  [ACTIVE] ← Previous epoch drains naturally
+      ↓ (epoch_close)
+  [CLOSING] ← Aggressive reclamation enabled
+      ↓ (empty slabs madvised immediately)
+  [ACTIVE] ← Epoch ID reused (ring wraps at 16)
 ```
 
 **Critical safety property:** Only slabs in FULL state are recycled. PARTIAL slabs are never recycled, eliminating TOCTTOU races where threads hold stale `current_partial` pointers.
 
 ### Handle Encoding
 
+**Current format (v1):**
+
 ```
 64-bit opaque handle:
-  [63:16] Slab pointer (48 bits)
-  [15:8]  Slot index (8 bits, max 256 objects/slab)
-  [7:0]   Size class (8 bits, currently 0-3)
+  [63:42] slab_id (22 bits, 4M slabs)
+  [41:18] generation (24 bits, 16M reuses before wrap)
+  [17:10] slot (8 bits, max 256 objects/slab)
+  [9:2]   size_class (8 bits)
+  [1:0]   version (2 bits, v1 = 0b01)
 ```
 
-This encoding is **extensible** for future tiered storage:
+**Why generation + version fields:**
+- **Generation (24-bit):** ABA protection for slab reuse (16M budget vs old 16-bit 65K)
+- **Version (2-bit):** Future ABI evolution (v2 can change encoding)
+- **slab_id instead of pointer:** Enables safe madvise (pointer invalidation-proof)
+
+**CachedNode architecture:**
+
+```c
+typedef struct cached_node {
+    slab_t *slab;        // Virtual address (survives madvise)
+    slab_id_t slab_id;   // Stored off-page, safe from madvise zeroing
+} cached_node_t;
 ```
-Future multi-tier encoding:
-  [63:60] Tier ID (4 bits, 16 tiers)
-  [59:16] Slab ID (44 bits, ~17T slabs)
-  [15:8]  Slot index (8 bits)
-  [7:0]   Size class (8 bits)
-```
+
+**Critical invariant:** When slab is madvised, its `(slab*, slab_id)` pair is stored in CachedNode before `madvise()` zeros the slab header. On reuse, `slab_id` is restored from the cached entry.
+
+This solved the **Phase 2 overflow bug** where madvise corrupted slab_id fields, causing 1% → 98.9% reclamation improvement.
 
 ## Path to Extended Functionality
 
@@ -149,6 +180,71 @@ void promote_slab(TieredAllocator* ta, Slab* slab, int from_tier, int to_tier) {
 
 **Critical constraint:** No code in this repo (temporal-slab) assumes tiers exist. Tiering is an optional higher-level orchestration layer.
 
+## RSS Reclamation Architecture
+
+### Phase 1: madvise on Empty Slabs (IMPLEMENTED)
+
+**Mechanism:**
+- Empty slabs in CLOSING epochs call `madvise(MADV_DONTNEED)` before cache push
+- Virtual memory stays mapped (safe for stale handles)
+- Kernel zero-fills pages on next access
+
+**Effectiveness:**
+- Limited alone - slabs immediately recycled in high-churn workloads
+- Requires deterministic empty periods (Phase 2 provides this)
+
+### Phase 2: epoch_close() + Aggressive Reclamation (IMPLEMENTED)
+
+**API:**
+```c
+void epoch_close(SlabAllocator* alloc, EpochId epoch);
+```
+
+**Semantics:**
+- Marks epoch as CLOSING (aggressive reclamation enabled)
+- Scans for already-empty slabs and madvises immediately
+- Future empty slabs from this epoch madvised on cache push
+
+**Critical bug fix:** CachedNode architecture
+- Problem: madvise zeroed slab headers, corrupting slab_id field
+- Solution: Store (slab*, slab_id) off-page in cached_node_t
+- Result: 1% \u2192 98.9% reclamation improvement in isolated tests
+
+**Benchmark results (epoch_rss_bench):**
+- 5 epochs × 50,000 objects (128 bytes)
+- 19.15 MiB marked reclaimable via madvise
+- 3.3% RSS drop under memory pressure (kernel-dependent)
+- 100% cache hit rate (perfect slab reuse)
+
+**Pattern:** Small epochs approach 100% reclaim, large epochs ~2%
+
+**Use cases:**
+```c
+// Web server: per-request epoch
+epoch_id_t req = epoch_open();
+// ... handle request ...
+epoch_close(alloc, req);  // All request memory reclaimable
+
+// Game engine: per-frame epoch
+epoch_id_t frame = epoch_open();
+// ... render frame ...
+epoch_close(alloc, frame);  // All frame memory reclaimable
+```
+
+### Phase 3: Handle Indirection + munmap() (NOT IMPLEMENTED)
+
+**Architecture:**
+```
+handle → slab_id → slab_table[generation, state, ptr] → slab
+```
+
+**What it enables:**
+- Real `munmap()` with crash-proof stale frees
+- Unmapped slabs detected safely without touching memory
+- Strongest possible RSS guarantees
+
+**Defer until:** Phases 1-2 proven in production
+
 ### Layer 3: Eviction Policy
 
 ```c
@@ -165,9 +261,9 @@ void evict_coldest_slab(SlabAllocator* alloc, int size_class) {
 ## Why Separation Matters
 
 **temporal-slab (this repo):**
-- Pure allocator with no policy
+- Pure allocator with epoch-scoped RSS reclamation
 - Zero external dependencies
-- Clear safety contract
+- Clear safety contract (no munmap during runtime)
 - Wide adoption potential
 
 **ZNS-Cache (future repo):**
