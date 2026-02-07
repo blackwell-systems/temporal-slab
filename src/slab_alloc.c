@@ -494,28 +494,46 @@ void allocator_init(SlabAllocator* a) {
     a->classes[i].slab_cache = (CachedSlab*)calloc(a->classes[i].cache_capacity, sizeof(CachedSlab));
     pthread_mutex_init(&a->classes[i].cache_lock, NULL);
     
-    /* Initialize overflow list */
-    list_init(&a->classes[i].cache_overflow);
+    /* Initialize overflow list (CachedNode for madvise safety) */
+    a->classes[i].cache_overflow_head = NULL;
+    a->classes[i].cache_overflow_tail = NULL;
+    a->classes[i].cache_overflow_len = 0;
   }
 }
 
 /* ------------------------------ Slab cache operations ------------------------------ */
 
-/* Pop cached slab (returns slab pointer and slab_id via out parameter) */
+/* Pop cached slab (returns slab pointer and slab_id via out parameter)
+ * 
+ * CRITICAL: Overflow nodes store slab_id off-page because madvise zeros slab header.
+ */
 static Slab* cache_pop(SizeClassAlloc* sc, uint32_t* out_slab_id) {
   pthread_mutex_lock(&sc->cache_lock);
   Slab* s = NULL;
   uint32_t id = UINT32_MAX;
   
   if (sc->cache_size > 0) {
+    /* Pop from array cache (slab_id stored off-page) */
     CachedSlab* entry = &sc->slab_cache[--sc->cache_size];
     s = entry->slab;
     id = entry->slab_id;
-  } else if (sc->cache_overflow.head) {
-    /* Cache empty - try overflow list */
-    s = sc->cache_overflow.head;
-    id = s->slab_id;  /* Overflow slabs keep their ID in header */
-    list_remove(&sc->cache_overflow, s);
+  } else if (sc->cache_overflow_head) {
+    /* Cache empty - try overflow list (slab_id stored in node, off-page) */
+    CachedNode* node = sc->cache_overflow_head;
+    s = node->slab;
+    id = node->slab_id;  /* SAFE: stored in node, not slab header */
+    
+    /* Remove from list */
+    sc->cache_overflow_head = node->next;
+    if (sc->cache_overflow_head) {
+      sc->cache_overflow_head->prev = NULL;
+    } else {
+      sc->cache_overflow_tail = NULL;
+    }
+    sc->cache_overflow_len--;
+    
+    /* Free node */
+    free(node);
   }
   
   pthread_mutex_unlock(&sc->cache_lock);
@@ -543,12 +561,31 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
     s->cache_state = SLAB_CACHED;
     atomic_fetch_add_explicit(&sc->empty_slab_recycled, 1, memory_order_relaxed);
   } else {
-    /* Registry-based handle validation enables safe overflow tracking.
-     * Slabs stay mapped for validation but RSS can be reclaimed via madvise.
+    /* Cache full - push to overflow list
      * 
-     * Overflow slabs keep slab_id in header (we reinitialize after madvise),
-     * but cache array stores (slab, slab_id) pair for guaranteed recovery. */
-    list_push_back(&sc->cache_overflow, s);
+     * CRITICAL: Store slab_id in CachedNode (off-page) because madvise zeros slab header.
+     * This prevents corruption on reuse: cache_pop() will read node->slab_id (safe),
+     * not s->slab_id (zeroed by madvise). */
+    CachedNode* node = (CachedNode*)malloc(sizeof(CachedNode));
+    if (!node) {
+      /* Allocation failure - skip caching this slab (leak until destroy) */
+      pthread_mutex_unlock(&sc->cache_lock);
+      return;
+    }
+    
+    node->slab = s;
+    node->slab_id = s->slab_id;  /* CRITICAL: store off-page before madvise */
+    node->prev = sc->cache_overflow_tail;
+    node->next = NULL;
+    
+    if (sc->cache_overflow_tail) {
+      sc->cache_overflow_tail->next = node;
+    } else {
+      sc->cache_overflow_head = node;
+    }
+    sc->cache_overflow_tail = node;
+    sc->cache_overflow_len++;
+    
     s->cache_state = SLAB_OVERFLOWED;
     atomic_fetch_add_explicit(&sc->empty_slab_cache_overflowed, 1, memory_order_relaxed);
   }
@@ -695,8 +732,11 @@ static inline SlabHandle handle_pack(uint32_t slab_id, uint32_t gen, uint8_t slo
 static inline void handle_unpack(SlabHandle h, uint32_t* slab_id, uint32_t* gen, uint32_t* slot, uint32_t* cls) {
   uint32_t version = (uint32_t)(h & 0x3u);
   if (version != HANDLE_VERSION_V1) {
-    /* Future: handle other versions. For now, zero all fields on mismatch. */
-    *cls = 0; *slot = 0; *gen = 0; *slab_id = 0;
+    /* Invalid version - set sentinel values that will fail validation */
+    *slab_id = UINT32_MAX;  /* Will fail bounds check */
+    *gen = 0;               /* Generation 0 never used */
+    *slot = 0;
+    *cls = UINT32_MAX;      /* Will fail bounds check */
     return;
   }
   
@@ -863,7 +903,8 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   uint32_t slab_id, slot, size_class, gen;
   handle_unpack(h, &slab_id, &gen, &slot, &size_class);
   
-  if (size_class >= (uint32_t)k_num_classes) return false;
+  /* Validate bounds (catches invalid version handles) */
+  if (slab_id == UINT32_MAX || size_class >= (uint32_t)k_num_classes) return false;
 
   SizeClassAlloc* sc = &a->classes[size_class];
   
@@ -1037,14 +1078,17 @@ void allocator_destroy(SlabAllocator* a) {
     sc->cache_size = 0;
     sc->cache_capacity = 0;
     
-    /* Drain overflow list */
-    Slab* cur = sc->cache_overflow.head;
-    while (cur) {
-      Slab* next = cur->next;
-      unmap_one_page(cur);
-      cur = next;
+    /* Drain overflow list (free nodes and unmap slabs) */
+    CachedNode* node = sc->cache_overflow_head;
+    while (node) {
+      CachedNode* next = node->next;
+      unmap_one_page(node->slab);
+      free(node);
+      node = next;
     }
-    list_init(&sc->cache_overflow);
+    sc->cache_overflow_head = NULL;
+    sc->cache_overflow_tail = NULL;
+    sc->cache_overflow_len = 0;
     
     pthread_mutex_unlock(&sc->cache_lock);
     pthread_mutex_destroy(&sc->cache_lock);
