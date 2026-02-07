@@ -1,4 +1,5 @@
 #include "epoch_domain.h"
+#include "slab_alloc_internal.h"  /* For accessing epoch_era[] */
 #include <stdlib.h>
 #include <assert.h>
 #include <pthread.h>
@@ -15,6 +16,7 @@ epoch_domain_t* epoch_domain_create(SlabAllocator* alloc) {
     domain->alloc = alloc;
     /* Wrap current epoch (no advance) - caller controls phase boundaries */
     domain->epoch_id = epoch_current(alloc);
+    domain->epoch_era = alloc->epoch_era[domain->epoch_id];  /* Capture era at creation */
     domain->refcount = 0;
     domain->auto_close = false;  // Default: explicit epoch_close (safer)
     
@@ -29,6 +31,7 @@ epoch_domain_t* epoch_domain_wrap(SlabAllocator* alloc, EpochId epoch_id, bool a
     
     domain->alloc = alloc;
     domain->epoch_id = epoch_id;
+    domain->epoch_era = alloc->epoch_era[epoch_id];  /* Capture era at wrap time */
     domain->refcount = 0;
     domain->auto_close = auto_close;
     
@@ -37,6 +40,11 @@ epoch_domain_t* epoch_domain_wrap(SlabAllocator* alloc, EpochId epoch_id, bool a
 
 void epoch_domain_enter(epoch_domain_t* domain) {
     if (!domain) return;
+    
+    /* On first enter (0->1 transition), notify allocator */
+    if (domain->refcount == 0) {
+        slab_epoch_inc_refcount(domain->alloc, domain->epoch_id);
+    }
     
     domain->refcount++;
     
@@ -54,10 +62,22 @@ void epoch_domain_exit(epoch_domain_t* domain) {
     
     domain->refcount--;
     
-    /* On last exit, perform cleanup */
+    /* On last exit (1->0 transition), notify allocator and perform cleanup */
     if (domain->refcount == 0) {
+        /* Decrement global refcount */
+        slab_epoch_dec_refcount(domain->alloc, domain->epoch_id);
+        
         if (domain->auto_close) {
-            epoch_close(domain->alloc, domain->epoch_id);
+            /* Validate era before auto-closing (prevent closing wrong epoch after wrap) */
+            uint64_t current_era = domain->alloc->epoch_era[domain->epoch_id];
+            if (current_era == domain->epoch_era) {
+                /* Era matches - safe to close */
+                uint64_t global_refcount = slab_epoch_get_refcount(domain->alloc, domain->epoch_id);
+                if (global_refcount == 0) {
+                    epoch_close(domain->alloc, domain->epoch_id);
+                }
+            }
+            /* Era mismatch: epoch wrapped and reused, skip auto-close */
         }
         
         /* Clear thread-local if this was current */

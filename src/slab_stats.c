@@ -143,7 +143,7 @@ void slab_stats_epoch(SlabAllocator* alloc, uint32_t size_class, EpochId epoch, 
   
   /* Phase 2.3: Read epoch metadata */
   out->open_since_ns = alloc->epoch_meta[epoch].open_since_ns;
-  out->alloc_count = atomic_load_explicit(&alloc->epoch_meta[epoch].alloc_count, memory_order_relaxed);
+  out->alloc_count = atomic_load_explicit(&alloc->epoch_meta[epoch].domain_refcount, memory_order_relaxed);
   memcpy(out->label, alloc->epoch_meta[epoch].label, sizeof(out->label));
   
   /* Phase 2.4: Read RSS delta tracking */

@@ -524,6 +524,64 @@ void epoch_advance(SlabAllocator* alloc);
  */
 void epoch_close(SlabAllocator* alloc, EpochId epoch);
 
+/* ==================== Phase 2.3: Semantic Attribution APIs ==================== */
+
+/* Set semantic label for epoch (for debugging and observability)
+ * 
+ * Labels help identify what an epoch represents (e.g., "request:abc123", "frame:4567").
+ * Labels are visible in JSON output and Prometheus metrics for root cause analysis.
+ * 
+ * BEHAVIOR:
+ * - Thread-safe (internal mutex protects label writes)
+ * - Label is truncated to 31 characters (32-byte field)
+ * - Label persists until epoch is reused (ring wrap)
+ * 
+ * USAGE:
+ *   EpochId e = epoch_current(alloc);
+ *   slab_epoch_set_label(alloc, e, "request:abc123");
+ * 
+ * THREAD SAFETY: Safe to call concurrently.
+ */
+void slab_epoch_set_label(SlabAllocator* alloc, EpochId epoch, const char* label);
+
+/* Increment domain refcount for epoch
+ * 
+ * Tracks domain enter/exit boundaries for leak detection.
+ * Refcount represents number of active domain scopes, NOT live allocations.
+ * 
+ * USAGE (typically called by epoch_domain_enter):
+ *   slab_epoch_inc_refcount(alloc, epoch);
+ * 
+ * THREAD SAFETY: Safe to call concurrently (atomic increment).
+ */
+void slab_epoch_inc_refcount(SlabAllocator* alloc, EpochId epoch);
+
+/* Decrement domain refcount for epoch
+ * 
+ * Decrements refcount on domain exit. Refcount cannot go negative (saturates at 0).
+ * 
+ * USAGE (typically called by epoch_domain_exit):
+ *   slab_epoch_dec_refcount(alloc, epoch);
+ * 
+ * THREAD SAFETY: Safe to call concurrently (atomic decrement).
+ */
+void slab_epoch_dec_refcount(SlabAllocator* alloc, EpochId epoch);
+
+/* Get current domain refcount for epoch
+ * 
+ * Returns number of active domain scopes for this epoch.
+ * Non-zero refcount indicates domains are still holding references.
+ * 
+ * USAGE:
+ *   uint64_t ref = slab_epoch_get_refcount(alloc, epoch);
+ *   if (ref > 0) {
+ *     // Domain leak detected - some domain didn't exit cleanly
+ *   }
+ * 
+ * THREAD SAFETY: Safe to call concurrently (atomic load).
+ */
+uint64_t slab_epoch_get_refcount(SlabAllocator* alloc, EpochId epoch);
+
 /* Allocate object in specific epoch (handle-based)
  * 
  * Same as alloc_obj(), but allocates into specified epoch for temporal grouping.

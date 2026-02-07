@@ -37,7 +37,8 @@
 
 typedef struct epoch_domain {
     SlabAllocator* alloc;      // Allocator instance
-    EpochId epoch_id;          // Underlying epoch
+    EpochId epoch_id;          // Underlying epoch (ring index 0-15)
+    uint64_t epoch_era;        // Era when domain was created (for wrap-around safety)
     uint32_t refcount;         // Nesting depth
     bool auto_close;           // Close epoch on last exit?
 } epoch_domain_t;

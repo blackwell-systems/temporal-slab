@@ -454,9 +454,10 @@ void allocator_init(SlabAllocator* a) {
   }
   
   /* Phase 2.3: Initialize epoch metadata for rich observability */
+  pthread_mutex_init(&a->epoch_label_lock, NULL);
   for (uint32_t e = 0; e < EPOCH_COUNT; e++) {
     a->epoch_meta[e].open_since_ns = 0;  /* 0 = never opened */
-    atomic_store_explicit(&a->epoch_meta[e].alloc_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->epoch_meta[e].domain_refcount, 0, memory_order_relaxed);
     a->epoch_meta[e].label[0] = '\0';  /* Empty label */
     
     /* Phase 2.4: Initialize RSS delta tracking */
@@ -853,9 +854,6 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
         *out = encode_handle(cur, &a->reg, idx, (uint32_t)ci);
       }
       
-      /* Phase 2.3: Increment epoch allocation count */
-      atomic_fetch_add_explicit(&a->epoch_meta[epoch].alloc_count, 1, memory_order_relaxed);
-      
       return p;
     }
     
@@ -934,9 +932,6 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       *out = encode_handle(s, &a->reg, idx, (uint32_t)ci);
     }
     
-    /* Phase 2.3: Increment epoch allocation count */
-    atomic_fetch_add_explicit(&a->epoch_meta[epoch].alloc_count, 1, memory_order_relaxed);
-    
     return p;
   }
 }
@@ -982,9 +977,6 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   uint32_t prev_fc = 0;
   if (!slab_free_slot_atomic(s, slot, &prev_fc)) return false;
   
-  /* Phase 2.3: Decrement epoch allocation count on successful free */
-  atomic_fetch_sub_explicit(&a->epoch_meta[epoch].alloc_count, 1, memory_order_relaxed);
-
   /* New free_count is prev_fc + 1 */
   uint32_t new_fc = prev_fc + 1;
 
@@ -1167,6 +1159,9 @@ void allocator_destroy(SlabAllocator* a) {
     pthread_mutex_destroy(&sc->cache_lock);
   }
   
+  /* Destroy label lock */
+  pthread_mutex_destroy(&a->epoch_label_lock);
+  
   /* Destroy slab registry */
   reg_destroy(&a->reg);
 }
@@ -1234,7 +1229,7 @@ void epoch_advance(SlabAllocator* a) {
   
   /* Phase 2.3: Reset metadata for new epoch (overwrites previous rotation) */
   a->epoch_meta[new_epoch].open_since_ns = now_ns();
-  atomic_store_explicit(&a->epoch_meta[new_epoch].alloc_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&a->epoch_meta[new_epoch].domain_refcount, 0, memory_order_relaxed);
   a->epoch_meta[new_epoch].label[0] = '\0';  /* Clear label */
   
   /* Null current_partial for old epoch across all size classes
@@ -1367,6 +1362,46 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
   
   /* Epoch now drains: frees continue and empty slabs are aggressively recycled.
    * With RSS reclamation enabled, physical pages are returned to OS as slabs drain. */
+}
+
+/* ------------------------------ Phase 2.3: Semantic Attribution APIs ------------------------------ */
+
+void slab_epoch_set_label(SlabAllocator* a, EpochId epoch, const char* label) {
+  if (!a || epoch >= a->epoch_count || !label) return;
+  
+  EpochMetadata* meta = &a->epoch_meta[epoch];
+  
+  pthread_mutex_lock(&a->epoch_label_lock);
+  strncpy(meta->label, label, sizeof(meta->label) - 1);
+  meta->label[sizeof(meta->label) - 1] = '\0';  /* Ensure null termination */
+  pthread_mutex_unlock(&a->epoch_label_lock);
+}
+
+void slab_epoch_inc_refcount(SlabAllocator* a, EpochId epoch) {
+  if (!a || epoch >= a->epoch_count) return;
+  
+  atomic_fetch_add_explicit(&a->epoch_meta[epoch].domain_refcount, 1, memory_order_relaxed);
+}
+
+void slab_epoch_dec_refcount(SlabAllocator* a, EpochId epoch) {
+  if (!a || epoch >= a->epoch_count) return;
+  
+  /* Atomic decrement with saturation at 0 (prevent underflow) */
+  uint64_t prev = atomic_load_explicit(&a->epoch_meta[epoch].domain_refcount, memory_order_relaxed);
+  while (prev > 0) {
+    if (atomic_compare_exchange_weak_explicit(
+            &a->epoch_meta[epoch].domain_refcount, &prev, prev - 1,
+            memory_order_relaxed, memory_order_relaxed)) {
+      break;  /* Success */
+    }
+    /* CAS failed, prev was updated with current value, retry */
+  }
+}
+
+uint64_t slab_epoch_get_refcount(SlabAllocator* a, EpochId epoch) {
+  if (!a || epoch >= a->epoch_count) return 0;
+  
+  return atomic_load_explicit(&a->epoch_meta[epoch].domain_refcount, memory_order_relaxed);
 }
 
 /*
