@@ -16,7 +16,7 @@ epoch_domain_t* epoch_domain_create(SlabAllocator* alloc) {
     domain->alloc = alloc;
     /* Wrap current epoch (no advance) - caller controls phase boundaries */
     domain->epoch_id = epoch_current(alloc);
-    domain->epoch_era = alloc->epoch_era[domain->epoch_id];  /* Capture era at creation */
+    domain->epoch_era = atomic_load_explicit(&alloc->epoch_era[domain->epoch_id], memory_order_acquire);  /* Capture era at creation */
     domain->refcount = 0;
     domain->auto_close = false;  // Default: explicit epoch_close (safer)
     
@@ -31,7 +31,7 @@ epoch_domain_t* epoch_domain_wrap(SlabAllocator* alloc, EpochId epoch_id, bool a
     
     domain->alloc = alloc;
     domain->epoch_id = epoch_id;
-    domain->epoch_era = alloc->epoch_era[epoch_id];  /* Capture era at wrap time */
+    domain->epoch_era = atomic_load_explicit(&alloc->epoch_era[epoch_id], memory_order_acquire);  /* Capture era at wrap time */
     domain->refcount = 0;
     domain->auto_close = auto_close;
     
@@ -69,7 +69,7 @@ void epoch_domain_exit(epoch_domain_t* domain) {
         
         if (domain->auto_close) {
             /* Validate era before auto-closing (prevent closing wrong epoch after wrap) */
-            uint64_t current_era = domain->alloc->epoch_era[domain->epoch_id];
+            uint64_t current_era = atomic_load_explicit(&domain->alloc->epoch_era[domain->epoch_id], memory_order_acquire);
             if (current_era == domain->epoch_era) {
                 /* Era matches - safe to close */
                 uint64_t global_refcount = slab_epoch_get_refcount(domain->alloc, domain->epoch_id);
@@ -102,7 +102,13 @@ void epoch_domain_destroy(epoch_domain_t* domain) {
     assert(domain->refcount == 0 && "epoch_domain_destroy called while domain is active");
     
     if (domain->auto_close) {
-        epoch_close(domain->alloc, domain->epoch_id);
+        /* Validate era before closing (prevent closing wrong epoch after wrap) */
+        uint64_t current_era = atomic_load_explicit(&domain->alloc->epoch_era[domain->epoch_id], memory_order_acquire);
+        if (current_era == domain->epoch_era) {
+            /* Era matches - safe to close */
+            epoch_close(domain->alloc, domain->epoch_id);
+        }
+        /* Era mismatch: epoch wrapped and reused, skip close */
     }
     
     free(domain);
@@ -111,9 +117,17 @@ void epoch_domain_destroy(epoch_domain_t* domain) {
 void epoch_domain_force_close(epoch_domain_t* domain) {
     if (!domain) return;
     
-    epoch_close(domain->alloc, domain->epoch_id);
-    domain->refcount = 0;
+    /* Safety: Only allow force-close when refcount is already 0 (no active scopes) */
+    assert(domain->refcount == 0 && "epoch_domain_force_close called with active scopes - use epoch_domain_exit instead");
     
+    /* Validate era before closing (prevent closing wrong epoch after wrap) */
+    uint64_t current_era = atomic_load_explicit(&domain->alloc->epoch_era[domain->epoch_id], memory_order_acquire);
+    if (current_era == domain->epoch_era) {
+        epoch_close(domain->alloc, domain->epoch_id);
+    }
+    /* Era mismatch: epoch wrapped and reused, skip close */
+    
+    /* Clear TLS if this was the current domain (though refcount=0 means we already exited) */
     if (tls_current_domain == domain) {
         tls_current_domain = NULL;
     }

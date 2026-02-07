@@ -207,8 +207,8 @@ struct SlabAllocator {
   _Atomic uint32_t epoch_state[EPOCH_COUNT];
   
   /* Phase 2.2: Monotonic epoch era for observability */
-  _Atomic uint64_t epoch_era_counter;  /* Increments on every epoch_advance */
-  uint64_t epoch_era[EPOCH_COUNT];     /* Era when each epoch was last activated */
+  _Atomic uint64_t epoch_era_counter;     /* Increments on every epoch_advance */
+  _Atomic uint64_t epoch_era[EPOCH_COUNT]; /* Era when each epoch was last activated (atomic for safe cross-thread reads) */
   
   /* Phase 2.3: Rich epoch metadata for debugging */
   EpochMetadata epoch_meta[EPOCH_COUNT];
