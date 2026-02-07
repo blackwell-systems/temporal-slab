@@ -447,6 +447,12 @@ void allocator_init(SlabAllocator* a) {
     atomic_store_explicit(&a->epoch_state[e], EPOCH_ACTIVE, memory_order_relaxed);
   }
   
+  /* Phase 2.2: Initialize era tracking for monotonic observability */
+  atomic_store_explicit(&a->epoch_era_counter, 0, memory_order_relaxed);
+  for (uint32_t e = 0; e < EPOCH_COUNT; e++) {
+    a->epoch_era[e] = 0;  /* Era 0 for all epochs at startup */
+  }
+  
   /* Zero out non-atomic fields (classes array) */
   for (size_t i = 0; i < k_num_classes; i++) {
     a->classes[i].epochs = NULL;
@@ -650,6 +656,7 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
     s->list_id = SLAB_LIST_NONE;
     s->cache_state = SLAB_ACTIVE;
     s->epoch_id = epoch_id;
+    s->era = a->epoch_era[epoch_id];  /* Phase 2.2: stamp era from epoch */
     s->slab_id = cached_id;  /* Restore ID from cache */
     atomic_store_explicit(&s->free_count, expected_count, memory_order_relaxed);
     
@@ -701,6 +708,7 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
   s->list_id = SLAB_LIST_NONE;
   s->cache_state = SLAB_ACTIVE;
   s->epoch_id = epoch_id;
+  s->era = a->epoch_era[epoch_id];  /* Phase 2.2: stamp era from epoch */
   s->slab_id = id;  /* Store registry ID */
 
   _Atomic uint32_t* bm = slab_bitmap_ptr(s);
@@ -1196,6 +1204,10 @@ void epoch_advance(SlabAllocator* a) {
   
   /* Mark new epoch as ACTIVE (overwrites CLOSING state on wrap-around) */
   atomic_store_explicit(&a->epoch_state[new_epoch], EPOCH_ACTIVE, memory_order_relaxed);
+  
+  /* Phase 2.2: Stamp era for monotonic observability */
+  uint64_t era = atomic_fetch_add_explicit(&a->epoch_era_counter, 1, memory_order_relaxed);
+  a->epoch_era[new_epoch] = era + 1;
   
   /* Null current_partial for old epoch across all size classes
    * This ensures no thread will allocate from a published slab in CLOSING epoch */
