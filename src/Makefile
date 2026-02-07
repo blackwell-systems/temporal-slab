@@ -64,6 +64,10 @@ slab_stats.o: slab_stats.c
 stats_dump: stats_dump.c slab_lib.o slab_stats.o
 	$(CC) $(CFLAGS) stats_dump.c slab_lib.o slab_stats.o -o stats_dump
 
+# Phase 2.2: Era stamping test
+test_era_stamping: test_era_stamping.c slab_lib.o
+	$(CC) $(CFLAGS) test_era_stamping.c slab_lib.o -o test_era_stamping
+
 clean:
 	rm -f smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump slab_lib.c slab_lib.o epoch_domain.o slab_stats.o benchmark_threads_tsan slab_lib_tsan.o tsan_test
 

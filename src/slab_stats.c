@@ -135,9 +135,8 @@ void slab_stats_epoch(SlabAllocator* alloc, uint32_t size_class, EpochId epoch, 
   out->object_size = sc->object_size;
   out->epoch_id = epoch;
   
-  /* Phase 2.2: Era stamping (will be populated when field is added to SlabAllocator) */
-  // out->epoch_era = alloc->epoch_era[epoch];
-  out->epoch_era = 0;
+  /* Phase 2.2: Era stamping for monotonic observability */
+  out->epoch_era = alloc->epoch_era[epoch];
   
   /* Read epoch lifecycle state */
   out->state = atomic_load_explicit(&alloc->epoch_state[epoch], memory_order_relaxed);

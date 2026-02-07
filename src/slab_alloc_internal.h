@@ -66,6 +66,9 @@ struct Slab {
   /* Epoch membership for temporal grouping */
   uint32_t epoch_id;
   
+  /* Phase 2.2: Era stamping for monotonic observability */
+  uint64_t era;  /* Era when slab was created/reused */
+  
   /* Registry ID for portable handle encoding + ABA protection */
   uint32_t slab_id;
 };
@@ -191,6 +194,10 @@ struct SlabAllocator {
   
   /* Per-epoch lifecycle state (ACTIVE=0 or CLOSING=1) */
   _Atomic uint32_t epoch_state[EPOCH_COUNT];
+  
+  /* Phase 2.2: Monotonic epoch era for observability */
+  _Atomic uint64_t epoch_era_counter;  /* Increments on every epoch_advance */
+  uint64_t epoch_era[EPOCH_COUNT];     /* Era when each epoch was last activated */
   
   /* Slab registry for portable handle encoding + ABA protection */
   SlabRegistry reg;
