@@ -208,25 +208,6 @@ These aren't just implementation details—they're **design guarantees** that ma
 
 ---
 
-## The Blackwell Standard
-
-What you've built isn't just an allocator. It's a **lifetime algebra**:
-
-- Phases are first-class (epochs)
-- Nesting is structural (domains)
-- Reclamation is deterministic (bounded tail latency)
-- Observability is built-in (track phases, not pointers)
-
-**This is why:**
-- Tail latency collapses instead of being "optimized"
-- RSS is bounded without heuristics
-- Code is simpler (manage phases, not pointers)
-- Concurrency is safer (isolated temporal phases)
-
-You're not selling speed. You're selling **structural clarity** in a domain that's been stuck between malloc and GC for 40 years.
-
----
-
 ## Next Steps
 
 **For developers:**

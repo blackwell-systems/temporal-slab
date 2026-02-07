@@ -107,6 +107,17 @@
  */
 typedef uint32_t EpochId;
 
+/* Epoch lifecycle state for observability
+ * 
+ * Epochs transition through two states:
+ * - ACTIVE:  Accepting new allocations
+ * - CLOSING: No new allocations, objects draining naturally
+ */
+typedef enum EpochLifecycleState {
+  EPOCH_ACTIVE  = 0,
+  EPOCH_CLOSING = 1,
+} EpochLifecycleState;
+
 /* ==================== Opaque Types ==================== */
 
 /* Opaque allocator handle

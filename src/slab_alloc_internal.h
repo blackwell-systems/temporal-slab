@@ -21,12 +21,6 @@
 /* Epoch configuration */
 #define EPOCH_COUNT 16u  /* Ring buffer size (power of 2 for fast modulo) */
 
-/* Epoch lifecycle state */
-typedef enum EpochLifecycleState {
-  EPOCH_ACTIVE  = 0,  /* Accepting new allocations */
-  EPOCH_CLOSING = 1,  /* No new allocations, draining only */
-} EpochLifecycleState;
-
 /* Slab list membership (partial/full lists, protected by sc->lock) */
 typedef enum SlabListId {
   SLAB_LIST_PARTIAL = 0,
@@ -161,6 +155,15 @@ struct SizeClassAlloc {
   /* Phase 2: Empty slab recycling counters */
   _Atomic uint64_t empty_slab_recycled;         /* empty slab pushed to cache */
   _Atomic uint64_t empty_slab_cache_overflowed; /* cache full, pushed to overflow */
+  
+  /* Phase 2.0: Slow-path attribution counters */
+  _Atomic uint64_t slow_path_cache_miss;        /* new_slab needed mmap */
+  _Atomic uint64_t slow_path_epoch_closed;      /* allocation rejected (epoch CLOSING) */
+  
+  /* Phase 2.0: RSS reclamation tracking */
+  _Atomic uint64_t madvise_calls;               /* madvise(MADV_DONTNEED) invocations */
+  _Atomic uint64_t madvise_bytes;               /* Total bytes passed to madvise */
+  _Atomic uint64_t madvise_failures;            /* madvise() returned error */
 
   /* Slab cache: free page stack to avoid mmap() in hot path */
   CachedSlab* slab_cache;  /* Changed to store (Slab*, slab_id) pairs */
