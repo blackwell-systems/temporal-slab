@@ -17,7 +17,7 @@ The allocator provides a lock-free fast path, conservative recycling guarantees,
 
 **Roadmap to RSS Competitiveness:**
 
-temporal-slab today achieves **RSS stability** (0% growth under steady churn) and **competitive normalized efficiency** (RSS/allocated comparable or better than malloc). However, it does not actively return physical memory to the OS during runtime.
+temporal-slab achieves **RSS stability** (0% growth under steady churn), **competitive normalized efficiency** (RSS/allocated comparable or better than malloc), and **epoch-scoped RSS reclamation** - returning physical memory to the OS at application-controlled lifetime boundaries.
 
 **Three deliberate design choices cause higher absolute RSS:**
 1. No runtime `munmap()` - guarantees stale handles are safe
@@ -26,17 +26,24 @@ temporal-slab today achieves **RSS stability** (0% growth under steady churn) an
 
 **Path forward (maintaining safety guarantees):**
 
-**Phase 1: `madvise(MADV_DONTNEED)` on Empty Slabs**
-- Real RSS drops without redesigning handles
-- Safety contract intact (no segfaults from unmapped slabs)
-- Strategy: `madvise()` slabs that are empty and belong to CLOSING epochs
-- Expected: RSS drops back toward live set after epoch expiration
+**Phase 1+2: Epoch-Scoped RSS Reclamation (IMPLEMENTED)**
 
-**Phase 2: `epoch_close()` + Lifetime-Aligned Reclamation**
-- The unique differentiator: RSS reclaim at **epoch granularity**, not hole granularity
-- Predictable reclamation: "close epoch → no new allocs → when empty, reclaim"
-- Impossible with malloc: general allocators can't safely know when lifetime phases end
-- Claim after implementation: "Returns memory at epoch granularity, deterministic RSS behavior aligned with application lifetime phases"
+**Status: Complete** - Critical bug fixed, production safety hardened, validated in benchmarks
+
+**Implementation:**
+- Phase 1: `madvise(MADV_DONTNEED)` on empty slabs in CLOSING epochs
+- Phase 2: `epoch_close()` API + aggressive reclamation policy
+- Critical fix: Overflow slab_id corruption (CachedNode off-page storage)
+- Safety improvements: 24-bit generation, 2-bit versioning, memory ordering
+
+**Benchmark Results** (epoch_rss_bench):
+- 19.15 MiB marked reclaimable across 5 epochs (4,903 slabs)
+- 3.3% overall RSS drop under memory pressure (kernel advisory behavior)
+- 100% cache hit rate (perfect slab reuse)
+- Pattern: Small epochs approach 100% reclaim, large epochs ~2%
+
+**Key Achievement:**
+Returns memory at **epoch granularity** - when application lifetime phases end, not when allocator heuristics decide. Traditional allocators cannot provide this capability.
 
 **Phase 3: Handle Indirection + `munmap()` (Graduate-Level)**
 - Architecture: `handle → slab_id → slab_table[generation, state, ptr] → slab`
