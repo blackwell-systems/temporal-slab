@@ -186,13 +186,13 @@ struct SizeClassAlloc {
 
 /* Phase 2.3: Epoch metadata for rich observability */
 typedef struct EpochMetadata {
-  uint64_t open_since_ns;       /* Timestamp when epoch became ACTIVE (0 if never opened) */
-  _Atomic uint64_t alloc_count; /* Number of live allocations in this epoch */
-  char label[32];               /* Semantic label (e.g., "request_id:abc", "frame:1234") */
+  uint64_t open_since_ns;           /* Timestamp when epoch became ACTIVE (0 if never opened) */
+  _Atomic uint64_t domain_refcount; /* Domain scopes (enter/exit tracking) - Phase 2.3 */
+  char label[32];                   /* Semantic label (e.g., "request_id:abc", "frame:1234") */
   
   /* Phase 2.4: RSS delta tracking for reclamation quantification */
-  uint64_t rss_before_close;    /* RSS snapshot at start of epoch_close() (0 if never closed) */
-  uint64_t rss_after_close;     /* RSS snapshot at end of epoch_close() (0 if never closed) */
+  uint64_t rss_before_close;        /* RSS snapshot at start of epoch_close() (0 if never closed) */
+  uint64_t rss_after_close;         /* RSS snapshot at end of epoch_close() (0 if never closed) */
 } EpochMetadata;
 
 /* Main allocator structure */
@@ -212,6 +212,7 @@ struct SlabAllocator {
   
   /* Phase 2.3: Rich epoch metadata for debugging */
   EpochMetadata epoch_meta[EPOCH_COUNT];
+  pthread_mutex_t epoch_label_lock;  /* Protects label writes (rare, cold path) */
   
   /* Slab registry for portable handle encoding + ABA protection */
   SlabRegistry reg;
