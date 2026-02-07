@@ -45,6 +45,9 @@ typedef enum SlabCacheState {
 typedef struct Slab Slab;
 typedef struct SlabList SlabList;
 typedef struct SizeClassAlloc SizeClassAlloc;
+typedef struct SlabRegistry SlabRegistry;
+typedef struct SlabMeta SlabMeta;
+typedef struct CachedSlab CachedSlab;
 
 /* Internal slab structure */
 struct Slab {
@@ -69,8 +72,55 @@ struct Slab {
   /* Epoch membership for temporal grouping */
   uint32_t epoch_id;
   
-  uint8_t _pad[2];
+  /* Registry ID for portable handle encoding + ABA protection */
+  uint32_t slab_id;
 };
+
+/* Slab registry metadata (generation stored outside page for madvise safety) */
+struct SlabMeta {
+  _Atomic(Slab*) ptr;        /* NULL if unmapped/unused */
+  _Atomic uint32_t gen;      /* Monotonically increases on reuse (ABA protection) */
+};
+
+/* Slab registry for portable handle encoding */
+struct SlabRegistry {
+  SlabMeta* metas;
+  uint32_t cap;
+  
+  /* Simple ID allocator */
+  uint32_t* free_ids;
+  uint32_t free_count;
+  uint32_t next_id;
+  
+  pthread_mutex_t lock;
+};
+
+/* Cache entry storing both slab pointer and ID (survives madvise)
+ * 
+ * INVARIANT: Any slab that may be madvised must have its reuse metadata
+ * stored off-page (slab_id, etc.). Never read slab_id from the slab header
+ * on reuse - it may have been zeroed by madvise(MADV_DONTNEED).
+ * 
+ * Both array cache (CachedSlab) and overflow cache (CachedNode) follow this
+ * invariant: (slab*, slab_id) pairs stored off-page, stable across madvise.
+ */
+struct CachedSlab {
+  Slab* slab;
+  uint32_t slab_id;
+};
+
+/* Overflow cache node (stores slab_id off-page for madvise safety)
+ * 
+ * CRITICAL: When overflow slabs are madvised, slab_id in slab header is zeroed.
+ * We must store slab_id in this node (off-page) to prevent corruption on reuse.
+ * This matches the array cache invariant above.
+ */
+typedef struct CachedNode {
+  struct CachedNode* prev;
+  struct CachedNode* next;
+  Slab* slab;
+  uint32_t slab_id;
+} CachedNode;
 
 /* Intrusive doubly-linked list */
 struct SlabList {
@@ -113,13 +163,16 @@ struct SizeClassAlloc {
   _Atomic uint64_t empty_slab_cache_overflowed; /* cache full, pushed to overflow */
 
   /* Slab cache: free page stack to avoid mmap() in hot path */
-  Slab** slab_cache;
+  CachedSlab* slab_cache;  /* Changed to store (Slab*, slab_id) pairs */
   size_t cache_capacity;
   size_t cache_size;
   pthread_mutex_t cache_lock;
   
-  /* Overflow list: bounded tracking of slabs when cache is full */
-  SlabList cache_overflow;
+  /* Overflow list: bounded tracking of slabs when cache is full
+   * Uses CachedNode to store slab_id off-page (survives madvise) */
+  CachedNode* cache_overflow_head;
+  CachedNode* cache_overflow_tail;
+  size_t cache_overflow_len;
 };
 
 /* Main allocator structure */
@@ -132,6 +185,9 @@ struct SlabAllocator {
   
   /* Per-epoch lifecycle state (ACTIVE=0 or CLOSING=1) */
   _Atomic uint32_t epoch_state[EPOCH_COUNT];
+  
+  /* Slab registry for portable handle encoding + ABA protection */
+  SlabRegistry reg;
 };
 
 #endif /* SLAB_ALLOC_INTERNAL_H */
