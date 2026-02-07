@@ -32,7 +32,7 @@ void slab_stats_global(SlabAllocator* alloc, SlabGlobalStats* out) {
     
     /* Performance totals */
     out->total_slow_path_hits += atomic_load_explicit(&sc->slow_path_hits, memory_order_relaxed);
-    out->total_cache_overflows += atomic_load_explicit(&sc->empty_slab_cache_overflowed, memory_order_relaxed);
+    out->total_cache_overflows += atomic_load_explicit(&sc->empty_slab_overflowed, memory_order_relaxed);
     
     /* Phase 2.0: Slow-path attribution */
     out->total_slow_cache_miss += atomic_load_explicit(&sc->slow_path_cache_miss, memory_order_relaxed);
@@ -76,7 +76,7 @@ void slab_stats_class(SlabAllocator* alloc, uint32_t size_class, SlabClassStats*
   out->current_partial_null = atomic_load_explicit(&sc->current_partial_null, memory_order_relaxed);
   out->current_partial_full = atomic_load_explicit(&sc->current_partial_full, memory_order_relaxed);
   out->empty_slab_recycled = atomic_load_explicit(&sc->empty_slab_recycled, memory_order_relaxed);
-  out->empty_slab_overflowed = atomic_load_explicit(&sc->empty_slab_cache_overflowed, memory_order_relaxed);
+  out->empty_slab_overflowed = atomic_load_explicit(&sc->empty_slab_overflowed, memory_order_relaxed);
   
   /* Phase 2.0: Slow-path attribution counters */
   out->slow_path_cache_miss = atomic_load_explicit(&sc->slow_path_cache_miss, memory_order_relaxed);
