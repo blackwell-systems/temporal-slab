@@ -1,23 +1,27 @@
 /*
- * stats_dump - Observability example for temporal-slab
+ * stats_dump - Observability tool for temporal-slab
  * 
  * Demonstrates dual output pattern:
  * - JSON to stdout (stable contract for tooling, jq, Prometheus, CI diffs)
  * - Text to stderr (human-readable debugging without polluting pipes)
  * 
+ * Phase 3: Added --doctor mode for actionable diagnostics
+ * 
  * Usage:
- *   ./stats_dump [--json] [--text]
- *   Default: both enabled
+ *   ./stats_dump [--json] [--text] [--doctor]
+ *   Default: --json --text (both outputs)
  *   
  * Examples:
  *   ./stats_dump                    # Both outputs
  *   ./stats_dump | jq .             # JSON only (pipe-friendly)
  *   ./stats_dump --no-json          # Text only to stderr
  *   ./stats_dump 2>/dev/null        # JSON only to stdout
+ *   ./stats_dump --doctor           # Actionable diagnostics (Phase 3)
  */
 
 #include <slab_alloc.h>
 #include <slab_stats.h>
+#include <slab_diagnostics.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +33,7 @@
 /* Command-line flags */
 static bool flag_json = true;
 static bool flag_text = true;
+static bool flag_doctor = false;
 
 static void parse_args(int argc, char** argv) {
   for (int i = 1; i < argc; i++) {
@@ -40,8 +45,12 @@ static void parse_args(int argc, char** argv) {
       flag_text = true;
     } else if (strcmp(argv[i], "--no-text") == 0) {
       flag_text = false;
+    } else if (strcmp(argv[i], "--doctor") == 0) {
+      flag_doctor = true;
+      flag_json = false;  /* Doctor mode replaces JSON */
+      flag_text = false;  /* Doctor mode replaces text */
     } else {
-      fprintf(stderr, "Usage: %s [--json] [--no-json] [--text] [--no-text]\n", argv[0]);
+      fprintf(stderr, "Usage: %s [--json] [--no-json] [--text] [--no-text] [--doctor]\n", argv[0]);
       exit(1);
     }
   }
@@ -229,6 +238,138 @@ static void run_workload(SlabAllocator* alloc) {
   }
 }
 
+/* ==================== Doctor Mode (Phase 3) ==================== */
+
+static void print_doctor_diagnostics(SlabAllocator* alloc) {
+  fprintf(stderr, "\n");
+  fprintf(stderr, "═══════════════════════════════════════════════════════════════\n");
+  fprintf(stderr, "  ALLOCATOR DIAGNOSTICS (Phase 3 --doctor mode)\n");
+  fprintf(stderr, "═══════════════════════════════════════════════════════════════\n\n");
+  
+  /* 1. Epoch Leak Detection */
+  fprintf(stderr, "━━━ 1. EPOCH LEAK DETECTION ━━━\n\n");
+  
+  EpochLeakReport leak_report;
+  uint32_t leak_count = slab_detect_epoch_leaks(alloc, 60, 10, &leak_report);
+  
+  if (leak_count == 0) {
+    fprintf(stderr, "  ✓ No epoch leaks detected (threshold: %usec)\n\n", leak_report.threshold_sec);
+  } else {
+    fprintf(stderr, "  ⚠ Found %u leak candidate(s) (showing top %u):\n\n", 
+            leak_count, leak_report.top_count);
+    
+    for (uint32_t i = 0; i < leak_report.top_count; i++) {
+      EpochLeakCandidate* c = &leak_report.candidates[i];
+      fprintf(stderr, "  [%u] Class %u (%uB), Epoch %u (era %lu)\n",
+              i + 1, c->class_index, c->object_size, c->epoch_id, c->epoch_era);
+      fprintf(stderr, "      Age:       %lu seconds (stuck!)\n", c->age_sec);
+      fprintf(stderr, "      Refcount:  %lu live allocations\n", c->alloc_count);
+      fprintf(stderr, "      RSS:       %.2f MB\n", c->estimated_rss_bytes / 1024.0 / 1024);
+      fprintf(stderr, "      Slabs:     %u partial, %u full, %u reclaimable\n",
+              c->partial_slab_count, c->full_slab_count, c->reclaimable_slab_count);
+      
+      if (c->label[0] != '\0') {
+        fprintf(stderr, "      Label:     '%s'\n", c->label);
+      }
+      
+      fprintf(stderr, "      → ACTION: Investigate why objects from this epoch haven't been freed\n");
+      if (c->reclaimable_slab_count > 0) {
+        fprintf(stderr, "                (Note: %u slabs are empty but not recycled yet)\n",
+                c->reclaimable_slab_count);
+      }
+      fprintf(stderr, "\n");
+    }
+    
+    free(leak_report.candidates);
+  }
+  
+  /* 2. Slow-Path Root Cause Analysis */
+  fprintf(stderr, "━━━ 2. SLOW-PATH ROOT CAUSE ANALYSIS ━━━\n\n");
+  
+  SlowPathReport slow_report;
+  slab_analyze_slow_path(alloc, &slow_report);
+  
+  bool found_slow_path = false;
+  for (uint32_t i = 0; i < slow_report.class_count; i++) {
+    SlowPathAttribution* attr = &slow_report.classes[i];
+    if (attr->total_slow_path_hits > 0) {
+      found_slow_path = true;
+      
+      fprintf(stderr, "  Class %u (%uB): %lu slow-path hits\n",
+              attr->class_index, attr->object_size, attr->total_slow_path_hits);
+      fprintf(stderr, "    Attribution breakdown:\n");
+      fprintf(stderr, "      Cache miss:    %lu (%.1f%%) - needed new slab from OS\n",
+              attr->cache_miss_count, attr->cache_miss_pct);
+      fprintf(stderr, "      Epoch closed:  %lu (%.1f%%) - allocation into CLOSING epoch\n",
+              attr->epoch_closed_count, attr->epoch_closed_pct);
+      fprintf(stderr, "      Partial null:  %lu (%.1f%%) - no cached current_partial\n",
+              attr->partial_null_count, attr->partial_null_pct);
+      fprintf(stderr, "      Partial full:  %lu (%.1f%%) - current_partial exhausted\n",
+              attr->partial_full_count, attr->partial_full_pct);
+      fprintf(stderr, "    → %s\n\n", attr->recommendation);
+    }
+  }
+  
+  if (!found_slow_path) {
+    fprintf(stderr, "  ✓ No significant slow-path activity (all allocations fast)\n\n");
+  }
+  
+  free(slow_report.classes);
+  
+  /* 3. Reclamation Effectiveness Report */
+  fprintf(stderr, "━━━ 3. RECLAMATION EFFECTIVENESS ━━━\n\n");
+  
+  ReclamationReport reclaim_report;
+  slab_analyze_reclamation(alloc, &reclaim_report);
+  
+  fprintf(stderr, "  Aggregate reclamation:\n");
+  fprintf(stderr, "    madvise() calls:    %lu\n", reclaim_report.total_madvise_calls);
+  fprintf(stderr, "    madvise() bytes:    %.2f MB\n", 
+          reclaim_report.total_madvise_bytes / 1024.0 / 1024);
+  fprintf(stderr, "    madvise() failures: %lu\n", reclaim_report.total_madvise_failures);
+  
+  if (reclaim_report.total_madvise_failures > 0) {
+    fprintf(stderr, "    ⚠ madvise failures detected - check permissions or kernel config\n");
+  }
+  fprintf(stderr, "\n");
+  
+  if (reclaim_report.epoch_count == 0) {
+    fprintf(stderr, "  (No epochs have been closed yet - no RSS deltas to report)\n\n");
+  } else {
+    fprintf(stderr, "  Per-epoch RSS deltas (%u closed epochs):\n\n", reclaim_report.epoch_count);
+    
+    for (uint32_t i = 0; i < reclaim_report.epoch_count; i++) {
+      EpochReclamation* e = &reclaim_report.epochs[i];
+      
+      fprintf(stderr, "    Epoch %u (class %u, era %lu):\n",
+              e->epoch_id, e->class_index, e->epoch_era);
+      fprintf(stderr, "      RSS before: %.2f MB\n", e->rss_before / 1024.0 / 1024);
+      fprintf(stderr, "      RSS after:  %.2f MB\n", e->rss_after / 1024.0 / 1024);
+      
+      if (e->rss_delta < 0) {
+        fprintf(stderr, "      Delta:      %.2f MB reclaimed ✓\n", 
+                -e->rss_delta / 1024.0 / 1024);
+      } else if (e->rss_delta > 0) {
+        fprintf(stderr, "      Delta:      +%.2f MB (increased - system activity?)\n",
+                e->rss_delta / 1024.0 / 1024);
+      } else {
+        fprintf(stderr, "      Delta:      unchanged\n");
+      }
+      
+      if (e->label[0] != '\0') {
+        fprintf(stderr, "      Label:      '%s'\n", e->label);
+      }
+      fprintf(stderr, "\n");
+    }
+  }
+  
+  free(reclaim_report.epochs);
+  
+  fprintf(stderr, "═══════════════════════════════════════════════════════════════\n");
+  fprintf(stderr, "  END DIAGNOSTICS\n");
+  fprintf(stderr, "═══════════════════════════════════════════════════════════════\n");
+}
+
 /* ==================== Main ==================== */
 
 int main(int argc, char** argv) {
@@ -243,15 +384,20 @@ int main(int argc, char** argv) {
   /* Run simulated workload */
   run_workload(alloc);
   
-  /* Output stats */
-  if (flag_json) {
-    print_json_global(alloc);
-  }
-  
-  if (flag_text) {
-    print_text_global(alloc);
-    for (uint32_t cls = 0; cls < 8; cls++) {
-      print_text_class(alloc, cls);
+  /* Output mode selection */
+  if (flag_doctor) {
+    print_doctor_diagnostics(alloc);
+  } else {
+    /* Standard dual-output mode */
+    if (flag_json) {
+      print_json_global(alloc);
+    }
+    
+    if (flag_text) {
+      print_text_global(alloc);
+      for (uint32_t cls = 0; cls < 8; cls++) {
+        print_text_class(alloc, cls);
+      }
     }
   }
   
