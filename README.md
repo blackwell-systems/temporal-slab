@@ -1,10 +1,8 @@
 # temporal-slab
 
-**temporal-slab is a high-performance slab allocator for small, fixed-size objects in long-running systems where latency predictability and memory stability matter more than generality.**
+**temporal-slab is a lifetime-aware slab allocator for fixed-size objects, optimized for predictable latency and bounded RSS in churn-heavy systems.**
 
-It is designed for workloads with **sustained allocation churn**, **narrow size distributions**, and **clear lifetime phases**—cases where general-purpose allocators exhibit tail-latency spikes or RSS drift over time.
-
-Unlike traditional allocators that fight fragmentation reactively, temporal-slab organizes memory around **temporal affinity**: objects allocated around the same time are placed together, reused together, and reclaimed together.
+It replaces spatial hole-finding with temporal grouping, enabling deterministic memory reuse and application-controlled reclamation at epoch boundaries—without unsafe unmapping or background compaction.
 
 ---
 
