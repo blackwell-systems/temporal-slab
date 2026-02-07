@@ -169,7 +169,7 @@ epoch_domain_destroy(domain);
 
 ---
 
-### 5. Lock-Free Fast Path (97% Contention-Free Allocation)
+### 6. Lock-Free Fast Path (97% Contention-Free Allocation)
 
 **Architecture**:
 - **Per-epoch `current_partial` pointer** (atomic, lock-free read)
@@ -188,7 +188,111 @@ epoch_domain_destroy(domain);
 
 ---
 
-### 6. ABA-Safe Handle Validation (Portable, No UAF)
+### 5. Production Observability (Phase 2.0 - Attribution-Based Diagnostics)
+
+**Problem Solved**: When tail latency spikes or RSS grows unbounded, traditional allocators offer no visibility into *why*.
+
+**Our Solution**: Versioned snapshot-based observability that answers four critical questions:
+
+#### A. Why did we go slow?
+
+Slow-path attribution counters pinpoint exact cause:
+
+```c
+SlabClassStats cs;
+slab_stats_class(alloc, 2, &cs);  // 128-byte class
+
+printf("Slow path breakdown:\n");
+printf("  cache miss:    %lu (needed mmap)\n", cs.slow_path_cache_miss);
+printf("  epoch closed:  %lu (allocation rejected)\n", cs.slow_path_epoch_closed);
+printf("  partial null:  %lu (no cached slab)\n", cs.current_partial_null);
+printf("  partial full:  %lu (cached slab exhausted)\n", cs.current_partial_full);
+```
+
+**Commercial value**: "Why did latency spike at 3am?" → Precise attribution eliminates guesswork.
+
+#### B. Why is RSS not dropping?
+
+madvise tracking shows reclamation effectiveness:
+
+```c
+SlabGlobalStats gs;
+slab_stats_global(alloc, &gs);
+
+printf("RSS reclamation:\n");
+printf("  madvise calls:    %lu\n", gs.total_madvise_calls);
+printf("  bytes reclaimed:  %.2f MB\n", gs.total_madvise_bytes / 1024.0 / 1024);
+printf("  failures:         %lu\n", gs.total_madvise_failures);
+```
+
+**Commercial value**: "RSS stuck at 10GB after epoch close" → madvise_failures reveals kernel/permission issue.
+
+#### C. What's happening per epoch?
+
+Epoch-level visibility shows memory distribution:
+
+```c
+SlabEpochStats es;
+slab_stats_epoch(alloc, 2, 5, &es);  // Class 2, Epoch 5
+
+printf("Epoch %u (%s):\n", es.epoch_id, 
+       es.state == EPOCH_ACTIVE ? "ACTIVE" : "CLOSING");
+printf("  Slabs: %u partial, %u full (%.2f KB RSS)\n",
+       es.partial_slab_count, es.full_slab_count,
+       es.estimated_rss_bytes / 1024.0);
+printf("  Reclaimable: %u slabs (%.2f KB)\n",
+       es.reclaimable_slab_count, es.reclaimable_bytes / 1024.0);
+```
+
+**Commercial value**: "Which epoch is leaking memory?" → Per-epoch RSS footprint shows culprit.
+
+#### D. What's the allocator shape right now?
+
+Snapshot visibility for capacity planning:
+
+```c
+slab_stats_class(alloc, 2, &cs);
+
+printf("Cache state:\n");
+printf("  Array:    %u/%u\n", cs.cache_size, cs.cache_capacity);
+printf("  Overflow: %u\n", cs.cache_overflow_len);
+printf("  Recycle rate: %.1f%%\n", cs.recycle_rate_pct);
+
+printf("Slab distribution:\n");
+printf("  Partial: %u | Full: %u\n", cs.total_partial_slabs, cs.total_full_slabs);
+```
+
+**Commercial value**: "Should we increase cache size?" → 95%+ recycle rate means cache is sized correctly.
+
+#### Observability Tool: stats_dump
+
+Dual-output pattern for production use:
+
+```bash
+# JSON for tooling (jq, Prometheus, CI diffs)
+./stats_dump --no-text | jq '.classes[2].slow_path_cache_miss'
+
+# Text for human debugging
+./stats_dump --no-json 2>&1 | grep "madvise"
+
+# Both simultaneously (default)
+./stats_dump | jq . 2>&1 | less
+```
+
+**Key features**:
+- **Stable contract**: JSON keys match struct field names exactly
+- **Versioned API**: `SLAB_STATS_VERSION` for forward compatibility
+- **Zero overhead**: Relaxed atomic reads on slow paths only
+- **Snapshot semantics**: Point-in-time view (~100µs cost)
+
+**Diagnostic patterns enabled**:
+- **RSS not dropping**: Check `madvise_failures` → kernel issue
+- **High slow-path rate**: Check attribution → tune cache or fix epoch usage
+- **Memory leak**: Per-epoch RSS shows which epoch won't drain
+
+---
+
+### 7. ABA-Safe Handle Validation (Portable, No UAF)
 
 **Problem Solved**: Stale handles must not cause crashes or use-after-free.
 
@@ -212,32 +316,6 @@ epoch_domain_destroy(domain);
 - **Double-free**: Detected by bitmap check (no corruption)
 - **Use-after-free**: Impossible (freed memory stays in slab until epoch close)
 - **Cross-platform**: Works on all architectures (no pointer tagging)
-
----
-
-### 7. Performance Telemetry (Attribution & Observability)
-
-**Built-in counters** for every size class:
-- `slow_path_hits` - Lock contention events
-- `new_slab_count` - Fresh page allocations
-- `list_move_partial_to_full` - Slab state transitions
-- `list_move_full_to_partial` - Freed object impact
-- `current_partial_null` - Cache miss rate
-- `current_partial_full` - False positive attempts
-- `empty_slab_recycled` - RSS reclamation activity
-- `empty_slab_overflowed` - Cache overflow rate
-
-**API**:
-```c
-PerfCounters counters;
-get_perf_counters(alloc, size_class, &counters);
-```
-
-**Use Cases**:
-- Diagnose slow-path hotspots
-- Validate cache hit rates (target: >95%)
-- Monitor RSS reclamation effectiveness
-- Capacity planning (slabs allocated vs cached)
 
 ---
 

@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include -DENABLE_RSS_RECLAMATION=1
 
-all: smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage
+all: smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump
 
 # Core library object (implementation only, no main)
 slab_lib.c: slab_alloc.c
@@ -44,7 +44,14 @@ test_malloc_wrapper: test_malloc_wrapper.c slab_lib.o
 domain_usage: ../examples/domain_usage.c slab_lib.o epoch_domain.o
 	$(CC) $(CFLAGS) ../examples/domain_usage.c slab_lib.o epoch_domain.o -o domain_usage
 
+# Phase 2.0: Observability stats snapshot tool
+slab_stats.o: slab_stats.c
+	$(CC) $(CFLAGS) -c slab_stats.c -o slab_stats.o
+
+stats_dump: stats_dump.c slab_lib.o slab_stats.o
+	$(CC) $(CFLAGS) stats_dump.c slab_lib.o slab_stats.o -o stats_dump
+
 clean:
-	rm -f smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage slab_lib.c slab_lib.o epoch_domain.o
+	rm -f smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump slab_lib.c slab_lib.o epoch_domain.o slab_stats.o
 
 .PHONY: all clean

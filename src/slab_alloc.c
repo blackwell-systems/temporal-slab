@@ -487,6 +487,15 @@ void allocator_init(SlabAllocator* a) {
     atomic_store_explicit(&a->classes[i].current_partial_full, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].empty_slab_recycled, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].empty_slab_cache_overflowed, 0, memory_order_relaxed);
+    
+    /* Phase 2.0: Initialize slow-path attribution counters */
+    atomic_store_explicit(&a->classes[i].slow_path_cache_miss, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].slow_path_epoch_closed, 0, memory_order_relaxed);
+    
+    /* Phase 2.0: Initialize RSS reclamation tracking counters */
+    atomic_store_explicit(&a->classes[i].madvise_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].madvise_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].madvise_failures, 0, memory_order_relaxed);
 
     /* Initialize slab cache (32 pages per size class = 128KB) */
     a->classes[i].cache_capacity = 32;
@@ -603,7 +612,13 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
    * - CLOSING epochs: empty slabs recycled + madvised (RSS drops)
    */
   #if ENABLE_RSS_RECLAMATION && defined(__linux__)
-  (void)madvise(s, SLAB_PAGE_SIZE, MADV_DONTNEED);
+  atomic_fetch_add_explicit(&sc->madvise_calls, 1, memory_order_relaxed);
+  int ret = madvise(s, SLAB_PAGE_SIZE, MADV_DONTNEED);
+  if (ret == 0) {
+    atomic_fetch_add_explicit(&sc->madvise_bytes, SLAB_PAGE_SIZE, memory_order_relaxed);
+  } else {
+    atomic_fetch_add_explicit(&sc->madvise_failures, 1, memory_order_relaxed);
+  }
   /* Non-fatal: RSS stays high if this fails, but no functional impact */
   #endif
 }
@@ -652,6 +667,9 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
 
   /* Cache miss - allocate new page */
   atomic_fetch_add_explicit(&sc->new_slab_count, 1, memory_order_relaxed);
+  
+  /* Phase 2.0: Attribute slow-path to cache miss (needed mmap) */
+  atomic_fetch_add_explicit(&sc->slow_path_cache_miss, 1, memory_order_relaxed);
   
   void* page = map_one_page();
   if (!page) return NULL;
@@ -768,13 +786,15 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
   
   if (epoch >= a->epoch_count) return NULL;  /* Invalid epoch */
   
+  SizeClassAlloc* sc = &a->classes[(size_t)ci];
+  
   /* CRITICAL: Refuse allocations into CLOSING epochs */
   uint32_t state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_acquire);
   if (state != EPOCH_ACTIVE) {
+    /* Phase 2.0: Attribute slow-path rejection to CLOSING epoch */
+    atomic_fetch_add_explicit(&sc->slow_path_epoch_closed, 1, memory_order_relaxed);
     return NULL;  /* Epoch is not active (draining or invalid state) */
   }
-
-  SizeClassAlloc* sc = &a->classes[(size_t)ci];
   EpochState* es = get_epoch_state(sc, epoch);
 
   /* Fast path: try current_partial for this epoch */

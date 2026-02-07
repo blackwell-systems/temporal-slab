@@ -6,6 +6,51 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Phase 2.0: Observability System
+
+#### Added
+- **Stats API** - Versioned snapshot-based observability for production diagnostics
+  - `slab_stats_global()` - Aggregate stats across all size classes and epochs
+  - `slab_stats_class()` - Per-size-class diagnostics with derived metrics
+  - `slab_stats_epoch()` - Per-epoch visibility with reclaimable slab estimation
+  - `EpochLifecycleState` - Public enum (ACTIVE/CLOSING) for observability
+- **Attribution Counters** - Answer "why slow?" with precise attribution:
+  - `slow_path_cache_miss` - Allocation needed new slab from OS (mmap)
+  - `slow_path_epoch_closed` - Allocation rejected (epoch CLOSING)
+  - Existing counters: `current_partial_null`, `current_partial_full`
+- **RSS Reclamation Tracking** - Answer "why RSS not dropping?":
+  - `madvise_calls` - Number of madvise(MADV_DONTNEED) invocations
+  - `madvise_bytes` - Total bytes reclaimed via madvise
+  - `madvise_failures` - madvise() system call failures
+- **Observability Tool** - `stats_dump` with dual output pattern:
+  - JSON to stdout (stable contract for tooling, jq, Prometheus, CI diffs)
+  - Text to stderr (human-readable debugging without polluting pipes)
+  - Flags: `--json`, `--no-json`, `--text`, `--no-text`
+- **Derived Metrics** - Computed in snapshot functions:
+  - `recycle_rate_pct` - Cache effectiveness (100 × recycled / [recycled + overflowed])
+  - `net_slabs` - Memory growth tracking (allocated - recycled)
+  - `estimated_rss_bytes` - Predicted RSS footprint per class/epoch
+- **Forward Compatibility** - `SLAB_STATS_VERSION` constant for API evolution
+
+#### Changed
+- Exposed `EpochLifecycleState` enum in public API (`include/slab_alloc.h`)
+- Counter initialization in `allocator_init()` - all Phase 2.0 counters zeroed
+- Instrumentation added at three key code points (minimal fast-path impact):
+  - `alloc_obj_epoch()` line 795 - epoch rejection attribution
+  - `new_slab()` line 657 - cache miss attribution  
+  - `cache_push()` lines 606-612 - madvise tracking
+
+#### Performance
+- **No regression**: p50: 31ns, p99: 1568ns, p999: 2818ns (unchanged)
+- **Overhead**: Five relaxed atomic increments on slow paths only
+- **Snapshot cost**: O(classes × epochs) = O(128) iterations + brief locks (~100µs)
+
+#### Documentation
+- `docs/OBSERVABILITY_DESIGN.md` - Phase 2.0/2.1/2.2 roadmap with diagnostic patterns
+- `include/slab_stats.h` - Comprehensive API documentation with usage examples
+
+---
+
 ### Phase 3: Epoch Domains (RAII Memory Management)
 
 #### Added
