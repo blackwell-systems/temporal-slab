@@ -373,7 +373,7 @@ P99.99 latency: ~10µs   (even with high load)
 | **P99.9 latency** | ~1ms | ~2µs (500x better) |
 | **Tail bound** | Unbounded | Bounded by cache miss |
 | **Reclamation pauses** | Yes (during alloc/free) | No (deferred to epoch_close) |
-| **Observable tail** | ❌ | ✅ "Slow-path rate" panel |
+| **Observable tail** | No | "Slow-path rate" panel |
 
 ---
 
@@ -385,13 +385,13 @@ P99.99 latency: ~10µs   (even with high load)
 | **P50 Latency** | ~100ns | ~100ns |
 | **P99 Latency** | ~10µs | ~500ns (20x better) |
 | **P99.9 Latency** | ~1ms | ~2µs (500x better) |
-| **Tail predictability** | ❌ Unbounded | ✅ Bounded |
-| **RSS attribution** | ❌ | ✅ Per-epoch |
-| **Leak detection** | ❌ | ✅ < 60s to detection |
-| **Size-class analysis** | ❌ | ✅ Real-time dashboards |
-| **Kernel reclamation** | ❌ | ✅ Observable + provable |
+| **Tail predictability** | Unbounded | Bounded |
+| **RSS attribution** | No | Per-epoch |
+| **Leak detection** | No | < 60s to detection |
+| **Size-class analysis** | No | Real-time dashboards |
+| **Kernel reclamation** | No | Observable + provable |
 | **Debugging overhead** | 10-100x (valgrind) | 0% (built-in telemetry) |
-| **Production observability** | ❌ | ✅ Grafana dashboards |
+| **Production observability** | No | Grafana dashboards |
 
 ---
 
