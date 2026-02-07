@@ -8,7 +8,7 @@ It replaces spatial "hole-finding" with **temporal grouping**, ensuring objects 
 
 ## What You Get (With Numbers)
 
-### 🚀 Eliminates Tail Latency Spikes
+### Eliminates Tail Latency Spikes
 
 **Measured results (100M allocations, 128-byte objects):**
 
@@ -27,7 +27,7 @@ It replaces spatial "hole-finding" with **temporal grouping**, ensuring objects 
 
 ---
 
-### 🧠 Stable RSS Under Sustained Churn
+### Stable RSS Under Sustained Churn
 
 **Measured results (1000 churn cycles):**
 
@@ -41,7 +41,7 @@ It replaces spatial "hole-finding" with **temporal grouping**, ensuring objects 
 
 ---
 
-### 🛡️ Strong Safety Guarantees
+### Strong Safety Guarantees
 
 * **No runtime `munmap()`** → stale pointers never segfault (slabs stay mapped during allocator lifetime)
 * **Generation-checked handles** → stale or double frees safely rejected (24-bit generation counter, 16M reuse budget)
@@ -52,7 +52,7 @@ It replaces spatial "hole-finding" with **temporal grouping**, ensuring objects 
 
 ---
 
-### 🎯 Purpose-Built Efficiency
+### Purpose-Built Efficiency
 
 * **Object sizes:** 64–768 bytes (8 fixed classes)
 * **Space efficiency:** **88.9%** (11.1% internal fragmentation vs malloc's ~15-25%)
