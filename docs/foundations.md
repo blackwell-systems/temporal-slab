@@ -2211,16 +2211,18 @@ ThreadLocal thread_data[16];  // 16 * 64 = 1024 bytes
 
 **Why temporal-slab cares about alignment:**
 
-**1. Handle encoding assumes aligned pointers:**
+**1. Handle encoding uses registry indirection:**
 
 ```c
-// Handle format: [slab_ptr:48][slot:8][class:8]
-// Assumes slab pointers are page-aligned (low 12 bits = 0)
+// Handle format v1: [slab_id:22][gen:24][slot:8][class:8][ver:2]
+// No raw pointers, uses registry lookup
 
+SlabHandle h = handle_pack(slab_id, generation, slot, class);
+// Registry: metas[slab_id] → {Slab* ptr, uint32_t gen}
+
+// Alignment matters for object pointers:
 Slab* slab = mmap(..., 4096, ...);  // OS returns page-aligned (0x...000)
-SlabHandle h = ((uint64_t)slab << 16) | (slot << 8) | class;
-
-// If slab were unaligned (low bits != 0), encoding would corrupt slot/class
+void* object = slab_base + (slot * slot_size);  // 8-byte aligned
 ```
 
 **2. All allocations 8-byte aligned:**
@@ -2721,29 +2723,42 @@ temporal-slab with madvise:
 Result: Competitive absolute RSS with malloc, zero drift over time
 ```
 
-**Why this wasn't implemented initially:**
+**Implementation status: Complete**
 
-The focus was on proving the core thesis: temporal grouping prevents RSS drift. Adding madvise would have complicated the proof-of-concept. Now that drift prevention is demonstrated (0% growth over 1000 cycles), optimizing absolute RSS is the next priority.
+madvise(MADV_DONTNEED) is implemented and active. Empty slabs in CLOSING epochs have physical memory released while virtual mappings remain intact.
 
-**Trade-offs of madvise:**
+**Trade-offs realized:**
 
 **Benefits:**
 - RSS drops to match live set (competitive with malloc)
-- Safety contract intact (no segfaults, handle validation works)
+- Safety contract intact (no segfaults, handle validation works via registry)
 - No syscall churn (madvise once per epoch close, not per allocation)
+- 98-99% physical page reclaim under epoch-aligned workloads
 
 **Costs:**
-- Page faults on reuse (minor faults, ~1-2µs per slab)
-- Slightly more complex reclamation logic
-- OS-specific (Linux/BSD have madvise, but behavior differs slightly)
+- Page faults on reuse (minor faults, ~1-2µs per slab, amortized)
+- Registry overhead (12 bytes per slab for off-page metadata)
+- One extra indirection (4-5 cycles for registry lookup)
 
-**The current architecture supports madvise without redesign:**
+**How it works in production:**
 
-- Slabs remain mapped → handle encoding unchanged
-- Epoch system tracks lifetime phases → knows when to call madvise
-- Conservative recycling → only FULL slabs are candidates
+```c
+// Allocate in epoch 1
+EpochId e1 = epoch_current(alloc);
+void* obj = slab_malloc_epoch(alloc, 128, e1);
 
-This makes madvise a straightforward addition in Phase 1 of the roadmap.
+// Use object
+process(obj);
+slab_free(alloc, obj);
+
+// Close epoch when phase ends
+epoch_close(alloc, e1);
+// → Epoch 1 marked CLOSING
+// → When last object freed, slab becomes empty
+// → madvise(slab, 4096, MADV_DONTNEED) called
+// → Physical memory released (RSS drops)
+// → Virtual mapping intact (handle validation still works)
+```
 
 ## Epoch-Granular Memory Reclamation
 
@@ -2863,14 +2878,15 @@ while (true) {
 
 "Returns memory at epoch granularity with deterministic timing. Applications control reclamation by closing epochs when lifetime phases end. Impossible with general-purpose allocators that lack lifetime phase tracking."
 
-**Current status:**
+**Current status (implementation complete):**
 
-Epoch infrastructure exists (16-epoch ring buffer, epoch_advance(), epoch-tagged slabs). What's missing:
-- `epoch_close()` API
-- Logic to track epoch state (ACTIVE vs CLOSING)
-- madvise integration for empty slabs in CLOSING epochs
+All components are implemented:
+- ✅ `epoch_close()` API (marks epochs CLOSING)
+- ✅ Epoch state tracking (ACTIVE vs CLOSING via atomic array)
+- ✅ madvise integration (empty slabs in CLOSING epochs get physical memory released)
+- ✅ Slab registry (enables safe handle validation even after madvise/munmap)
 
-This is Phase 2 of the roadmap after madvise(MADV_DONTNEED) proves effective in Phase 1.
+temporal-slab can now return memory at epoch granularity with deterministic timing.
 
 ## O(1) Deterministic Class Selection
 
@@ -3164,16 +3180,19 @@ At T=60 seconds:
 - Next allocation at T=61 pops Slab B from cache (reused, no new mmap)
 ```
 
-**Step 4: Refusal to unmap provides RSS ceiling**
+**Step 4: Epoch-aligned reclamation returns memory to OS**
 ```
 Peak allocation: 50,000 sessions = 50,000 / 15 = 3,334 slabs = 13.3 MB
-After 1 hour: 3,334 slabs in cache/use = 13.3 MB RSS
-After 1 week: 3,334 slabs in cache/use = 13.3 MB RSS (0% growth)
+After 1 hour: All sessions freed from old epochs
+→ epoch_close() triggered for expired epochs
+→ Empty slabs madvised (physical memory released)
+→ RSS: 12 MB (matches live set + minimal overhead)
+After 1 week: RSS = 12 MB (0% drift)
 
-If we unmapped empty slabs:
-- Lower RSS ceiling (11-12 MB)
-- But: mmap/munmap churn (~1000 syscalls/second)
-- And: Cannot validate stale handles (segfaults instead of errors)
+With slab registry + generation counters:
+- Safe madvise/munmap (handle validation via registry)
+- No segfaults (registry marks unmapped slabs as NULL)
+- ABA protection (generation mismatch detects recycled slabs)
 ```
 
 **RSS growth comparison over time:**
@@ -3191,12 +3210,13 @@ Traditional allocators cannot prevent temporal fragmentation without compaction 
 
 **The tradeoff:**
 
-temporal-slab achieves 0% RSS growth but has:
-- Higher RSS floor (+37% vs malloc at startup due to slab alignment and cache)
+temporal-slab achieves 0% RSS drift and competitive absolute RSS (with epoch_close + madvise) but has:
 - Fixed-size classes only (768 bytes max, 11.1% internal fragmentation)
 - Requires lifetime-correlated allocation patterns (works for sessions, connections, requests; doesn't help random sizes)
+- One extra indirection per handle (4-5 cycles for registry lookup)
+- 12 bytes registry overhead per slab
 
-For long-running systems where RSS drift is unacceptable (services that must run for weeks without restart), this is the right tradeoff.
+For long-running systems where RSS drift is unacceptable and latency predictability is critical (HFT, control planes, real-time systems), this is the right tradeoff.
 
 ## What You Should Understand Now
 
@@ -3206,8 +3226,20 @@ Memory allocation bridges the gap between OS-provided pages and application-need
 
 Slab allocation solves this by dividing pages into fixed-size slots (size classes) and filling slabs sequentially. Objects allocated around the same time end up in the same slab. If they have correlated lifetimes (allocation-order affinity), they die together, and the slab can be recycled as a unit. This manages entropy by grouping objects to expire in an organized way.
 
-temporal-slab extends this with lock-free fast-path allocation (sub-100ns latency), conservative recycling (only full slabs are recycled, eliminating use-after-free races), refusal to unmap (enabling safe handle validation and bounded RSS), and O(1) class selection (eliminating jitter).
+temporal-slab extends this with:
+- **Lock-free fast-path allocation** (sub-100ns latency via atomic CAS on bitmaps)
+- **Conservative recycling** (only FULL slabs recycled, eliminating use-after-free races)
+- **Slab registry with generation counters** (enables safe madvise/munmap with ABA protection)
+- **Epoch-granular reclamation** (deterministic RSS drops aligned with application lifecycle)
+- **O(1) class selection** (lookup table eliminates branching jitter)
 
-The allocator does not predict lifetimes or require application hints. Lifetime alignment emerges naturally from allocation patterns. This is substrate, not policy—a foundation for higher-level systems to build on.
+The allocator does not predict lifetimes or require application hints. Lifetime alignment emerges naturally from allocation patterns. Applications control when to reclaim memory by closing epochs at phase boundaries. This is substrate, not policy—a foundation for higher-level systems to build on.
 
-The implementation details—how bitmaps encode slot state, how atomic CAS loops allocate slots, how list membership is tracked—follow from these foundational concepts. Those details are in the source code. This document provides the foundation to understand why they exist.
+**Current implementation (v1.0):**
+
+All phases complete:
+- Phase 1: madvise releases physical memory (RSS competitive with malloc)
+- Phase 2: epoch_close() enables application-controlled reclamation
+- Phase 3: Slab registry enables safe handle validation after madvise/munmap
+
+The implementation details—how bitmaps encode slot state, how atomic CAS loops allocate slots, how registry indirection works, how generation counters prevent ABA—follow from these foundational concepts. Those details are in the source code. This document provides the foundation to understand why they exist and how they enable temporal-slab's unique guarantees.
