@@ -22,6 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
 
 /* Command-line flags */
 static bool flag_json = true;
@@ -50,7 +53,19 @@ static void print_json_global(SlabAllocator* alloc) {
   SlabGlobalStats gs;
   slab_stats_global(alloc, &gs);
   
+  /* Snapshot metadata for deterministic analysis */
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  uint64_t timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+  pid_t pid = getpid();
+  long page_size = sysconf(_SC_PAGESIZE);
+  
   printf("{\n");
+  printf("  \"schema_version\": 1,\n");
+  printf("  \"timestamp_ns\": %lu,\n", timestamp_ns);
+  printf("  \"pid\": %d,\n", (int)pid);
+  printf("  \"page_size\": %ld,\n", page_size);
+  printf("  \"epoch_count\": 16,\n");  /* Hardcoded: allocator doesn't expose epoch_count publicly */
   printf("  \"version\": %u,\n", gs.version);
   printf("  \"current_epoch\": %u,\n", gs.current_epoch);
   printf("  \"active_epoch_count\": %u,\n", gs.active_epoch_count);
