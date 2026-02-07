@@ -33,6 +33,21 @@
 
 _Static_assert((SLAB_PAGE_SIZE & (SLAB_PAGE_SIZE - 1)) == 0, "SLAB_PAGE_SIZE must be power of two");
 
+/* Phase 1 RSS Reclamation: Enable madvise(MADV_DONTNEED) on empty slabs
+ * 
+ * When enabled, empty slabs have their physical pages reclaimed via madvise(),
+ * causing RSS to drop immediately. The virtual memory remains mapped (safe for
+ * stale handle validation), but kernel zero-fills on next access.
+ * 
+ * Trade-off: Slight latency cost on slab reuse (zero-fill overhead).
+ * 
+ * Enable with: gcc -DENABLE_RSS_RECLAMATION ...
+ * Default: DISABLED (preserve existing behavior, avoid zero-fill overhead)
+ */
+#ifndef ENABLE_RSS_RECLAMATION
+#define ENABLE_RSS_RECLAMATION 0
+#endif
+
 /* Size classes (HFT-optimized: sub-100 byte granularity) */
 static const uint32_t k_size_classes[] = {64u, 96u, 128u, 192u, 256u, 384u, 512u, 768u};
 static const size_t   k_num_classes   = sizeof(k_size_classes) / sizeof(k_size_classes[0]);
@@ -396,6 +411,27 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
     atomic_fetch_add_explicit(&sc->empty_slab_cache_overflowed, 1, memory_order_relaxed);
   }
   
+  /* Phase 1 RSS Reclamation: madvise(MADV_DONTNEED) on empty slabs
+   * 
+   * Strategy: Tell the kernel it can reclaim physical pages backing this slab.
+   * The virtual memory remains mapped (safe for stale handle validation),
+   * but RSS drops immediately.
+   * 
+   * Safety: Slab is empty (free_count == object_count), so no live objects.
+   * The header will be zeroed by MADV_DONTNEED, but we reinitialize it in
+   * new_slab() when popping from cache.
+   * 
+   * Trade-off: Slight latency cost on next allocation from this slab (zero-fill),
+   * but RSS drops immediately in benchmarks.
+   * 
+   * Note: Must use whole slab because madvise requires page-aligned addresses. */
+  #if ENABLE_RSS_RECLAMATION && defined(__linux__)
+  if (madvise(s, SLAB_PAGE_SIZE, MADV_DONTNEED) != 0) {
+    /* Non-fatal: continue silently. RSS stays high if this fails. */
+    /* perror disabled to avoid log spam */
+  }
+  #endif
+  
   pthread_mutex_unlock(&sc->cache_lock);
 }
 
@@ -407,13 +443,37 @@ static Slab* new_slab(SizeClassAlloc* sc, uint32_t epoch_id) {
   /* Try to pop from cache first */
   Slab* s = cache_pop(sc);
   if (s) {
-    /* Phase 1.6: Validate cached slab metadata (catches corruption early) */
+    #if ENABLE_RSS_RECLAMATION
+    /* Phase 1 RSS: madvise(MADV_DONTNEED) zeroes the slab, so we must reinitialize
+     * all metadata that was cleared. We cannot validate magic anymore since it was zeroed.
+     * This is safe because cache_pop() only returns slabs we previously cached. */
+    
+    uint32_t expected_count = slab_object_count(obj_size);
+    
+    /* Reinitialize all slab metadata (was zeroed by madvise) */
+    s->prev = NULL;
+    s->next = NULL;
+    atomic_store_explicit(&s->magic, SLAB_MAGIC, memory_order_relaxed);
+    s->object_size = obj_size;
+    s->object_count = expected_count;
+    s->list_id = SLAB_LIST_NONE;
+    s->cache_state = SLAB_ACTIVE;  /* Will be added to partial list */
+    s->epoch_id = epoch_id;  /* Assign to epoch for temporal grouping */
+    atomic_store_explicit(&s->free_count, expected_count, memory_order_relaxed);
+    
+    /* Clear bitmap (was already zeroed by madvise, but be explicit) */
+    _Atomic uint32_t* bm = slab_bitmap_ptr(s);
+    uint32_t words = slab_bitmap_words(expected_count);
+    for (uint32_t i = 0; i < words; i++) {
+      atomic_store_explicit(&bm[i], 0u, memory_order_relaxed);
+    }
+    #else
+    /* Without RSS reclamation: validate cached slab metadata */
     assert(atomic_load_explicit(&s->magic, memory_order_relaxed) == SLAB_MAGIC && "cached slab has invalid magic");
     assert(s->object_size == obj_size && "cached slab has wrong object_size");
     
     uint32_t expected_count = slab_object_count(obj_size);
     assert(s->object_count == expected_count && "cached slab has wrong object_count");
-    
     
     /* Reinitialize the cached slab */
     s->prev = NULL;
@@ -429,6 +489,7 @@ static Slab* new_slab(SizeClassAlloc* sc, uint32_t epoch_id) {
     for (uint32_t i = 0; i < words; i++) {
       atomic_store_explicit(&bm[i], 0u, memory_order_relaxed);
     }
+    #endif
     
     return s;
   }
