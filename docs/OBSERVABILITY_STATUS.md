@@ -8,53 +8,53 @@ Current state of the Phase 2 observability roadmap and what's next.
 
 ## Executive Summary
 
-**Phase 2.0: ✅ COMPLETE** - Production-ready monitoring with external tooling  
-**Phase 2.1: ⚠️ PARTIALLY DESIGNED** - Epoch-close telemetry  
-**Phase 2.2: ✅ COMPLETE** - Era stamping implemented  
-**Phase 2.3: 📋 DESIGNED** - Semantic attribution (labels, refcount)  
-**Phase 2.4: 📋 DESIGNED** - Kernel cooperation telemetry  
+**Phase 2.0: COMPLETE** - Production-ready monitoring with external tooling  
+**Phase 2.1: PARTIALLY DESIGNED** - Epoch-close telemetry  
+**Phase 2.2: COMPLETE** - Era stamping implemented  
+**Phase 2.3: COMPLETE** - Semantic attribution (labels, refcount, leak detection)  
+**Phase 2.4: DESIGNED** - Kernel cooperation telemetry  
 
-**Current capability:** Full structural observability with Prometheus + Grafana dashboard, sub-1% overhead, root cause attribution for slow-path and RSS behavior.
+**Current capability:** Full structural observability with Prometheus + Grafana dashboard, sub-1% overhead, root cause attribution for slow-path and RSS behavior, **semantic attribution for leak detection and memory accountability**.
 
-**Next milestone:** Phase 2.3 (semantic attribution) to add epoch labels and refcount leak detection.
+**Next milestone:** Phase 2.1 (epoch-close telemetry) or comparative benchmarks vs malloc/jemalloc.
 
 ---
 
-## Phase 2.0: Core Stats Infrastructure ✅ COMPLETE
+## Phase 2.0: Core Stats Infrastructure [COMPLETE]
 
 ### What Was Delivered
 
 **Allocator implementation:**
-- ✅ `SlabGlobalStats`, `SlabClassStats`, `SlabEpochStats` structs
-- ✅ `slab_stats_global()`, `slab_stats_class()`, `slab_stats_epoch()` APIs
-- ✅ Atomic counters with `memory_order_relaxed` (<1% overhead)
-- ✅ Per-size-class slow-path attribution (cache_miss vs epoch_closed)
-- ✅ RSS reclamation tracking (madvise calls/bytes/failures)
-- ✅ `stats_dump` CLI tool with dual output (text + JSON)
+- [COMPLETE] `SlabGlobalStats`, `SlabClassStats`, `SlabEpochStats` structs
+- [COMPLETE] `slab_stats_global()`, `slab_stats_class()`, `slab_stats_epoch()` APIs
+- [COMPLETE] Atomic counters with `memory_order_relaxed` (<1% overhead)
+- [COMPLETE] Per-size-class slow-path attribution (cache_miss vs epoch_closed)
+- [COMPLETE] RSS reclamation tracking (madvise calls/bytes/failures)
+- [COMPLETE] `stats_dump` CLI tool with dual output (text + JSON)
 
 **External tooling (temporal-slab-tools):**
-- ✅ `tslab stats` - Human summary and JSON passthrough
-- ✅ `tslab watch` - Interval sampling with delta/sec calculations
-- ✅ `tslab top` - Rank classes by metrics (slow_path_hits, madvise_bytes, etc)
-- ✅ `tslab export prometheus` - Prometheus text exposition format (40+ metrics)
+- [COMPLETE] `tslab stats` - Human summary and JSON passthrough
+- [COMPLETE] `tslab watch` - Interval sampling with delta/sec calculations
+- [COMPLETE] `tslab top` - Rank classes by metrics (slow_path_hits, madvise_bytes, etc)
+- [COMPLETE] `tslab export prometheus` - Prometheus text exposition format (40+ metrics)
 
 **Production monitoring:**
-- ✅ Grafana dashboard (14 panels) - `/temporal-slab-tools/dashboards/temporal-slab-observability.json`
-- ✅ Complete deployment guide - `MONITORING_SETUP.md`
-- ✅ Prometheus alert rules (slow-path rate, madvise failures, RSS growth)
-- ✅ Textfile collector setup (systemd service + timer)
+- [COMPLETE] Grafana dashboard (14 panels) - `/temporal-slab-tools/dashboards/temporal-slab-observability.json`
+- [COMPLETE] Complete deployment guide - `MONITORING_SETUP.md`
+- [COMPLETE] Prometheus alert rules (slow-path rate, madvise failures, RSS growth)
+- [COMPLETE] Textfile collector setup (systemd service + timer)
 
 **Documentation:**
-- ✅ `OBSERVABILITY_DESIGN.md` - Complete phase breakdown
-- ✅ `stats_dump_reference.md` - Field-by-field JSON schema documentation
-- ✅ `OBSERVABILITY_PHILOSOPHY.md` (tools repo) - Structural vs emergent observability
-- ✅ `METRICS_PERFORMANCE.md` (tools repo) - Atomic counter performance analysis
-- ✅ `ARM_PORTABILITY.md` - ARM64 atomics and memory ordering
+- [COMPLETE] `OBSERVABILITY_DESIGN.md` - Complete phase breakdown
+- [COMPLETE] `stats_dump_reference.md` - Field-by-field JSON schema documentation
+- [COMPLETE] `OBSERVABILITY_PHILOSOPHY.md` (tools repo) - Structural vs emergent observability
+- [COMPLETE] `METRICS_PERFORMANCE.md` (tools repo) - Atomic counter performance analysis
+- [COMPLETE] `ARM_PORTABILITY.md` - ARM64 atomics and memory ordering
 
 **Testing:**
-- ✅ `VERIFICATION.sh` - 8-test suite covering all commands
-- ✅ Schema validation (JSON Schema Draft 2020-12)
-- ✅ All tests passing on x86-64
+- [COMPLETE] `VERIFICATION.sh` - 8-test suite covering all commands
+- [COMPLETE] Schema validation (JSON Schema Draft 2020-12)
+- [COMPLETE] All tests passing on x86-64
 
 ---
 
@@ -77,7 +77,7 @@ Current state of the Phase 2 observability roadmap and what's next.
 
 ---
 
-## Phase 2.1: Epoch-Close Telemetry ⚠️ PARTIALLY DESIGNED
+## Phase 2.1: Epoch-Close Telemetry [PARTIAL] PARTIALLY DESIGNED
 
 ### Status
 
@@ -138,12 +138,12 @@ epoch_close_recycled_slabs: 50
 
 ---
 
-## Phase 2.2: Era Stamping ✅ COMPLETE
+## Phase 2.2: Era Stamping [COMPLETE] COMPLETE
 
 ### Status
 
-**Implementation:** ✅ Complete  
-**Tested:** ✅ All code compiled, not yet in production workload  
+**Implementation:** [COMPLETE] Complete  
+**Tested:** [COMPLETE] All code compiled, not yet in production workload  
 
 ### What Was Delivered
 
@@ -187,44 +187,72 @@ If `epoch_id` wraps to 5 again, `epoch_era` will be 166 (distinguishable).
 
 ---
 
-## Phase 2.3: Semantic Attribution 📋 DESIGNED
+## Phase 2.3: Semantic Attribution [COMPLETE] COMPLETE
 
 ### Status
 
-**Implementation:** Not started  
-**Design:** Complete (OBSERVABILITY_DESIGN.md)  
+**Implementation:** [COMPLETE] Complete (2025-02-07)  
+**Tested:** [COMPLETE] All commands working, Grafana dashboard live  
 **Blockers:** None  
 **Priority:** HIGH (enables application bug detection)
 
-### What It Adds
+### What Was Delivered
 
-**New struct:**
-```c
-typedef struct EpochMetadata {
-  uint64_t open_since_ns;       /* Timestamp when epoch became ACTIVE */
-  _Atomic uint64_t alloc_count; /* Number of live allocations in this epoch */
-  char label[32];               /* Semantic label (e.g., "request_id:abc") */
-  
-  /* Phase 2.4 fields (future) */
-  uint64_t rss_before_close;
-  uint64_t rss_after_close;
-} EpochMetadata;
-
-struct SlabAllocator {
-  EpochMetadata epoch_meta[EPOCH_COUNT];
-};
+**JSON output (stats_dump):**
+```json
+{
+  "epochs": [
+    {
+      "epoch_id": 12,
+      "epoch_era": 150,
+      "state": "ACTIVE",
+      "age_sec": 600,
+      "refcount": 2,
+      "label": "background-worker-3",
+      "total_partial_slabs": 100,
+      "total_full_slabs": 50,
+      "total_reclaimable_slabs": 25,
+      "estimated_rss_bytes": 50331648
+    }
+  ]
+}
 ```
 
-**New APIs:**
-```c
-/* Application sets epoch label when opening */
-void slab_epoch_set_label(SlabAllocator* alloc, EpochId epoch, const char* label);
+**Interactive tooling:**
+```bash
+# Rank epochs by age (leak detection)
+./stats_dump --no-text | tslab top --epochs --by age_sec --stdin
 
-/* Application increments refcount when entering domain */
-void slab_epoch_inc_refcount(SlabAllocator* alloc, EpochId epoch);
+# Rank epochs by RSS (memory attribution)
+./stats_dump --no-text | tslab top --epochs --by rss_bytes --stdin
+```
 
-/* Application decrements refcount when exiting domain */
-void slab_epoch_dec_refcount(SlabAllocator* alloc, EpochId epoch);
+**Prometheus metrics (5 new metrics):**
+```
+temporal_slab_epoch_age_seconds{epoch="12",state="ACTIVE",label="background-worker-3"} 600
+temporal_slab_epoch_refcount{epoch="12",state="ACTIVE",label="background-worker-3"} 2
+temporal_slab_epoch_rss_bytes{epoch="12",state="ACTIVE",label="background-worker-3"} 50331648
+temporal_slab_epoch_reclaimable_slabs{epoch="12",state="ACTIVE",label="background-worker-3"} 25
+temporal_slab_epoch_state{epoch="12",state="ACTIVE",label="background-worker-3"} 1
+```
+
+**Grafana dashboard (4 new panels):**
+- Epoch age heatmap (ACTIVE epochs, threshold coloring)
+- Top epochs by RSS (topk query for memory attribution)
+- Refcount tracking for CLOSING epochs (drainage monitoring)
+- Reclaimable slabs by epoch (reclamation opportunities)
+
+**Pre-built alerting rules:**
+```yaml
+- alert: EpochLeak
+  expr: max(temporal_slab_epoch_age_seconds) > 300
+  annotations:
+    summary: "Epoch {{ $labels.epoch }} ({{ $labels.label }}) stuck for {{ $value }}s"
+
+- alert: EpochMemoryLeak
+  expr: temporal_slab_epoch_rss_bytes > 52428800 and temporal_slab_epoch_age_seconds > 60
+  annotations:
+    summary: "Epoch {{ $labels.epoch }} leaking {{ $value | humanize }}B"
 ```
 
 ### Why It Matters
@@ -294,7 +322,7 @@ temporal-slab sees "refcount=2, age=600s" (causality), and identifies **who forg
 
 ---
 
-## Phase 2.4: Kernel Cooperation Telemetry 📋 DESIGNED
+## Phase 2.4: Kernel Cooperation Telemetry [DESIGNED] DESIGNED
 
 ### Status
 
@@ -402,7 +430,7 @@ temporal_slab_epoch_madvise_bytes * 100
 
 ---
 
-## Phase 2.5: External Tooling Enhancements 📋 FUTURE
+## Phase 2.5: External Tooling Enhancements [DESIGNED] FUTURE
 
 ### Not Yet Designed (Ideas)
 
@@ -492,12 +520,12 @@ Pre-built alert rules with runbooks (currently manual configuration).
 ## Summary: Where We Stand
 
 **Production-ready observability:**
-- ✅ Full monitoring stack (Prometheus + Grafana)
-- ✅ Sub-1% overhead (atomic relaxed counters)
-- ✅ Structural observability (causality, not patterns)
-- ✅ Root cause attribution (slow-path, RSS, madvise)
-- ✅ External tooling (4 commands, 40+ metrics)
-- ✅ Complete documentation (7 docs, 4,479 lines)
+- [COMPLETE] Full monitoring stack (Prometheus + Grafana)
+- [COMPLETE] Sub-1% overhead (atomic relaxed counters)
+- [COMPLETE] Structural observability (causality, not patterns)
+- [COMPLETE] Root cause attribution (slow-path, RSS, madvise)
+- [COMPLETE] External tooling (4 commands, 40+ metrics)
+- [COMPLETE] Complete documentation (7 docs, 4,479 lines)
 
 **Next capability unlock:**
 - 🎯 **Phase 2.3** (semantic attribution) → Application bug detection
