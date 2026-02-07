@@ -1,30 +1,66 @@
 # temporal-slab
 
-temporal-slab is a **high-performance slab allocator** for fixed-size objects, designed for systems that require **predictable latency**, **safe behavior under sustained churn**, and **epoch-scoped memory reclamation**.
+**temporal-slab is a high-performance slab allocator for small, fixed-size objects in long-running systems where latency predictability and memory stability matter more than generality.**
 
-**Core features:**
-- Lock-free allocation fast path (sub-100ns median latency)
-- Epoch-based temporal grouping (16-epoch ring buffer)
-- Epoch-scoped RSS reclamation via `epoch_close()` API
-- Safe handle validation (no crashes on invalid frees)
-- Bounded RSS under steady-state churn (0% growth)
+It is designed for workloads with **sustained allocation churn**, **narrow size distributions**, and **clear lifetime phases**—cases where general-purpose allocators exhibit tail-latency spikes or RSS drift over time.
 
-**Best for:**
-- Cache metadata, session stores, connection tracking
-- Request-scoped allocation (web servers, RPC handlers)
-- Frame-based allocation (game engines, simulation loops)
-- Systems needing deterministic memory reclamation
+Unlike traditional allocators that fight fragmentation reactively, temporal-slab organizes memory around **temporal affinity**: objects allocated around the same time are placed together, reused together, and reclaimed together.
 
-**Not competitive for:**
-- Mixed-size, variable-lifetime workloads
-- General-purpose allocator replacement
-- Objects >768 bytes
+---
+
+## What temporal-slab Guarantees
+
+* **Deterministic latency**  
+  Lock-free allocation fast path with **~30–70ns p50** and **~374ns p99** (≈3.3× better p99 than system malloc).
+
+* **Bounded RSS under churn**  
+  **0–2.4% RSS growth** over 1000 churn cycles. No unbounded memory drift.
+
+* **Epoch-scoped reclamation**  
+  Application-controlled memory reclamation via `epoch_close()`, enabling physical page reclaim aligned to lifetime phases.
+
+* **Crash-proof safety**  
+  Invalid, stale, or double frees are safely rejected—never segfaults.
+
+* **Predictable trade-offs**  
+  Higher baseline RSS (+~36%) in exchange for **stable memory behavior and tail-latency elimination**.
+
+---
+
+## Best Fit For
+
+* Cache metadata and session stores
+* Request-scoped allocation (web servers, RPC frameworks)
+* Frame- or batch-based systems (games, simulations, pipelines)
+* Latency-sensitive services that must not drift in memory usage
+
+## Not Intended For
+
+* Mixed-size, mixed-lifetime workloads
+* General-purpose allocator replacement
+* Objects larger than **768 bytes**
+
+---
+
+## Why temporal-slab Exists
+
+In long-running systems, **fragmentation is entropy**.
+
+General-purpose allocators treat memory as a spatial problem—searching for holes large enough to satisfy requests. Over time, this leads to pages filled with mixed lifetimes, making memory difficult to reuse or return to the OS.
+
+temporal-slab addresses the *temporal* side of fragmentation.
+
+By grouping allocations by **when** they occur (epochs), it ensures that objects with similar lifetimes share slabs. When those lifetimes end, entire slabs become reclaimable as a unit—without compaction, relocation, or unsafe unmapping.
+
+This enables behavior that general-purpose allocators fundamentally cannot provide: **deterministic, phase-aligned memory reclamation.**
+
+---
 
 ## RSS Reclamation
 
 temporal-slab returns physical memory to the OS at **application-controlled lifetime boundaries** via the `epoch_close()` API.
 
-**Implementation:**
+**Mechanism:**
 - Empty slabs in CLOSING epochs call `madvise(MADV_DONTNEED)`
 - CachedNode architecture stores slab metadata off-page (survives madvise)
 - 24-bit generation counter for ABA protection (16M reuse budget)
@@ -36,67 +72,13 @@ temporal-slab returns physical memory to the OS at **application-controlled life
 - 100% cache hit rate (perfect slab reuse)
 - Pattern: Small epochs ~100% reclaim, large epochs ~2%
 
-**Design trade-offs:**
-- Higher baseline RSS vs malloc (+36% in benchmarks)
-  - 8-byte metadata headers
-  - Fixed size-class rounding
-  - Conservative slab retention
-- Predictable tail latency (8x better p99 vs malloc)
-- Explicit reclamation points vs heuristic-based
-
-## Future Work
-
-**Phase 3: Handle Indirection + `munmap()`**
+**Future work:**
+- Phase 3: Handle indirection + `munmap()` for deterministic unmapping
 - Architecture: `handle → slab_id → slab_table[generation, state, ptr] → slab`
 - Enables: Real `munmap()` with crash-proof stale frees
-- Defer until: Phases 1-2 proven in production
+- Defer until: Current implementation proven in production
 
-## Why temporal-slab Exists
-
-### Fragmentation as Entropy
-
-In long-running systems, memory fragmentation is not a bug—it is entropy.
-
-Traditional allocators (e.g. malloc) treat memory as a spatial problem: they search for holes large enough to satisfy each allocation request. Over time, this leads to spatial fragmentation: memory resembles "Swiss cheese"—plenty of free space in aggregate, but scattered into unusable fragments. Allocation cost rises, cache locality degrades, and allocator metadata grows.
-
-More subtle—and more damaging—is temporal fragmentation.
-
-In conventional allocators, objects with vastly different lifetimes are often placed adjacent to one another. When a short-lived object is freed, its memory cannot be efficiently reclaimed if neighboring objects are long-lived. Pages accumulate mixed lifetimes and cannot be reused or released cleanly.
-
-temporal-slab addresses this by organizing allocation around temporal affinity instead of spatial holes.
-
-Objects are grouped into slabs based on when they are allocated, implicitly aligning their lifetimes. Rather than searching for holes, allocation proceeds sequentially within a slab. When the objects in a slab expire, the slab becomes empty as a unit and can be safely recycled.
-
-This shifts allocation from a reactive search problem to a predictive layout strategy:
-
-- No hole searching in fragmented address space
-- No mixing of unrelated lifetimes within a slab
-- Clear, deterministic reuse boundaries
-
-Traditional allocators fight entropy by constantly reordering memory. temporal-slab manages entropy by ensuring objects expire in an organized way.
-
-### The Missing Middle
-
-Existing ZNS systems operate at file or extent granularity. At small object sizes (64–256 bytes), metadata and tracking costs dominate and destroy cache locality.
-
-temporal-slab moves lifetime-aware placement to the allocator layer, where object-scale decisions are cheap and precise. This fills the missing middle between memory allocators and lifetime-aware storage systems.
-
-### Substrate, Not Policy
-
-temporal-slab does not require applications to provide lifetime hints. Lifetime information is implicit in allocation and reuse patterns.
-
-By managing memory at the slab level, the allocator already knows:
-- When objects are created
-- When groups of objects become unused
-- When entire slabs can be safely recycled
-
-This makes temporal-slab a substrate that higher layers can build on, not a policy engine that applications must tune.
-
-**Key outcomes:**
-- Bounded RSS under churn (2.2% growth over 1000 cycles)
-- Lock-free allocation fast path (70ns median)
-- No crashes on stale or invalid frees
-- Explicit, documented safety invariants
+---
 
 ## Safety Contract
 
