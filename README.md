@@ -15,8 +15,35 @@ The allocator provides a lock-free fast path, conservative recycling guarantees,
 - Mixed-size, mixed-lifetime workloads (see benchmark results)
 - General-purpose allocator replacement
 
-**Roadmap:**
-- `epoch_close()` API for aggressive recycling of expired epochs
+**Roadmap to RSS Competitiveness:**
+
+temporal-slab today achieves **RSS stability** (0% growth under steady churn) and **competitive normalized efficiency** (RSS/allocated comparable or better than malloc). However, it does not actively return physical memory to the OS during runtime.
+
+**Three deliberate design choices cause higher absolute RSS:**
+1. No runtime `munmap()` - guarantees stale handles are safe
+2. Conservative slab retention - cached + overflow slabs stay mapped
+3. Size-class rounding - 8-byte headers + fixed size classes
+
+**Path forward (maintaining safety guarantees):**
+
+**Phase 1: `madvise(MADV_DONTNEED)` on Empty Slabs**
+- Real RSS drops without redesigning handles
+- Safety contract intact (no segfaults from unmapped slabs)
+- Strategy: `madvise()` slabs that are empty and belong to CLOSING epochs
+- Expected: RSS drops back toward live set after epoch expiration
+
+**Phase 2: `epoch_close()` + Lifetime-Aligned Reclamation**
+- The unique differentiator: RSS reclaim at **epoch granularity**, not hole granularity
+- Predictable reclamation: "close epoch → no new allocs → when empty, reclaim"
+- Impossible with malloc: general allocators can't safely know when lifetime phases end
+- Claim after implementation: "Returns memory at epoch granularity, deterministic RSS behavior aligned with application lifetime phases"
+
+**Phase 3: Handle Indirection + `munmap()` (Graduate-Level)**
+- Architecture: `handle → slab_id → slab_table[generation, state, ptr] → slab`
+- Enables: Real `munmap()` with crash-proof stale frees
+- Defer until: Phases 1-2 proven in production
+
+**Additional features:**
 - Per-class hot slab ring for reduced contention
 - Configurable size class sets
 - Lazy compaction for nearly-empty slabs
