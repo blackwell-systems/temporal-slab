@@ -1,58 +1,55 @@
 # temporal-slab
 
-temporal-slab is a **high-performance slab allocator** for fixed-size objects, designed for systems that require **predictable latency**, **safe behavior under sustained churn**, and **narrow size distributions**.
+temporal-slab is a **high-performance slab allocator** for fixed-size objects, designed for systems that require **predictable latency**, **safe behavior under sustained churn**, and **epoch-scoped memory reclamation**.
 
-The allocator provides a lock-free fast path, conservative recycling guarantees, and explicit safety contracts. It excels in workloads with consistent object sizes (cache metadata, sessions, connection tracking).
-
-**Current status (v0.x):**
-- Optimized for single-size or narrow size distribution workloads
-- Lock-free allocation with sub-100ns median latency
+**Core features:**
+- Lock-free allocation fast path (sub-100ns median latency)
+- Epoch-based temporal grouping (16-epoch ring buffer)
+- Epoch-scoped RSS reclamation via `epoch_close()` API
 - Safe handle validation (no crashes on invalid frees)
-- Conservative recycling (correctness over aggressive reclamation)
-- **Epoch-based temporal grouping** - 16-epoch ring buffer for lifetime separation
+- Bounded RSS under steady-state churn (0% growth)
 
-**Not yet competitive:**
-- Mixed-size, mixed-lifetime workloads (see benchmark results)
+**Best for:**
+- Cache metadata, session stores, connection tracking
+- Request-scoped allocation (web servers, RPC handlers)
+- Frame-based allocation (game engines, simulation loops)
+- Systems needing deterministic memory reclamation
+
+**Not competitive for:**
+- Mixed-size, variable-lifetime workloads
 - General-purpose allocator replacement
+- Objects >768 bytes
 
-**Roadmap to RSS Competitiveness:**
+## RSS Reclamation
 
-temporal-slab achieves **RSS stability** (0% growth under steady churn), **competitive normalized efficiency** (RSS/allocated comparable or better than malloc), and **epoch-scoped RSS reclamation** - returning physical memory to the OS at application-controlled lifetime boundaries.
-
-**Three deliberate design choices cause higher absolute RSS:**
-1. No runtime `munmap()` - guarantees stale handles are safe
-2. Conservative slab retention - cached + overflow slabs stay mapped
-3. Size-class rounding - 8-byte headers + fixed size classes
-
-**Path forward (maintaining safety guarantees):**
-
-**Phase 1+2: Epoch-Scoped RSS Reclamation (IMPLEMENTED)**
-
-Complete. Critical bug fixed, production safety hardened, validated in benchmarks.
+temporal-slab returns physical memory to the OS at **application-controlled lifetime boundaries** via the `epoch_close()` API.
 
 **Implementation:**
-- Phase 1: `madvise(MADV_DONTNEED)` on empty slabs in CLOSING epochs
-- Phase 2: `epoch_close()` API + aggressive reclamation policy
-- Critical fix: Overflow slab_id corruption (CachedNode off-page storage)
-- Safety improvements: 24-bit generation, 2-bit versioning, memory ordering
+- Empty slabs in CLOSING epochs call `madvise(MADV_DONTNEED)`
+- CachedNode architecture stores slab metadata off-page (survives madvise)
+- 24-bit generation counter for ABA protection (16M reuse budget)
+- Virtual memory stays mapped (safe for stale handles)
 
-**Benchmark Results:**
-- Test: 5 epochs × 50,000 objects (128 bytes each)
-- Outcome: 19.15 MiB marked reclaimable (4,903 slabs), 3.3% RSS drop under pressure
-- Cache reuse: 100% hit rate (perfect slab reuse after madvise)
-- Pattern: Small epochs approach 100% reclaim, large epochs ~2%
+**Benchmark results (5 epochs × 50K objects):**
+- 19.15 MiB marked reclaimable (4,903 slabs)
+- 3.3% RSS drop under memory pressure
+- 100% cache hit rate (perfect slab reuse)
+- Pattern: Small epochs ~100% reclaim, large epochs ~2%
 
-Returns memory at epoch granularity - when application lifetime phases end, not when allocator heuristics decide. Traditional allocators cannot provide this capability.
+**Design trade-offs:**
+- Higher baseline RSS vs malloc (+36% in benchmarks)
+  - 8-byte metadata headers
+  - Fixed size-class rounding
+  - Conservative slab retention
+- Predictable tail latency (8x better p99 vs malloc)
+- Explicit reclamation points vs heuristic-based
 
-**Phase 3: Handle Indirection + `munmap()` (Graduate-Level)**
+## Future Work
+
+**Phase 3: Handle Indirection + `munmap()`**
 - Architecture: `handle → slab_id → slab_table[generation, state, ptr] → slab`
 - Enables: Real `munmap()` with crash-proof stale frees
 - Defer until: Phases 1-2 proven in production
-
-**Additional features:**
-- Per-class hot slab ring for reduced contention
-- Configurable size class sets
-- Lazy compaction for nearly-empty slabs
 
 ## Why temporal-slab Exists
 
