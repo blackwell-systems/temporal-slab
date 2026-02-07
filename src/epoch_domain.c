@@ -13,10 +13,10 @@ epoch_domain_t* epoch_domain_create(SlabAllocator* alloc) {
     if (!domain) return NULL;
     
     domain->alloc = alloc;
-    epoch_advance(alloc);
+    /* Wrap current epoch (no advance) - caller controls phase boundaries */
     domain->epoch_id = epoch_current(alloc);
     domain->refcount = 0;
-    domain->auto_close = true;  // Default: auto-close on last exit
+    domain->auto_close = false;  // Default: explicit epoch_close (safer)
     
     return domain;
 }
