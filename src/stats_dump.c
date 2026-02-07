@@ -58,6 +58,32 @@ static void parse_args(int argc, char** argv) {
 
 /* ==================== JSON Output (stdout) ==================== */
 
+/* JSON string escaper (prevents invalid JSON from special characters in labels) */
+static void print_json_string(const char* s) {
+  if (!s) {
+    printf("\"\"");
+    return;
+  }
+  
+  printf("\"");
+  for (const char* p = s; *p && (p - s) < 31; p++) {
+    switch (*p) {
+      case '"':  printf("\\\""); break;
+      case '\\': printf("\\\\"); break;
+      case '\n': printf("\\n"); break;
+      case '\r': printf("\\r"); break;
+      case '\t': printf("\\t"); break;
+      default:
+        if (*p >= 32 && *p <= 126) {
+          putchar(*p);
+        } else {
+          printf("\\u%04x", (unsigned char)*p);
+        }
+    }
+  }
+  printf("\"");
+}
+
 static void print_json_global(SlabAllocator* alloc) {
   SlabGlobalStats gs;
   slab_stats_global(alloc, &gs);
@@ -123,6 +149,57 @@ static void print_json_global(SlabAllocator* alloc) {
     printf("      \"net_slabs\": %lu,\n", cs.net_slabs);
     printf("      \"estimated_rss_bytes\": %lu\n", cs.estimated_rss_bytes);
     printf("    }%s\n", cls < 7 ? "," : "");
+  }
+  
+  printf("  ],\n");  /* Changed: added comma for epochs array */
+  
+  /* Phase 2.3: Epochs array (optional field for backward compat) */
+  printf("  \"epochs\": [\n");
+  
+  for (uint32_t epoch_id = 0; epoch_id < 16; epoch_id++) {
+    /* Aggregate epoch stats across all size classes */
+    uint64_t total_partial = 0;
+    uint64_t total_full = 0;
+    uint64_t total_reclaimable = 0;
+    
+    for (uint32_t cls = 0; cls < 8; cls++) {
+      SlabEpochStats es;
+      slab_stats_epoch(alloc, cls, epoch_id, &es);
+      
+      total_partial += es.partial_slab_count;
+      total_full += es.full_slab_count;
+      total_reclaimable += es.reclaimable_slab_count;
+    }
+    
+    /* Get metadata */
+    SlabEpochStats es;
+    slab_stats_epoch(alloc, 0, epoch_id, &es);  /* Metadata same across classes */
+    
+    /* Calculate age using CLOCK_MONOTONIC */
+    uint64_t age_sec = 0;
+    if (es.open_since_ns > 0) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+      if (now_ns >= es.open_since_ns) {
+        age_sec = (now_ns - es.open_since_ns) / 1000000000ULL;
+      }
+    }
+    
+    printf("    {\n");
+    printf("      \"epoch_id\": %u,\n", epoch_id);
+    printf("      \"epoch_era\": %lu,\n", es.epoch_era);
+    printf("      \"state\": \"%s\",\n", es.state == EPOCH_ACTIVE ? "ACTIVE" : "CLOSING");
+    printf("      \"age_sec\": %lu,\n", age_sec);
+    printf("      \"refcount\": %lu,\n", es.alloc_count);  /* Now tracks domain_refcount */
+    printf("      \"label\": ");
+    print_json_string(es.label);
+    printf(",\n");
+    printf("      \"total_partial_slabs\": %lu,\n", total_partial);
+    printf("      \"total_full_slabs\": %lu,\n", total_full);
+    printf("      \"total_reclaimable_slabs\": %lu,\n", total_reclaimable);
+    printf("      \"estimated_rss_bytes\": %lu\n", (total_partial + total_full) * 4096);
+    printf("    }%s\n", epoch_id < 15 ? "," : "");
   }
   
   printf("  ]\n");
