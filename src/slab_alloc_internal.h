@@ -170,6 +170,12 @@ struct SizeClassAlloc {
   _Atomic uint64_t madvise_calls;               /* madvise(MADV_DONTNEED) invocations */
   _Atomic uint64_t madvise_bytes;               /* Total bytes passed to madvise */
   _Atomic uint64_t madvise_failures;            /* madvise() returned error */
+  
+  /* Phase 2.1: Epoch-close telemetry */
+  _Atomic uint64_t epoch_close_calls;           /* How many times epoch_close() called */
+  _Atomic uint64_t epoch_close_scanned_slabs;   /* Total slabs scanned for reclaimable */
+  _Atomic uint64_t epoch_close_recycled_slabs;  /* Slabs actually recycled */
+  _Atomic uint64_t epoch_close_total_ns;        /* Total time spent in epoch_close() */
 
   /* Slab cache: free page stack to avoid mmap() in hot path */
   CachedSlab* slab_cache;  /* Changed to store (Slab*, slab_id) pairs */

@@ -1249,6 +1249,11 @@ void epoch_advance(SlabAllocator* a) {
 void epoch_close(SlabAllocator* a, EpochId epoch) {
   if (!a || epoch >= a->epoch_count) return;
   
+  /* Phase 2.1: Capture start time for epoch_close latency tracking */
+  struct timespec start_ts;
+  clock_gettime(CLOCK_MONOTONIC, &start_ts);
+  uint64_t start_ns = (uint64_t)start_ts.tv_sec * 1000000000ULL + (uint64_t)start_ts.tv_nsec;
+  
   /* Phase 2.4: Capture RSS before closing epoch (quantify reclamation impact) */
   uint64_t rss_before = read_rss_bytes_linux();
   a->epoch_meta[epoch].rss_before_close = rss_before;
@@ -1292,15 +1297,24 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
     
     /* Quick scan to count empty slabs */
     size_t empty_count = 0;
+    size_t scanned_count = 0;  /* Phase 2.1: Track total slabs scanned */
     for (Slab* s = es->partial.head; s; s = s->next) {
+      scanned_count++;
       if (atomic_load_explicit(&s->free_count, memory_order_relaxed) == s->object_count) {
         empty_count++;
       }
     }
     for (Slab* s = es->full.head; s; s = s->next) {
+      scanned_count++;
       if (atomic_load_explicit(&s->free_count, memory_order_relaxed) == s->object_count) {
         empty_count++;
       }
+    }
+    
+    /* Phase 2.1: Update telemetry counters */
+    atomic_fetch_add_explicit(&sc->epoch_close_scanned_slabs, scanned_count, memory_order_relaxed);
+    if (empty_count > 0) {
+      atomic_fetch_add_explicit(&sc->epoch_close_recycled_slabs, empty_count, memory_order_relaxed);
     }
     
     if (empty_count > 0) {
@@ -1363,6 +1377,18 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
   /* Phase 2.4: Capture RSS after closing epoch (quantify reclamation impact) */
   uint64_t rss_after = read_rss_bytes_linux();
   a->epoch_meta[epoch].rss_after_close = rss_after;
+  
+  /* Phase 2.1: Capture end time and update telemetry */
+  struct timespec end_ts;
+  clock_gettime(CLOCK_MONOTONIC, &end_ts);
+  uint64_t end_ns = (uint64_t)end_ts.tv_sec * 1000000000ULL + (uint64_t)end_ts.tv_nsec;
+  uint64_t elapsed_ns = end_ns - start_ns;
+  
+  /* Update per-class counters (aggregate across all size classes) */
+  for (size_t i = 0; i < k_num_classes; i++) {
+    atomic_fetch_add_explicit(&a->classes[i].epoch_close_calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&a->classes[i].epoch_close_total_ns, elapsed_ns, memory_order_relaxed);
+  }
   
   /* Epoch now drains: frees continue and empty slabs are aggressively recycled.
    * With RSS reclamation enabled, physical pages are returned to OS as slabs drain. */

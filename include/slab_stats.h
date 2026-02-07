@@ -96,6 +96,12 @@ typedef struct SlabClassStats {
   uint64_t madvise_bytes;              /* Total bytes passed to madvise */
   uint64_t madvise_failures;           /* madvise returned error */
   
+  /* Epoch-close telemetry (Phase 2.1) */
+  uint64_t epoch_close_calls;          /* How many times epoch_close() called */
+  uint64_t epoch_close_scanned_slabs;  /* Total slabs scanned for reclaimable */
+  uint64_t epoch_close_recycled_slabs; /* Slabs actually recycled */
+  uint64_t epoch_close_total_ns;       /* Total time spent in epoch_close() */
+  
   /* Cache state snapshot (requires cache_lock) */
   uint32_t cache_size;                 /* Slabs currently in array cache */
   uint32_t cache_capacity;             /* Max array cache size */

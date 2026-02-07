@@ -140,6 +140,10 @@ static void print_json_global(SlabAllocator* alloc) {
     printf("      \"madvise_calls\": %lu,\n", cs.madvise_calls);
     printf("      \"madvise_bytes\": %lu,\n", cs.madvise_bytes);
     printf("      \"madvise_failures\": %lu,\n", cs.madvise_failures);
+    printf("      \"epoch_close_calls\": %lu,\n", cs.epoch_close_calls);
+    printf("      \"epoch_close_scanned_slabs\": %lu,\n", cs.epoch_close_scanned_slabs);
+    printf("      \"epoch_close_recycled_slabs\": %lu,\n", cs.epoch_close_recycled_slabs);
+    printf("      \"epoch_close_total_ns\": %lu,\n", cs.epoch_close_total_ns);
     printf("      \"cache_size\": %u,\n", cs.cache_size);
     printf("      \"cache_capacity\": %u,\n", cs.cache_capacity);
     printf("      \"cache_overflow_len\": %u,\n", cs.cache_overflow_len);

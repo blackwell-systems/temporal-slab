@@ -87,6 +87,12 @@ void slab_stats_class(SlabAllocator* alloc, uint32_t size_class, SlabClassStats*
   out->madvise_bytes = atomic_load_explicit(&sc->madvise_bytes, memory_order_relaxed);
   out->madvise_failures = atomic_load_explicit(&sc->madvise_failures, memory_order_relaxed);
   
+  /* Phase 2.1: Epoch-close telemetry */
+  out->epoch_close_calls = atomic_load_explicit(&sc->epoch_close_calls, memory_order_relaxed);
+  out->epoch_close_scanned_slabs = atomic_load_explicit(&sc->epoch_close_scanned_slabs, memory_order_relaxed);
+  out->epoch_close_recycled_slabs = atomic_load_explicit(&sc->epoch_close_recycled_slabs, memory_order_relaxed);
+  out->epoch_close_total_ns = atomic_load_explicit(&sc->epoch_close_total_ns, memory_order_relaxed);
+  
   /* Cache state snapshot (brief lock) */
   pthread_mutex_lock(&sc->cache_lock);
   out->cache_size = (uint32_t)sc->cache_size;
