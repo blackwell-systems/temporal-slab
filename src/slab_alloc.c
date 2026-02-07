@@ -678,22 +678,30 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
         cache_push(sc, s);
         return true;
       }
-    } else if (s->list_id == SLAB_LIST_FULL) {
-      /* ACTIVE epochs: Conservative FULL-only recycling (original behavior) */
-      list_remove(&es->full, s);
-      s->list_id = SLAB_LIST_NONE;
-      sc->total_slabs--;
-      pthread_mutex_unlock(&sc->lock);
+    } else {
+      /* ACTIVE epochs: Recycle empty slabs from both FULL and PARTIAL lists
+       * Safety: Under sc->lock, with proper unlinking and current_partial clearing */
+      if (s->list_id == SLAB_LIST_FULL) {
+        list_remove(&es->full, s);
+      } else if (s->list_id == SLAB_LIST_PARTIAL) {
+        list_remove(&es->partial, s);
+      }
       
-      /* Push to cache (or overflow if cache full) - outside lock */
-      cache_push(sc, s);
-      return true;
-    } else if (s->list_id == SLAB_LIST_PARTIAL) {
-      /* Empty PARTIAL slab in ACTIVE epoch: unpublish but don't recycle */
+      /* Unpublish from current_partial if published */
       Slab* expected = s;
       (void)atomic_compare_exchange_strong_explicit(
           &es->current_partial, &expected, NULL,
           memory_order_release, memory_order_relaxed);
+      
+      if (s->list_id != SLAB_LIST_NONE) {
+        s->list_id = SLAB_LIST_NONE;
+        sc->total_slabs--;
+        pthread_mutex_unlock(&sc->lock);
+        
+        /* Push to cache (or overflow if cache full) - outside lock */
+        cache_push(sc, s);
+        return true;
+      }
     }
     
     pthread_mutex_unlock(&sc->lock);
