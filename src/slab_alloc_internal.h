@@ -157,7 +157,7 @@ struct SizeClassAlloc {
   
   /* Phase 2: Empty slab recycling counters */
   _Atomic uint64_t empty_slab_recycled;         /* empty slab pushed to cache */
-  _Atomic uint64_t empty_slab_cache_overflowed; /* cache full, pushed to overflow */
+  _Atomic uint64_t empty_slab_overflowed;       /* cache full, pushed to overflow */
   
   /* Phase 2.0: Slow-path attribution counters */
   _Atomic uint64_t slow_path_cache_miss;        /* new_slab needed mmap */

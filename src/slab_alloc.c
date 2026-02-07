@@ -487,7 +487,7 @@ void allocator_init(SlabAllocator* a) {
     atomic_store_explicit(&a->classes[i].current_partial_null, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].current_partial_full, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].empty_slab_recycled, 0, memory_order_relaxed);
-    atomic_store_explicit(&a->classes[i].empty_slab_cache_overflowed, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].empty_slab_overflowed, 0, memory_order_relaxed);
     
     /* Phase 2.0: Initialize slow-path attribution counters */
     atomic_store_explicit(&a->classes[i].slow_path_cache_miss, 0, memory_order_relaxed);
@@ -597,7 +597,7 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
     sc->cache_overflow_len++;
     
     s->cache_state = SLAB_OVERFLOWED;
-    atomic_fetch_add_explicit(&sc->empty_slab_cache_overflowed, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&sc->empty_slab_overflowed, 1, memory_order_relaxed);
   }
   
   pthread_mutex_unlock(&sc->cache_lock);
@@ -789,8 +789,9 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
   
   SizeClassAlloc* sc = &a->classes[(size_t)ci];
   
-  /* CRITICAL: Refuse allocations into CLOSING epochs */
-  uint32_t state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_acquire);
+  /* CRITICAL: Refuse allocations into CLOSING epochs
+   * Best-effort check: may race with epoch_advance (allocation may succeed briefly) */
+  uint32_t state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_relaxed);
   if (state != EPOCH_ACTIVE) {
     /* Phase 2.0: Attribute slow-path rejection to CLOSING epoch */
     atomic_fetch_add_explicit(&sc->slow_path_epoch_closed, 1, memory_order_relaxed);
@@ -849,7 +850,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
   /* Slow path: need mutex to pick/create slab (use loop, not recursion) */
   for (;;) {
     /* Double-check epoch state in slow path (may have changed) */
-    state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_acquire);
+    state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_relaxed);
     if (state != EPOCH_ACTIVE) {
       return NULL;  /* Epoch closed while we were contending */
     }
@@ -968,7 +969,7 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   if (new_fc == s->object_count) {
     pthread_mutex_lock(&sc->lock);
     
-    uint32_t epoch_state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_acquire);
+    uint32_t epoch_state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_relaxed);
     
     /* Phase 2.1: Track transition to empty (prev_fc == object_count-1 → new_fc == object_count) */
     bool became_empty = (prev_fc == s->object_count - 1);  /* Was one-away, now fully free */
@@ -1153,7 +1154,7 @@ void get_perf_counters(SlabAllocator* a, uint32_t size_class, PerfCounters* out)
   out->current_partial_null = atomic_load_explicit(&sc->current_partial_null, memory_order_relaxed);
   out->current_partial_full = atomic_load_explicit(&sc->current_partial_full, memory_order_relaxed);
   out->empty_slab_recycled = atomic_load_explicit(&sc->empty_slab_recycled, memory_order_relaxed);
-  out->empty_slab_overflowed = atomic_load_explicit(&sc->empty_slab_cache_overflowed, memory_order_relaxed);
+  out->empty_slab_overflowed = atomic_load_explicit(&sc->empty_slab_overflowed, memory_order_relaxed);
 }
 
 /* ------------------------------ RSS (Linux) ------------------------------ */
@@ -1190,11 +1191,11 @@ void epoch_advance(SlabAllocator* a) {
   /* CRITICAL: Implement epoch closing semantics
    * Rule: Never allocate into a CLOSING epoch */
   
-  /* Mark old epoch as CLOSING */
-  atomic_store_explicit(&a->epoch_state[old_epoch], EPOCH_CLOSING, memory_order_release);
+  /* Mark old epoch as CLOSING (relaxed: best-effort visibility) */
+  atomic_store_explicit(&a->epoch_state[old_epoch], EPOCH_CLOSING, memory_order_relaxed);
   
   /* Mark new epoch as ACTIVE (overwrites CLOSING state on wrap-around) */
-  atomic_store_explicit(&a->epoch_state[new_epoch], EPOCH_ACTIVE, memory_order_release);
+  atomic_store_explicit(&a->epoch_state[new_epoch], EPOCH_ACTIVE, memory_order_relaxed);
   
   /* Null current_partial for old epoch across all size classes
    * This ensures no thread will allocate from a published slab in CLOSING epoch */
@@ -1222,7 +1223,8 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
    * This allows applications to explicitly control reclamation boundaries
    * aligned with application lifetime phases (requests, frames, batches).
    */
-  atomic_store_explicit(&a->epoch_state[epoch], EPOCH_CLOSING, memory_order_release);
+  /* Best-effort visibility: allocations may briefly succeed until state observed */
+  atomic_store_explicit(&a->epoch_state[epoch], EPOCH_CLOSING, memory_order_relaxed);
   
   /* Proactively scan for already-empty slabs and recycle them
    * 
