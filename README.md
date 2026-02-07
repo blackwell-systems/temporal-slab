@@ -9,7 +9,7 @@ It replaces spatial hole-finding with temporal grouping, enabling deterministic 
 ## What temporal-slab Guarantees
 
 * **Deterministic latency**  
-  Lock-free allocation fast path with **~30–70ns p50** and **~374ns p99** (≈3.3× better p99 than system malloc).
+  Lock-free allocation fast path with **30ns p50**, **76ns p99** (39× better), **166ns p99.9** (69× better), **1.5µs p99.99** (41× better). Variance: 659× vs malloc 10,585× (16× more predictable).
 
 * **Bounded RSS under churn**  
   **0–2.4% RSS growth** over 1000 churn cycles. No unbounded memory drift.
@@ -188,22 +188,31 @@ make
 
 temporal-slab delivers three key properties for latency-sensitive workloads:
 
-1. **Deterministic allocation latency** - Sub-100ns median, <2µs p99, no jitter
-2. **Stable RSS under churn** - 2.4% growth over 1000 cycles (vs 20-50% for malloc/tcmalloc)
-3. **Predictable trade-offs** - 11.1% internal fragmentation, zero external fragmentation
+1. **Eliminates tail latency spikes** - 39-69× better across p99-p99.9, 16× more predictable variance
+2. **Stable RSS under churn** - 0-2.4% growth over 1000 cycles (vs unbounded malloc drift)
+3. **Predictable trade-offs** - +37% baseline RSS for deterministic behavior
 
-**Quick Results (Intel Core Ultra 7, 128-byte objects):**
+**Tail Latency Results (100M samples, 128-byte objects):**
 
-| Metric | Value | Comparison |
-|--------|-------|------------|
-| p50 allocation | 30ns | Slightly slower than system_malloc (21ns) |
-| p99 allocation | 374ns | **3.3x better than system_malloc** (1,238ns) |
-| RSS growth (steady-state churn) | **0%** | Perfect stability over 100 cycles |
-| Space efficiency | 88.9% | Reasonable for fixed size classes |
-| Memory overhead | +37% | Higher baseline RSS vs system_malloc (21.8 MiB vs 15.9 MiB) |
-| Thread scaling | Linear to 4 threads | Lock-free fast path, cache coherence limits beyond 8 threads |
+| Percentile | temporal-slab | system_malloc | Advantage |
+|------------|---------------|---------------|----------|
+| p50 | 30ns | 24ns | 0.8× (baseline trade-off) |
+| p99 | 76ns | 2,962ns | **39× better** |
+| p99.9 | 166ns | 11,525ns | **69× better** |
+| p99.99 | 1,542ns | 63,940ns | **41× better** |
+| p99.999 | 19.8µs | 254µs | **12.9× better** |
+| Variance | 659× | 10,585× | **16× more predictable** |
 
-**Important:** temporal-slab does not attempt to outperform general-purpose allocators everywhere. It eliminates latency variance and RSS drift for fixed-size, churn-heavy workloads.
+**RSS & Efficiency:**
+
+| Metric | temporal-slab | system_malloc |
+|--------|---------------|---------------|
+| Steady-state RSS growth (100 cycles) | **0%** | 11,174% |
+| Long-term RSS growth (1000 cycles) | 2.4% | Unbounded |
+| Baseline RSS overhead | +37% | - |
+| Space efficiency | 88.9% | ~85% |
+
+**Trade-off:** temporal-slab trades 20% slower median latency (30ns vs 24ns) for **elimination of malloc's catastrophic tail spikes** (2-250µs). At p99.9, malloc hits 11.5µs while temporal-slab stays at 166ns—a 69× difference.
 
 **Full analysis:** See [docs/results.md](docs/results.md) for detailed benchmarks, charts, and interpretation guidelines.
 
