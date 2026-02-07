@@ -476,6 +476,7 @@ void allocator_init(SlabAllocator* a) {
       list_init(&a->classes[i].epochs[e].partial);
       list_init(&a->classes[i].epochs[e].full);
       atomic_store_explicit(&a->classes[i].epochs[e].current_partial, NULL, memory_order_relaxed);
+      atomic_store_explicit(&a->classes[i].epochs[e].empty_partial_count, 0, memory_order_relaxed);
     }
 
     /* Initialize performance counters */
@@ -805,6 +806,11 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     uint32_t idx = slab_alloc_slot_atomic(cur, &prev_fc);
     
     if (idx != UINT32_MAX) {
+      /* Phase 2.1: If allocating from empty slab, decrement empty counter */
+      if (prev_fc == cur->object_count) {
+        atomic_fetch_sub_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
+      }
+      
       /* Precise transition detection: check if WE caused 1->0 */
       if (prev_fc == 1) {
         /* Slab is now full - move PARTIAL->FULL and publish new current */
@@ -878,6 +884,10 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       continue;
     }
     
+    /* Phase 2.1: If allocating from empty slab, decrement empty counter */
+    if (prev_fc == s->object_count) {
+      atomic_fetch_sub_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
+    }
 
     /* Check if we caused 1->0 transition */
     if (prev_fc == 1) {
@@ -960,6 +970,9 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
     
     uint32_t epoch_state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_acquire);
     
+    /* Phase 2.1: Track transition to empty (prev_fc == object_count-1 → new_fc == object_count) */
+    bool became_empty = (prev_fc == s->object_count - 1);  /* Was one-away, now fully free */
+    
     if (epoch_state == EPOCH_CLOSING) {
       /* FIX #1: Aggressive recycling ONLY for CLOSING epochs
        * 
@@ -969,6 +982,8 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
         list_remove(&es->full, s);
       } else if (s->list_id == SLAB_LIST_PARTIAL) {
         list_remove(&es->partial, s);
+        /* Phase 2.1: Decrement empty counter (removing from partial list) */
+        atomic_fetch_sub_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
       }
       
       /* Ensure not published in current_partial */
@@ -986,10 +1001,16 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
         cache_push(sc, s);
         return true;
       }
+    } else {
+      /* FIX #1: For ACTIVE epochs, do NOT recycle empty slabs
+       * They stay on partial list for fast reuse (good latency, stable RSS).
+       * This makes epoch_close() the explicit control point for RSS reclamation. */
+      
+      /* Phase 2.1: Increment empty counter (slab just became empty and staying in partial) */
+      if (became_empty && s->list_id == SLAB_LIST_PARTIAL) {
+        atomic_fetch_add_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
+      }
     }
-    /* FIX #1: For ACTIVE epochs, do NOT recycle empty slabs
-     * They stay on partial list for fast reuse (good latency, stable RSS).
-     * This makes epoch_close() the explicit control point for RSS reclamation. */
     
     pthread_mutex_unlock(&sc->lock);
     return true;
@@ -1078,6 +1099,7 @@ void allocator_destroy(SlabAllocator* a) {
         list_init(&es->partial);
         list_init(&es->full);
         atomic_store_explicit(&es->current_partial, NULL, memory_order_relaxed);
+        atomic_store_explicit(&es->empty_partial_count, 0, memory_order_relaxed);
       }
       
       free(sc->epochs);
