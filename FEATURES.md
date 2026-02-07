@@ -290,6 +290,93 @@ Dual-output pattern for production use:
 - **High slow-path rate**: Check attribution → tune cache or fix epoch usage
 - **Memory leak**: Per-epoch RSS shows which epoch won't drain
 
+#### Phase 2.1-2.4: Complete Observability Pipeline
+
+Building on Phase 2.0's foundation, four additional phases transform epochs into **fully observable temporal windows**:
+
+##### Phase 2.1: O(1) Reclaimable Tracking
+
+**Problem**: Scanning partial lists to find empty slabs is O(n) expensive.
+
+**Solution**: Atomic `empty_partial_count` per epoch:
+```c
+SlabEpochStats es;
+slab_stats_epoch(alloc, 2, 5, &es);
+printf("Reclaimable: %u slabs (%.2f KB) [O(1) query]\n",
+       es.reclaimable_slab_count, es.reclaimable_bytes / 1024.0);
+```
+
+**Impact**: 100+ slabs → O(1) atomic load (~5ns vs ~1µs scan)
+
+##### Phase 2.2: Era Stamping
+
+**Problem**: "Is this epoch 0 from now, or from 5 rotations ago?"
+
+**Solution**: Monotonic 64-bit era counter:
+```c
+slab_stats_epoch(alloc, 2, 0, &es);
+printf("Epoch %u, Era %lu\n", es.epoch_id, es.epoch_era);
+// Example: (epoch=0, era=105) vs (epoch=0, era=110) = different rotations
+```
+
+**Use case**: Correlate with logs: "Request XYZ allocated in (epoch=3, era=1250)"
+
+##### Phase 2.3: Epoch Metadata (Temporal Profiling)
+
+**Problem**: Epochs are opaque buckets. Can't debug "why stuck?"
+
+**Solution**: Three metadata fields per epoch:
+```c
+slab_stats_epoch(alloc, 2, 5, &es);
+printf("Epoch 5:\n");
+printf("  open_since_ns: %lu (opened %.1f sec ago)\n", 
+       es.open_since_ns, (now_ns() - es.open_since_ns) / 1e9);
+printf("  alloc_count: %lu live allocations\n", es.alloc_count);
+printf("  label: '%s'\n", es.label);  // e.g., "request_id:abc123"
+```
+
+**Use cases**:
+- **Detect stuck epochs**: `open_since_ns` 2 minutes old + `alloc_count=15000`
+- **Profile allocation patterns**: `alloc_count` spikes correlate with load
+- **Correlate with app phases**: Labels like "batch_42", "frame:1234"
+
+##### Phase 2.4: RSS Delta Tracking
+
+**Problem**: "Did closing the epoch actually free memory?"
+
+**Solution**: Before/after RSS measurements:
+```c
+epoch_close(alloc, 5);  // Triggers measurement
+slab_stats_epoch(alloc, 2, 5, &es);
+uint64_t delta = es.rss_before_close - es.rss_after_close;
+printf("Epoch 5 closed:\n");
+printf("  rss_before: %.2f MB\n", es.rss_before_close / 1024.0 / 1024);
+printf("  rss_after:  %.2f MB\n", es.rss_after_close / 1024.0 / 1024);
+printf("  delta:      %.2f MB reclaimed\n", delta / 1024.0 / 1024);
+```
+
+**Value**: Quantifies reclamation effectiveness → validates RSS reclamation is working
+
+#### Complete Observability Workflow
+
+The five phases answer a complete debugging workflow:
+
+| Question | Phase | API |
+|----------|-------|-----|
+| Why did allocation slow down? | 2.0 | `slow_path_cache_miss`, `slow_path_epoch_closed` |
+| Which epoch is using memory? | 2.1 | `reclaimable_slab_count` (O(1)) |
+| Is this the same epoch or new rotation? | 2.2 | `epoch_era` (monotonic ID) |
+| How old is this epoch? | 2.3 | `open_since_ns` (age in nanoseconds) |
+| How many objects still live? | 2.3 | `alloc_count` (refcount) |
+| What caused these allocations? | 2.3 | `label` (semantic tag) |
+| Did closing it free memory? | 2.4 | RSS delta (MB reclaimed) |
+
+**Production scenario**: "Epoch 7 using 40MB"
+1. Check `open_since_ns`: Opened 2 minutes ago (stuck!)
+2. Check `alloc_count`: 15,000 live allocations (leak!)
+3. Check `label`: "session:batch_42" (identifies culprit)
+4. Close epoch: `rss_before=40MB`, `rss_after=2MB` (38MB reclaimed)
+
 ---
 
 ### 7. ABA-Safe Handle Validation (Portable, No UAF)
