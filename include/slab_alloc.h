@@ -452,6 +452,7 @@ EpochId epoch_current(SlabAllocator* alloc);
  * 
  * BEHAVIOR:
  * - Atomic increment of current_epoch counter
+ * - Previous epoch marked CLOSING (no new allocations allowed)
  * - No immediate memory reclamation (epochs drain naturally as objects are freed)
  * - No compaction or relocation (objects never move)
  * 
@@ -468,6 +469,49 @@ EpochId epoch_current(SlabAllocator* alloc);
  * THREAD SAFETY: Safe to call concurrently (uses atomic increment).
  */
 void epoch_advance(SlabAllocator* alloc);
+
+/* Close specific epoch (Phase 2 RSS Reclamation)
+ * 
+ * Marks an epoch as CLOSING, preventing new allocations and enabling aggressive
+ * reclamation when slabs become empty.
+ * 
+ * BEHAVIOR:
+ * - Marks epoch as CLOSING (no new allocations)
+ * - Empty slabs in CLOSING epochs are immediately recycled
+ * - With ENABLE_RSS_RECLAMATION=1: recycled slabs have physical pages reclaimed via madvise()
+ * - Does NOT free live objects (existing objects remain valid)
+ * - Does NOT compact or relocate (objects never move)
+ * 
+ * USE CASES:
+ * - Request completion: close epoch when HTTP request finishes
+ * - Frame boundaries: close epoch at end of game frame
+ * - Batch expiration: close epoch when batch processing completes
+ * - Session timeout: close epoch when user session expires
+ * 
+ * EXAMPLE:
+ *   // Allocate request-scoped objects
+ *   EpochId req_epoch = epoch_current(alloc);
+ *   void* session = alloc_obj_epoch(alloc, sizeof(Session), req_epoch, &h1);
+ *   void* buffer = alloc_obj_epoch(alloc, 4096, req_epoch, &h2);
+ *   
+ *   process_request(session, buffer);
+ *   
+ *   // Free request objects
+ *   free_obj(alloc, h1);
+ *   free_obj(alloc, h2);
+ *   
+ *   // Close epoch - slabs now empty, RSS can drop
+ *   epoch_close(alloc, req_epoch);
+ * 
+ * PHASE 2 RSS RECLAMATION:
+ * When combined with ENABLE_RSS_RECLAMATION=1, closing an epoch enables deterministic
+ * RSS drops as slabs drain. This is the key differentiator: temporal_slab can return
+ * memory at epoch granularity (aligned with application lifetime phases), while
+ * traditional allocators can only react to emergent hole patterns.
+ * 
+ * THREAD SAFETY: Safe to call concurrently (uses atomic store).
+ */
+void epoch_close(SlabAllocator* alloc, EpochId epoch);
 
 /* Allocate object in specific epoch (handle-based)
  * 
