@@ -498,6 +498,10 @@ The `classes` array contains 8 objects (one per size class). Each object has ide
   "madvise_calls": 50,
   "madvise_bytes": 204800,
   "madvise_failures": 0,
+  "epoch_close_calls": 10,
+  "epoch_close_scanned_slabs": 20,
+  "epoch_close_recycled_slabs": 18,
+  "epoch_close_total_ns": 250000,
   "cache_size": 5,
   "cache_capacity": 32,
   "cache_overflow_len": 0,
@@ -794,6 +798,84 @@ Object size in bytes for this class (64, 96, 128, 192, 256, 384, 512, 768).
 
 ---
 
+### Epoch-Close Telemetry (Phase 2.1)
+
+#### `epoch_close_calls` (uint64)
+
+**Type:** Monotonic counter  
+**Semantics:** Number of times `epoch_close()` was called for this class
+
+**Usage:**
+- Epoch lifecycle tracking
+- Shows reclamation attempt frequency
+- High rate indicates active epoch rotation
+
+**Interpretation:**
+```
+epoch_close_rate = delta(epoch_close_calls) / delta(time)
+# Should correlate with application request completion rate
+```
+
+---
+
+#### `epoch_close_scanned_slabs` (uint64)
+
+**Type:** Monotonic counter  
+**Semantics:** Total slabs examined during `epoch_close()` for this class
+
+**Usage:**
+- Reclamation workload indicator
+- Shows how many slabs needed inspection
+- Higher values = more work per epoch_close
+
+**Analysis:**
+```
+avg_scanned_per_close = epoch_close_scanned_slabs / epoch_close_calls
+# High average suggests many partial slabs per epoch
+```
+
+---
+
+#### `epoch_close_recycled_slabs` (uint64)
+
+**Type:** Monotonic counter  
+**Semantics:** Slabs successfully recycled during `epoch_close()` for this class
+
+**Usage:**
+- Reclamation effectiveness
+- Shows how many empty slabs were reclaimed
+- Compare with `scanned_slabs` for yield ratio
+
+**Key metric:**
+```
+reclamation_yield = epoch_close_recycled_slabs / epoch_close_scanned_slabs
+# Good: > 0.8 (80%+ of scanned slabs are recyclable)
+# Warning: < 0.3 (low reclamation efficiency)
+```
+
+---
+
+#### `epoch_close_total_ns` (uint64)
+
+**Type:** Monotonic counter (nanoseconds)  
+**Semantics:** Total time spent in `epoch_close()` for this class
+
+**Usage:**
+- Performance overhead tracking
+- Shows reclamation latency cost
+- Measured using `CLOCK_MONOTONIC`
+
+**Latency calculation:**
+```
+avg_epoch_close_latency_ms = (epoch_close_total_ns / epoch_close_calls) / 1e6
+# Expected: < 1ms for typical workloads
+# Alert if: > 10ms (indicates scanning bottleneck)
+```
+
+**Note:** This measures `epoch_close()` duration *including* slab scanning and recycling, but *excluding* the `madvise()` system call (which happens outside the lock).
+
+---
+
 ## Usage Examples
 
 ### 1. Calculate Slow Path Rate
@@ -844,6 +926,39 @@ def cache_hit_rate(snapshot):
                      for c in snapshot.classes)
     total_allocs = sum(c.new_slab_count for c in snapshot.classes)
     return total_fast / total_allocs if total_allocs > 0 else 1.0
+```
+
+---
+
+### 5. Epoch-Close Reclamation Metrics (Phase 2.1)
+
+```python
+def epoch_close_metrics(snap1, snap2):
+    """Calculate epoch_close performance between two snapshots."""
+    delta_time = (snap2.timestamp_ns - snap1.timestamp_ns) / 1e9
+    
+    # Global metrics across all classes
+    delta_calls = sum(c.epoch_close_calls for c in snap2.classes) - \
+                  sum(c.epoch_close_calls for c in snap1.classes)
+    delta_scanned = sum(c.epoch_close_scanned_slabs for c in snap2.classes) - \
+                    sum(c.epoch_close_scanned_slabs for c in snap1.classes)
+    delta_recycled = sum(c.epoch_close_recycled_slabs for c in snap2.classes) - \
+                     sum(c.epoch_close_recycled_slabs for c in snap1.classes)
+    delta_ns = sum(c.epoch_close_total_ns for c in snap2.classes) - \
+               sum(c.epoch_close_total_ns for c in snap1.classes)
+    
+    return {
+        "epoch_close_rate": delta_calls / delta_time,  # calls/sec
+        "avg_latency_ms": (delta_ns / delta_calls / 1e6) if delta_calls > 0 else 0,
+        "reclamation_yield": (delta_recycled / delta_scanned) if delta_scanned > 0 else 0,
+        "slabs_recycled_rate": delta_recycled / delta_time,  # slabs/sec
+    }
+
+# Example usage
+metrics = epoch_close_metrics(snapshot_before, snapshot_after)
+print(f"Epoch close rate: {metrics['epoch_close_rate']:.2f} calls/sec")
+print(f"Average latency: {metrics['avg_latency_ms']:.3f} ms")
+print(f"Reclamation yield: {metrics['reclamation_yield']:.1%}")
 ```
 
 ---
