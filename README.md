@@ -1,16 +1,36 @@
 # temporal-slab
 
-**temporal-slab trades a small median slowdown for orders-of-magnitude reduction in tail latency, eliminating allocator-induced latency spikes that break real-time and latency-sensitive systems.**
+**temporal-slab is a lifetime-aware slab allocator designed to eliminate allocator-induced tail latency and memory drift in long-running systems.**
 
-It achieves this through lifetime-aware allocation: objects allocated together stay together, enabling deterministic memory reuse, bounded worst-case behavior, and application-controlled reclamation at epoch boundaries.
+It provides predictable allocation latency, bounded RSS under sustained churn, and application-controlled memory reclamation using epoch-based lifetimes.
+
+**temporal-slab is not a general-purpose malloc replacement.**  
+It is designed for systems where worst-case behavior matters more than average speed.
 
 ---
 
-## Tail Latency Is the Point
+## Why It Exists
 
-temporal-slab is intentionally optimized for the deep tail. While system_malloc has a slightly faster median (24ns vs 30ns), it exhibits **catastrophic latency spikes** under sustained load:
+General-purpose allocators optimize for average-case throughput. Under sustained load, they exhibit rare but catastrophic latency spikes and unbounded RSS drift.
 
-**Measured over 100 million allocations:**
+In latency-sensitive systems, these outliers dominate SLA violations, frame drops, and tail amplification.
+
+**temporal-slab trades a small median slowdown for structural elimination of allocator-induced tail risk.**
+
+### The Exchange
+
+**You trade:**
+- +6ns median latency (+20% slower average case)
+- +37% baseline RSS (epochs keep some slabs hot)
+
+**To eliminate:**
+- 2µs–250µs tail spikes (69× reduction at p99.9)
+- Allocator-driven instability (16× more predictable variance)
+- Unpredictable reclamation (0–2.4% RSS growth vs unbounded drift)
+
+---
+
+## Measured Results (100M Allocations)
 
 | Percentile | system_malloc | temporal-slab | Advantage |
 |------------|---------------|---------------|-----------|
@@ -20,9 +40,11 @@ temporal-slab is intentionally optimized for the deep tail. While system_malloc 
 | p99.999 | 254,039 ns | 19,764 ns | **12.9× better** |
 | **Variance** | **10,585×** | **659×** | **16× more predictable** |
 
-In latency-sensitive systems, these outliers **dominate user experience, SLA violations, and system stability**. temporal-slab eliminates them by design.
+**RSS stability:**
+- temporal-slab: 0–2.4% growth over 1000 churn cycles
+- system_malloc: 11,174% growth (unbounded drift)
 
-This is not tuning. This is **structural predictability** — the difference between algorithmic guarantees and heuristic behavior.
+**Key insight:** malloc can hit 254µs at p99.999. temporal-slab stays in nanoseconds until the deepest tail.
 
 ---
 
