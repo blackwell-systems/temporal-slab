@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include -DENABLE_RSS_RECLAMATION=1
 TSAN_FLAGS = -O1 -g -std=c11 -pthread -Wall -Wextra -pedantic -I../include -DENABLE_RSS_RECLAMATION=1 -fsanitize=thread
 
-all: smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump
+all: smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump synthetic_bench
 
 # ThreadSanitizer builds for data race detection
 tsan: tsan_test
@@ -72,7 +72,11 @@ stats_dump: stats_dump.c slab_lib.o slab_stats.o slab_diagnostics.o
 test_era_stamping: test_era_stamping.c slab_lib.o
 	$(CC) $(CFLAGS) test_era_stamping.c slab_lib.o -o test_era_stamping
 
+# Canonical benchmark harness
+synthetic_bench: ../workloads/synthetic_bench.c slab_lib.o
+	$(CC) $(CFLAGS) ../workloads/synthetic_bench.c slab_lib.o -o ../workloads/synthetic_bench
+
 clean:
-	rm -f smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump slab_lib.c slab_lib.o epoch_domain.o slab_stats.o benchmark_threads_tsan slab_lib_tsan.o tsan_test
+	rm -f smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump slab_lib.c slab_lib.o epoch_domain.o slab_stats.o benchmark_threads_tsan slab_lib_tsan.o tsan_test ../workloads/synthetic_bench
 
 .PHONY: all clean
