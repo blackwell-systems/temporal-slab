@@ -6,9 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-### Phase 2.0: Observability System
+### Phase 2: Complete Observability System
 
-#### Added
+Complete observability implementation across 5 incremental phases, transforming epochs from opaque memory buckets into fully observable temporal windows for debugging production issues.
+
+#### Phase 2.0: Core Stats API
+
+##### Added
 - **Stats API** - Versioned snapshot-based observability for production diagnostics
   - `slab_stats_global()` - Aggregate stats across all size classes and epochs
   - `slab_stats_class()` - Per-size-class diagnostics with derived metrics
@@ -32,7 +36,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `estimated_rss_bytes` - Predicted RSS footprint per class/epoch
 - **Forward Compatibility** - `SLAB_STATS_VERSION` constant for API evolution
 
-#### Changed
+##### Changed
 - Exposed `EpochLifecycleState` enum in public API (`include/slab_alloc.h`)
 - Counter initialization in `allocator_init()` - all Phase 2.0 counters zeroed
 - Instrumentation added at three key code points (minimal fast-path impact):
@@ -40,14 +44,140 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `new_slab()` line 657 - cache miss attribution  
   - `cache_push()` lines 606-612 - madvise tracking
 
-#### Performance
+##### Performance
 - **No regression**: p50: 31ns, p99: 1568ns, p999: 2818ns (unchanged)
 - **Overhead**: Five relaxed atomic increments on slow paths only
 - **Snapshot cost**: O(classes × epochs) = O(128) iterations + brief locks (~100µs)
 
-#### Documentation
+##### Documentation
 - `docs/OBSERVABILITY_DESIGN.md` - Phase 2.0/2.1/2.2 roadmap with diagnostic patterns
 - `include/slab_stats.h` - Comprehensive API documentation with usage examples
+
+#### Phase 2.1: O(1) Reclaimable Tracking
+
+##### Added
+- **Atomic Empty Slab Counter** - `empty_partial_count` per epoch
+  - Incremented when slab transitions to fully empty (all slots free)
+  - Decremented when empty slab gets first allocation
+  - Decremented when empty slab recycled to cache
+  - Eliminates O(n) scan of partial list in `slab_stats_epoch()`
+- **Instant Reclamation Visibility** - `reclaimable_slab_count` in `SlabEpochStats`
+  - O(1) query instead of O(partial_slabs) scan
+  - Shows exact number of empty slabs ready for madvise
+  - Enables real-time reclamation potential monitoring
+
+##### Changed
+- `EpochState` struct: Added `empty_partial_count` atomic counter
+- `alloc_obj_epoch()`: Decrement counter when allocating from empty slab
+- `free_obj()`: Increment counter when slab becomes empty (both ACTIVE and CLOSING)
+- `epoch_close()`: Decrement counter when recycling empty slab
+- `slab_stats_epoch()`: Read atomic counter instead of scanning partial list
+
+##### Performance
+- **Query speedup**: 100+ slabs → O(1) atomic load (~5ns vs ~1µs)
+- **Zero allocation overhead**: Counter updates only on empty transitions
+- **Memory cost**: 4 bytes per epoch per size class (512 bytes total)
+
+#### Phase 2.2: Era Stamping
+
+##### Added
+- **Monotonic Era Counter** - `epoch_era_counter` global atomic
+  - Increments on every `epoch_advance()` call
+  - Never wraps (64-bit: ~584 billion years at 1Hz)
+  - Provides unique temporal identity across epoch wraparounds
+- **Per-Epoch Era Stamps** - `epoch_era[EPOCH_COUNT]` array
+  - Records era when epoch was last activated
+  - Stamped into slabs on allocation (`slab->era`)
+  - Exposed via `SlabEpochStats` for observability
+- **Temporal Uniqueness** - Solve "is this the same epoch or new rotation?"
+  - Before: (epoch=0, era=100) vs (epoch=0, era=105) = different rotations
+  - After: Can distinguish epochs across wraparound boundaries
+  - Enables correlation with application logs/metrics
+
+##### Changed
+- `SlabAllocator`: Added `epoch_era_counter` and `epoch_era[]` array
+- `Slab` struct: Added `era` field for temporal stamping
+- `epoch_advance()`: Increment counter and stamp `epoch_era[new_epoch]`
+- `new_slab()`: Copy `epoch_era[epoch_id]` into `slab->era`
+- `SlabEpochStats`: Added `epoch_era` field for observability
+
+##### Use Cases
+- Detect epoch wraparound: Same `epoch_id` but different `era` values
+- Correlate with logs: "Request XYZ allocated in (epoch=3, era=1250)"
+- Track epoch lifetime: "Epoch 5 lived through eras 100-115 (15 rotations)"
+
+#### Phase 2.3: Epoch Metadata
+
+##### Added
+- **Temporal Profiling Metadata** - `EpochMetadata` struct per epoch
+  - `open_since_ns`: Timestamp when epoch became ACTIVE (0 if never opened)
+  - `alloc_count`: Atomic refcount of live allocations in this epoch
+  - `label[32]`: Semantic tag for debugging (e.g., "request_id:abc123", "frame:1234")
+- **Lifetime Tracking** - Know when epochs opened and how long they've been active
+  - Set on `epoch_advance()`: `open_since_ns = now_ns()`
+  - Enables age detection: "Epoch 7 opened 2 minutes ago and still has 15K live objects"
+- **Allocation Refcounting** - Track live allocations per epoch
+  - Incremented on successful allocation (both fast and slow paths)
+  - Decremented on successful free
+  - Memory ordering: relaxed (best-effort visibility, eventual consistency)
+- **Semantic Labeling** - Correlate epochs with application phases
+  - 32-byte string field for custom tags
+  - Reset to empty on `epoch_advance()`
+  - Examples: "batch_42", "session:user_123", "frame:1234"
+
+##### Changed
+- `EpochMetadata` struct: Added to `slab_alloc_internal.h`
+- `SlabAllocator`: Added `epoch_meta[EPOCH_COUNT]` array
+- `allocator_init()`: Initialize all metadata fields to zero
+- `epoch_advance()`: Reset metadata (timestamp, zero count, clear label)
+- `alloc_obj_epoch()`: Increment `alloc_count` on success (2 code paths)
+- `free_obj()`: Decrement `alloc_count` on successful free
+- `SlabEpochStats`: Added 3 metadata fields for observability
+
+##### Use Cases
+- **Detect stuck epochs**: `open_since_ns` far in past + `alloc_count > 0`
+- **Profile allocation patterns**: `alloc_count` spikes correlate with load
+- **Debug lifetime issues**: Labels connect allocator state to app phases
+- **Measure drain time**: Delta between `open_since_ns` observations
+
+#### Phase 2.4: RSS Delta Tracking
+
+##### Added
+- **Before/After RSS Measurements** - Quantify memory reclamation impact
+  - `rss_before_close`: RSS snapshot at start of `epoch_close()` (0 if never closed)
+  - `rss_after_close`: RSS snapshot at end of `epoch_close()` (0 if never closed)
+  - Delta calculation: `rss_before - rss_after` shows MB reclaimed
+- **Reclamation Validation** - Hard numbers on memory returned to OS
+  - Validates that closing epochs actually frees memory
+  - Quantifies effectiveness (MB freed per close)
+  - Diagnoses leaks (delta approaching zero = problem)
+
+##### Changed
+- `EpochMetadata` struct: Added `rss_before_close` and `rss_after_close`
+- `allocator_init()`: Initialize RSS fields to zero
+- `epoch_close()`: Capture RSS at start and end of function
+- `SlabEpochStats`: Added RSS delta fields for observability
+
+##### Use Cases
+- **Validate reclamation**: "Closed epoch 5, freed 36 MB (28% reduction)"
+- **Compare strategies**: A/B test epoch rotation policies by RSS delta
+- **Diagnose leaks**: Zero delta despite many frees indicates leak
+- **Track RSS trends**: Sum deltas across epochs for total reclamation
+
+##### Example Output
+```
+Epoch 5 closed:
+  rss_before: 128 MB
+  rss_after:   92 MB
+  delta:       36 MB reclaimed (28% reduction)
+```
+
+#### Testing
+- `test_era_stamping.c` - Validates monotonic era progression and wraparound
+- `test_epoch_metadata.c` - 5 scenarios testing timestamps, refcounts, isolation, wraparound
+- `test_rss_delta.c` - 3 scenarios testing RSS capture, multiple closes, unclosed epochs
+
+All tests pass, confirming complete Phase 2 functionality.
 
 ---
 
