@@ -51,7 +51,8 @@ This document builds the theoretical foundation for temporal-slab from first pri
 - [Bounded RSS Through Conservative Recycling](#bounded-rss-through-conservative-recycling)
 - [Hazard Pointers and Reference Counting](#hazard-pointers-and-reference-counting)
 - [Slab Cache](#slab-cache)
-- [Refusal to Unmap](#refusal-to-unmap)
+- [Refusal to Unmap vs madvise](#refusal-to-unmap-vs-madvise)
+- [Epoch-Granular Memory Reclamation](#epoch-granular-memory-reclamation)
 - [O(1) Deterministic Class Selection](#o1-deterministic-class-selection)
 - [Branch Prediction and Misprediction](#branch-prediction-and-misprediction)
 
@@ -2621,15 +2622,253 @@ The cache absorbs transient fluctuations in allocation rate. A workload that all
 
 If the cache is full and another slab becomes empty, it is pushed to an overflow list. The overflow list has unbounded capacity. Slabs on the overflow list remain mapped—they are not unmapped (no munmap).
 
-## Refusal to Unmap
+## Refusal to Unmap vs madvise
 
-temporal-slab never unmaps slabs during runtime. When a slab becomes empty, it is pushed to the cache or overflow list but remains mapped. Unmapping only occurs during allocator destruction.
+temporal-slab in its current implementation (v0.x) never unmaps slabs during runtime. When a slab becomes empty, it is pushed to the cache or overflow list but remains mapped. Unmapping only occurs during allocator destruction.
 
-This design choice has two benefits:
+This design choice provides two critical benefits:
 
 1. **Safe handle validation.** temporal-slab uses opaque handles encoding a slab pointer, slot index, and size class. When freeing a handle, the allocator checks the slab's magic number and slot state. If the handle is invalid (double-free, wrong allocator, corrupted), the check fails and returns an error. But this only works if the slab remains mapped. If unmapped, dereferencing the handle triggers a segmentation fault.
 
-2. **Bounded RSS.** RSS is bounded by the high-water mark of allocations. If a workload briefly allocates 10GB then stabilizes at 1GB, RSS is 10GB. This is deliberate: RSS reflects the maximum working set observed, not the current working set. Unmapping slabs would reduce RSS but at the cost of mmap/munmap churn and the inability to validate handles.
+2. **Bounded RSS stability.** RSS is bounded by the high-water mark of allocations. If a workload briefly allocates 10GB then stabilizes at 1GB, RSS is 10GB. This is deliberate: RSS reflects the maximum working set observed, not the current working set. The RSS does not drift upward over time—it remains constant at the high-water mark.
+
+**The trade-off: Higher absolute RSS for safety and stability**
+
+This approach causes higher absolute RSS compared to allocators that aggressively return memory to the OS. The allocator holds onto empty slabs in the cache and overflow lists, keeping them mapped even when unused.
+
+**Example:**
+```
+Workload: Allocate 10,000 objects, free all, allocate 1,000 objects
+
+malloc/jemalloc:
+- Peak RSS: 40 MB (10,000 objects)
+- After free: 5 MB (aggressive munmap returns memory)
+- Steady state: 5 MB (1,000 objects)
+
+temporal-slab (current):
+- Peak RSS: 40 MB (10,000 objects)
+- After free: 40 MB (slabs remain mapped)
+- Steady state: 40 MB (1,000 objects + cached slabs)
+
+Result: temporal-slab uses 8× more RSS despite 10× fewer live objects
+```
+
+**Why this was acceptable for v0.x:**
+
+The priority was proving temporal grouping prevents RSS **drift**:
+- malloc: 12 MB → 25 MB over 7 days (+108% drift)
+- temporal-slab: 12 MB → 12 MB (0% drift)
+
+Absolute RSS (40 MB vs 5 MB) was secondary to stability (no drift).
+
+**The path forward: madvise(MADV_DONTNEED)**
+
+Linux provides `madvise(MADV_DONTNEED)` which releases physical memory while keeping the virtual mapping:
+
+```c
+// Tell OS: "I don't need this physical memory, free it"
+madvise(slab, 4096, MADV_DONTNEED);
+
+// Virtual address remains valid (no segfault if accessed)
+// Physical pages returned to OS (RSS drops)
+// If accessed later, page fault allocates new physical page (zeroed)
+```
+
+**Key properties:**
+- Virtual address remains mapped (no segfault)
+- Physical memory released (RSS drops immediately)
+- Handle validation still works (magic number and bitmap remain accessible)
+- No mmap/munmap churn (virtual mapping unchanged)
+
+**Why madvise is better than munmap for temporal-slab:**
+
+```
+munmap(slab):
+- Virtual address unmapped → accessing it segfaults
+- Handle validation broken → cannot safely check stale handles
+- Requires mmap to reuse → syscall overhead
+
+madvise(slab, MADV_DONTNEED):
+- Virtual address remains mapped → accessing it succeeds (faults in new page)
+- Handle validation works → stale handles detected safely
+- No mmap needed to reuse → zero syscall overhead
+```
+
+**Implementation strategy (Phase 1 roadmap):**
+
+```c
+// When epoch is closed and all slabs are empty:
+for (each empty slab in closed epoch) {
+  madvise(slab, 4096, MADV_DONTNEED);
+  // Physical memory released
+  // Virtual mapping intact
+  // Handle validation still works
+}
+```
+
+**Expected impact:**
+
+```
+Workload: Allocate 10,000 objects, free all, allocate 1,000 objects
+
+temporal-slab with madvise:
+- Peak RSS: 40 MB (10,000 objects)
+- After free + epoch close: 5 MB (madvise released 35 MB)
+- Steady state: 5 MB (1,000 objects)
+
+Result: Competitive absolute RSS with malloc, zero drift over time
+```
+
+**Why this wasn't implemented initially:**
+
+The focus was on proving the core thesis: temporal grouping prevents RSS drift. Adding madvise would have complicated the proof-of-concept. Now that drift prevention is demonstrated (0% growth over 1000 cycles), optimizing absolute RSS is the next priority.
+
+**Trade-offs of madvise:**
+
+**Benefits:**
+- RSS drops to match live set (competitive with malloc)
+- Safety contract intact (no segfaults, handle validation works)
+- No syscall churn (madvise once per epoch close, not per allocation)
+
+**Costs:**
+- Page faults on reuse (minor faults, ~1-2µs per slab)
+- Slightly more complex reclamation logic
+- OS-specific (Linux/BSD have madvise, but behavior differs slightly)
+
+**The current architecture supports madvise without redesign:**
+
+- Slabs remain mapped → handle encoding unchanged
+- Epoch system tracks lifetime phases → knows when to call madvise
+- Conservative recycling → only FULL slabs are candidates
+
+This makes madvise a straightforward addition in Phase 1 of the roadmap.
+
+## Epoch-Granular Memory Reclamation
+
+Epoch-granular memory reclamation is the ability to release memory at the granularity of entire epochs rather than individual allocations or holes. This is temporal-slab's unique differentiator over traditional allocators.
+
+**The problem with hole-granular reclamation:**
+
+Traditional allocators (malloc, jemalloc, tcmalloc) reclaim memory by finding "holes"—freed regions—and returning them to the OS:
+
+```
+Page with mixed lifetimes:
+[Live obj][FREED    ][Live obj][FREED    ][Live obj]
+
+Cannot reclaim because live objects pin the page
+Hole-granular reclamation is blocked by scattered live objects
+```
+
+Over time, live objects scatter across many pages. Even aggressive compaction (moving live objects to consolidate pages) cannot solve this without:
+- Pointer invalidation (breaks C/C++ semantics)
+- Stop-the-world pauses (unacceptable latency)
+- Heuristic guessing (when is it safe to compact?)
+
+**Epoch-granular reclamation:**
+
+temporal-slab groups allocations by epoch. When an epoch is closed, no new allocations enter it. As objects are freed, the epoch drains. When the epoch is completely empty, the allocator knows all slabs in that epoch can be reclaimed:
+
+```
+Epoch 1 (closed):
+Slab A: [FREED][FREED][FREED]... (all empty)
+Slab B: [FREED][FREED][FREED]... (all empty)
+Slab C: [FREED][FREED][FREED]... (all empty)
+
+All slabs empty → Call madvise on entire epoch → RSS drops predictably
+```
+
+**Why this is impossible for general allocators:**
+
+malloc has no concept of epochs. It doesn't know which objects were allocated together or when their collective lifetime phase ends. It must wait for holes to appear and hope they can be coalesced.
+
+temporal-slab explicitly tracks lifetime phases via epochs. The application signals phase transitions with `epoch_advance()` or `epoch_close()`. This provides the allocator information that malloc fundamentally lacks.
+
+**The `epoch_close()` API (Phase 2 roadmap):**
+
+```c
+// Application logic
+EpochId batch_epoch = epoch_current(alloc);
+
+// Allocate all objects for a batch in the same epoch
+for (int i = 0; i < batch_size; i++) {
+  void* obj = slab_malloc_epoch(alloc, size, batch_epoch);
+  process_object(obj);
+}
+
+// Batch complete, close the epoch
+epoch_close(alloc, batch_epoch);
+// → No new allocations in this epoch
+// → When all objects freed, madvise all slabs
+// → RSS drops deterministically
+```
+
+**Predictable reclamation timeline:**
+
+```
+T=0: epoch_advance() → Epoch 1 becomes active
+T=0-5s: Allocate 10,000 objects in Epoch 1
+T=5s: epoch_close(Epoch 1) → Epoch 1 closed
+T=5-60s: Objects freed as they expire (sessions timeout, requests complete)
+T=60s: Last object freed → Epoch 1 completely empty
+T=60s: madvise() all Epoch 1 slabs → RSS drops by 40 MB
+
+Result: Deterministic reclamation 60 seconds after close
+```
+
+Compare to malloc:
+```
+T=0-5s: Allocate 10,000 objects
+T=5-60s: Objects freed as they expire
+T=60s: All objects freed... but RSS remains high
+T=???: malloc eventually returns some memory (nondeterministic)
+
+Result: RSS drops slowly over unknown timeline, never fully reclaimed
+```
+
+**Why this matters for control planes:**
+
+Control plane services have predictable lifetime phases:
+- Request processing: Allocate request metadata, free after response
+- Session management: Allocate session state, free after timeout
+- Cache eviction: Allocate cache entries, free on LRU eviction
+
+Each phase can use a dedicated epoch. When the phase ends, close the epoch. Memory is reclaimed deterministically without guessing when objects will die.
+
+**Example: Kubernetes controller**
+
+```c
+// Watch loop for Kubernetes resources
+while (true) {
+  EpochId watch_epoch = epoch_current(alloc);
+  
+  // Process watch events for this interval
+  for (int i = 0; i < events_per_interval; i++) {
+    Event* evt = parse_event(watch_epoch);  // Allocates in watch_epoch
+    handle_event(evt);
+    // evt freed after handling
+  }
+  
+  // Interval complete, close epoch
+  epoch_close(alloc, watch_epoch);
+  // → All event metadata from this interval reclaimed when freed
+  // → RSS drops predictably every interval
+  
+  epoch_advance(alloc);  // Start new interval
+}
+```
+
+**The claim after implementation:**
+
+"Returns memory at epoch granularity with deterministic timing. Applications control reclamation by closing epochs when lifetime phases end. Impossible with general-purpose allocators that lack lifetime phase tracking."
+
+**Current status:**
+
+Epoch infrastructure exists (16-epoch ring buffer, epoch_advance(), epoch-tagged slabs). What's missing:
+- `epoch_close()` API
+- Logic to track epoch state (ACTIVE vs CLOSING)
+- madvise integration for empty slabs in CLOSING epochs
+
+This is Phase 2 of the roadmap after madvise(MADV_DONTNEED) proves effective in Phase 1.
 
 ## O(1) Deterministic Class Selection
 
