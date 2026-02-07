@@ -61,8 +61,12 @@ domain_usage: ../examples/domain_usage.c slab_lib.o epoch_domain.o
 slab_stats.o: slab_stats.c
 	$(CC) $(CFLAGS) -c slab_stats.c -o slab_stats.o
 
-stats_dump: stats_dump.c slab_lib.o slab_stats.o
-	$(CC) $(CFLAGS) stats_dump.c slab_lib.o slab_stats.o -o stats_dump
+# Phase 3: Actionable diagnostics
+slab_diagnostics.o: slab_diagnostics.c
+	$(CC) $(CFLAGS) -c slab_diagnostics.c -o slab_diagnostics.o
+
+stats_dump: stats_dump.c slab_lib.o slab_stats.o slab_diagnostics.o
+	$(CC) $(CFLAGS) stats_dump.c slab_lib.o slab_stats.o slab_diagnostics.o -o stats_dump
 
 # Phase 2.2: Era stamping test
 test_era_stamping: test_era_stamping.c slab_lib.o
