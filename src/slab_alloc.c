@@ -110,6 +110,138 @@ static inline int class_index_for_size(uint32_t sz) {
   return (int)k_class_lookup[sz];
 }
 
+/* ------------------------------ Slab Registry (ABA Protection) ------------------------------ */
+
+/* Initialize slab registry */
+static void reg_init(SlabRegistry* r) {
+  r->metas = NULL;
+  r->cap = 0;
+  r->free_ids = NULL;
+  r->free_count = 0;
+  r->next_id = 0;
+  pthread_mutex_init(&r->lock, NULL);
+}
+
+/* Destroy slab registry */
+static void reg_destroy(SlabRegistry* r) {
+  free(r->metas);
+  free(r->free_ids);
+  pthread_mutex_destroy(&r->lock);
+}
+
+/* Allocate a new slab_id (grows registry if needed) */
+static uint32_t reg_alloc_id(SlabRegistry* r) {
+  pthread_mutex_lock(&r->lock);
+  
+  uint32_t id;
+  if (r->free_count > 0) {
+    id = r->free_ids[--r->free_count];
+  } else {
+    id = r->next_id++;
+  }
+  
+  /* Grow registry if needed (double capacity) */
+  if (id >= r->cap) {
+    uint32_t new_cap = r->cap ? r->cap * 2 : 1024;
+    while (new_cap <= id) new_cap *= 2;
+    
+    SlabMeta* nm = (SlabMeta*)calloc(new_cap, sizeof(SlabMeta));
+    if (!nm) {
+      pthread_mutex_unlock(&r->lock);
+      return UINT32_MAX;  /* Allocation failure */
+    }
+    
+    for (uint32_t i = 0; i < r->cap; i++) {
+      nm[i] = r->metas[i];
+    }
+    free(r->metas);
+    r->metas = nm;
+    r->cap = new_cap;
+    
+    /* Grow free_ids array too */
+    uint32_t* nf = (uint32_t*)calloc(new_cap, sizeof(uint32_t));
+    if (!nf) {
+      pthread_mutex_unlock(&r->lock);
+      return UINT32_MAX;
+    }
+    free(r->free_ids);
+    r->free_ids = nf;
+  }
+  
+  /* Initialize generation (start at 1, 0 reserved for NULL handle) */
+  atomic_store_explicit(&r->metas[id].gen, 1u, memory_order_relaxed);
+  atomic_store_explicit(&r->metas[id].ptr, NULL, memory_order_relaxed);
+  
+  pthread_mutex_unlock(&r->lock);
+  return id;
+}
+
+/* Publish slab pointer in registry */
+static void reg_set_ptr(SlabRegistry* r, uint32_t id, Slab* s) {
+  if (id < r->cap) {
+    atomic_store_explicit(&r->metas[id].ptr, s, memory_order_release);
+  }
+}
+
+/* Bump generation on reuse (ABA protection)
+ * 
+ * Memory ordering: Uses relaxed because validation safety comes from
+ * the handshake between ptr (release/acquire) and gen (checked after ptr load).
+ * We don't need acq_rel here - the ptr store/load provides synchronization.
+ */
+static uint32_t reg_bump_gen(SlabRegistry* r, uint32_t id) {
+  if (id >= r->cap) return 0;
+  
+  uint32_t g = atomic_fetch_add_explicit(&r->metas[id].gen, 1u, memory_order_relaxed) + 1u;
+  uint32_t g24 = g & 0xFFFFFFu;  /* Truncate to 24 bits for handles */
+  if (g24 == 0) g24 = 1;  /* Avoid 0 (reserved for NULL handle) */
+  return g24;
+}
+
+/* Get current generation (24-bit for handle encoding)
+ * 
+ * Memory ordering: Acquire ensures we see the generation value that was current
+ * when the ptr was published. Combined with ptr acquire load, this provides
+ * the validation handshake.
+ */
+static uint32_t reg_get_gen24(SlabRegistry* r, uint32_t id) {
+  if (id >= r->cap) return 0;
+  
+  uint32_t g = atomic_load_explicit(&r->metas[id].gen, memory_order_acquire);
+  uint32_t g24 = g & 0xFFFFFFu;  /* Truncate to 24 bits */
+  if (g24 == 0) g24 = 1;
+  return g24;
+}
+
+/* Lookup and validate slab by id + generation (returns NULL if invalid)
+ * 
+ * Validation handshake:
+ * 1. Load ptr with acquire (sees everything before writer's release store)
+ * 2. Load gen with acquire (sees current generation)
+ * 3. Compare gen from handle with current gen
+ * 
+ * Safety: If ptr is non-NULL, the slab mapping is valid (never unmapped).
+ * If generation mismatches, handle is stale from old incarnation (ABA detected).
+ * 
+ * Note: We may spuriously fail if we observe new ptr but old gen (or vice versa)
+ * due to independent atomics, but that's safe - just returns NULL early.
+ */
+static Slab* reg_lookup_validate(SlabRegistry* r, uint32_t id, uint32_t gen24) {
+  if (id >= r->cap) return NULL;
+  
+  /* Step 1: Load ptr with acquire (handshake point) */
+  Slab* s = atomic_load_explicit(&r->metas[id].ptr, memory_order_acquire);
+  if (!s) return NULL;
+  
+  /* Step 2: Load current generation with acquire */
+  uint32_t cur = reg_get_gen24(r, id);
+  
+  /* Step 3: Validate generation matches handle */
+  if (cur != gen24) return NULL;  /* ABA: stale handle from old generation */
+  
+  return s;
+}
+
 /* ------------------------------ Intrusive list operations ------------------------------ */
 
 static inline void assert_slab_unlinked(Slab* s) {
@@ -303,6 +435,9 @@ void allocator_init(SlabAllocator* a) {
   /* Initialize O(1) class lookup table (once per process) */
   init_class_lookup();
   
+  /* Initialize slab registry for portable handle encoding */
+  reg_init(&a->reg);
+  
   /* IMPORTANT: Initialize atomics BEFORE memset (memset on atomics is UB) */
   a->epoch_count = EPOCH_COUNT;
   atomic_store_explicit(&a->current_epoch, 0, memory_order_relaxed);
@@ -356,7 +491,7 @@ void allocator_init(SlabAllocator* a) {
     /* Initialize slab cache (32 pages per size class = 128KB) */
     a->classes[i].cache_capacity = 32;
     a->classes[i].cache_size = 0;
-    a->classes[i].slab_cache = (Slab**)calloc(a->classes[i].cache_capacity, sizeof(Slab*));
+    a->classes[i].slab_cache = (CachedSlab*)calloc(a->classes[i].cache_capacity, sizeof(CachedSlab));
     pthread_mutex_init(&a->classes[i].cache_lock, NULL);
     
     /* Initialize overflow list */
@@ -366,130 +501,114 @@ void allocator_init(SlabAllocator* a) {
 
 /* ------------------------------ Slab cache operations ------------------------------ */
 
-static Slab* cache_pop(SizeClassAlloc* sc) {
+/* Pop cached slab (returns slab pointer and slab_id via out parameter) */
+static Slab* cache_pop(SizeClassAlloc* sc, uint32_t* out_slab_id) {
   pthread_mutex_lock(&sc->cache_lock);
   Slab* s = NULL;
+  uint32_t id = UINT32_MAX;
+  
   if (sc->cache_size > 0) {
-    s = sc->slab_cache[--sc->cache_size];
+    CachedSlab* entry = &sc->slab_cache[--sc->cache_size];
+    s = entry->slab;
+    id = entry->slab_id;
   } else if (sc->cache_overflow.head) {
     /* Cache empty - try overflow list */
     s = sc->cache_overflow.head;
+    id = s->slab_id;  /* Overflow slabs keep their ID in header */
     list_remove(&sc->cache_overflow, s);
   }
+  
   pthread_mutex_unlock(&sc->cache_lock);
+  
+  if (out_slab_id) *out_slab_id = id;
   return s;
 }
 
-/* Phase 2: Push empty slab to cache (or overflow if cache full) */
+/* FIX #3: Push empty slab to cache (madvise AFTER releasing lock for predictable latency) */
 static void cache_push(SizeClassAlloc* sc, Slab* s) {
-  pthread_mutex_lock(&sc->cache_lock);
-  
   /* Slab must be fully unlinked from epoch lists before caching */
   assert_slab_unlinked(s);
+  
+  pthread_mutex_lock(&sc->cache_lock);
+  
   s->list_id = SLAB_LIST_NONE;  /* Not on partial/full list anymore */
   s->prev = NULL;  /* Defensive: ensure clean state */
   s->next = NULL;
   
   if (sc->cache_size < sc->cache_capacity) {
-    sc->slab_cache[sc->cache_size++] = s;
+    /* Store both slab pointer and ID (survives madvise) */
+    sc->slab_cache[sc->cache_size].slab = s;
+    sc->slab_cache[sc->cache_size].slab_id = s->slab_id;
+    sc->cache_size++;
     s->cache_state = SLAB_CACHED;
     atomic_fetch_add_explicit(&sc->empty_slab_recycled, 1, memory_order_relaxed);
   } else {
-    /* CONSERVATIVE SAFETY: Never munmap() during runtime.
-     * Reason: SlabHandle stores raw Slab* pointers that callers may hold
-     * indefinitely (stale handles, double-free attempts). If we munmap,
-     * free_obj() will segfault when checking magic.
+    /* Registry-based handle validation enables safe overflow tracking.
+     * Slabs stay mapped for validation but RSS can be reclaimed via madvise.
      * 
-     * When cache is full, push to overflow list instead of dropping.
-     * This keeps slabs mapped and tracked, preventing leaks while
-     * maintaining safe stale-handle validation.
-     * 
-     * RSS is bounded by (partial + full + cache + overflow) = working set.
-     * Only munmap() during allocator_destroy(). */
+     * Overflow slabs keep slab_id in header (we reinitialize after madvise),
+     * but cache array stores (slab, slab_id) pair for guaranteed recovery. */
     list_push_back(&sc->cache_overflow, s);
     s->cache_state = SLAB_OVERFLOWED;
     atomic_fetch_add_explicit(&sc->empty_slab_cache_overflowed, 1, memory_order_relaxed);
   }
   
-  /* Phase 1 RSS Reclamation: madvise(MADV_DONTNEED) on empty slabs
-   * 
-   * Strategy: Tell the kernel it can reclaim physical pages backing this slab.
-   * The virtual memory remains mapped (safe for stale handle validation),
-   * but RSS drops immediately.
-   * 
-   * Safety: Slab is empty (free_count == object_count), so no live objects.
-   * The header will be zeroed by MADV_DONTNEED, but we reinitialize it in
-   * new_slab() when popping from cache.
-   * 
-   * Trade-off: Slight latency cost on next allocation from this slab (zero-fill),
-   * but RSS drops immediately in benchmarks.
-   * 
-   * Note: Must use whole slab because madvise requires page-aligned addresses. */
-  #if ENABLE_RSS_RECLAMATION && defined(__linux__)
-  if (madvise(s, SLAB_PAGE_SIZE, MADV_DONTNEED) != 0) {
-    /* Non-fatal: continue silently. RSS stays high if this fails. */
-    /* perror disabled to avoid log spam */
-  }
-  #endif
-  
   pthread_mutex_unlock(&sc->cache_lock);
+  
+  /* FIX #3: madvise AFTER releasing lock (eliminates syscall variance from critical section)
+   * 
+   * Phase 1 RSS Reclamation: Tell kernel to reclaim physical pages.
+   * Virtual memory stays mapped (safe for handle validation via registry).
+   * Header will be zeroed, but generation lives in registry (ABA-proof).
+   * 
+   * Combined with FIX #1 (epoch-aware recycling), this enables deterministic RSS drops:
+   * - ACTIVE epochs: empty slabs stay hot (no madvise, good latency)
+   * - CLOSING epochs: empty slabs recycled + madvised (RSS drops)
+   */
+  #if ENABLE_RSS_RECLAMATION && defined(__linux__)
+  (void)madvise(s, SLAB_PAGE_SIZE, MADV_DONTNEED);
+  /* Non-fatal: RSS stays high if this fails, but no functional impact */
+  #endif
 }
 
 /* ------------------------------ Slab allocation ------------------------------ */
 
-static Slab* new_slab(SizeClassAlloc* sc, uint32_t epoch_id) {
+/* FIX #2: new_slab with registry integration (generation bumping on reuse) */
+static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
   uint32_t obj_size = sc->object_size;
 
   /* Try to pop from cache first */
-  Slab* s = cache_pop(sc);
+  uint32_t cached_id = UINT32_MAX;
+  Slab* s = cache_pop(sc, &cached_id);
+  
   if (s) {
-    #if ENABLE_RSS_RECLAMATION
-    /* Phase 1 RSS: madvise(MADV_DONTNEED) zeroes the slab, so we must reinitialize
-     * all metadata that was cleared. We cannot validate magic anymore since it was zeroed.
-     * This is safe because cache_pop() only returns slabs we previously cached. */
+    /* FIX #2: Bump generation on reuse (ABA protection)
+     * This makes old handles invalid even after madvise zeroes the header */
+    (void)reg_bump_gen(&a->reg, cached_id);
     
+    /* Reinitialize all slab metadata (may have been zeroed by madvise) */
     uint32_t expected_count = slab_object_count(obj_size);
     
-    /* Reinitialize all slab metadata (was zeroed by madvise) */
     s->prev = NULL;
     s->next = NULL;
     atomic_store_explicit(&s->magic, SLAB_MAGIC, memory_order_relaxed);
     s->object_size = obj_size;
     s->object_count = expected_count;
     s->list_id = SLAB_LIST_NONE;
-    s->cache_state = SLAB_ACTIVE;  /* Will be added to partial list */
-    s->epoch_id = epoch_id;  /* Assign to epoch for temporal grouping */
+    s->cache_state = SLAB_ACTIVE;
+    s->epoch_id = epoch_id;
+    s->slab_id = cached_id;  /* Restore ID from cache */
     atomic_store_explicit(&s->free_count, expected_count, memory_order_relaxed);
     
-    /* Clear bitmap (was already zeroed by madvise, but be explicit) */
+    /* Clear bitmap (may have been zeroed by madvise) */
     _Atomic uint32_t* bm = slab_bitmap_ptr(s);
     uint32_t words = slab_bitmap_words(expected_count);
     for (uint32_t i = 0; i < words; i++) {
       atomic_store_explicit(&bm[i], 0u, memory_order_relaxed);
     }
-    #else
-    /* Without RSS reclamation: validate cached slab metadata */
-    assert(atomic_load_explicit(&s->magic, memory_order_relaxed) == SLAB_MAGIC && "cached slab has invalid magic");
-    assert(s->object_size == obj_size && "cached slab has wrong object_size");
     
-    uint32_t expected_count = slab_object_count(obj_size);
-    assert(s->object_count == expected_count && "cached slab has wrong object_count");
-    
-    /* Reinitialize the cached slab */
-    s->prev = NULL;
-    s->next = NULL;
-    s->list_id = SLAB_LIST_NONE;
-    s->cache_state = SLAB_ACTIVE;  /* Will be added to partial list */
-    s->epoch_id = epoch_id;  /* Assign to epoch for temporal grouping */
-    atomic_store_explicit(&s->free_count, s->object_count, memory_order_relaxed);
-    
-    /* Clear bitmap */
-    _Atomic uint32_t* bm = slab_bitmap_ptr(s);
-    uint32_t words = slab_bitmap_words(s->object_count);
-    for (uint32_t i = 0; i < words; i++) {
-      atomic_store_explicit(&bm[i], 0u, memory_order_relaxed);
-    }
-    #endif
+    /* Update registry pointer (may have been nulled) */
+    reg_set_ptr(&a->reg, cached_id, s);
     
     return s;
   }
@@ -509,6 +628,14 @@ static Slab* new_slab(SizeClassAlloc* sc, uint32_t epoch_id) {
     return NULL;
   }
 
+  /* Allocate slab_id from registry */
+  uint32_t id = reg_alloc_id(&a->reg);
+  if (id == UINT32_MAX) {
+    unmap_one_page(page);
+    errno = ENOMEM;
+    return NULL;
+  }
+
   s->prev = NULL;
   s->next = NULL;
   atomic_store_explicit(&s->magic, SLAB_MAGIC, memory_order_relaxed);
@@ -516,8 +643,9 @@ static Slab* new_slab(SizeClassAlloc* sc, uint32_t epoch_id) {
   s->object_count = count;
   atomic_store_explicit(&s->free_count, count, memory_order_relaxed);
   s->list_id = SLAB_LIST_NONE;
-  s->cache_state = SLAB_ACTIVE;  /* Will be added to partial list */
-  s->epoch_id = epoch_id;  /* Assign to epoch for temporal grouping */
+  s->cache_state = SLAB_ACTIVE;
+  s->epoch_id = epoch_id;
+  s->slab_id = id;  /* Store registry ID */
 
   _Atomic uint32_t* bm = slab_bitmap_ptr(s);
   uint32_t words = slab_bitmap_words(count);
@@ -525,22 +653,64 @@ static Slab* new_slab(SizeClassAlloc* sc, uint32_t epoch_id) {
     atomic_store_explicit(&bm[i], 0u, memory_order_relaxed);
   }
 
+  /* Publish in registry */
+  reg_set_ptr(&a->reg, id, s);
+
   return s;
 }
 
-/* ------------------------------ Handle encoding ------------------------------ */
+/* ------------------------------ Handle encoding (Portable, ABA-safe) ------------------------------ */
 
-/* Encode slab/slot/size_class into opaque 64-bit handle */
-static inline SlabHandle encode_handle(Slab* slab, uint32_t slot, uint32_t size_class) {
-  uintptr_t slab_addr = (uintptr_t)slab;
-  return ((uint64_t)slab_addr << 16) | ((uint64_t)slot << 8) | (uint64_t)size_class;
+/* Portable handle encoding v1: slab_id + generation + slot + class + version
+ * 
+ * Layout (64-bit):
+ *   [63:42] slab_id (22 bits) - registry index (max 4M slabs)
+ *   [41:18] generation (24 bits) - ABA protection (wraps after 16M reuses)
+ *   [17:10] slot (8 bits) - object index within slab (max 255 objects)
+ *   [9:2]   size_class (8 bits) - 0-255 size classes
+ *   [1:0]   version (2 bits) - handle format version (v1=0b01)
+ * 
+ * Key properties:
+ * - No raw pointers (portable across all platforms)
+ * - Generation stored in registry (survives madvise)
+ * - 24-bit generation: safe against ABA even under pathological churn
+ * - 2-bit version field allows future format changes
+ * 
+ * Design constraints:
+ * - 8-bit slot limits max objects per slab to 255
+ * - This bounds min object size to ~16 bytes (4096 / 255)
+ * - Current size classes (64-768 bytes) well within limits
+ * - If smaller classes needed, must rev handle format (use version bits)
+ */
+#define HANDLE_VERSION_V1 0x1u
+
+static inline SlabHandle handle_pack(uint32_t slab_id, uint32_t gen, uint8_t slot, uint8_t cls) {
+  return ((uint64_t)(slab_id & 0x3FFFFFu) << 42)  /* 22 bits */
+       | ((uint64_t)(gen & 0xFFFFFFu) << 18)      /* 24 bits */
+       | ((uint64_t)slot << 10)                   /* 8 bits */
+       | ((uint64_t)cls << 2)                     /* 8 bits */
+       | (uint64_t)HANDLE_VERSION_V1;             /* 2 bits */
 }
 
-/* Decode opaque handle into slab/slot/size_class */
-static inline Slab* decode_handle(SlabHandle h, uint32_t* out_slot, uint32_t* out_size_class) {
-  *out_slot = (uint32_t)((h >> 8) & 0xFF);
-  *out_size_class = (uint32_t)(h & 0xFF);
-  return (Slab*)(uintptr_t)(h >> 16);
+static inline void handle_unpack(SlabHandle h, uint32_t* slab_id, uint32_t* gen, uint32_t* slot, uint32_t* cls) {
+  uint32_t version = (uint32_t)(h & 0x3u);
+  if (version != HANDLE_VERSION_V1) {
+    /* Future: handle other versions. For now, zero all fields on mismatch. */
+    *cls = 0; *slot = 0; *gen = 0; *slab_id = 0;
+    return;
+  }
+  
+  *cls     = (uint32_t)((h >> 2) & 0xFFu);
+  *slot    = (uint32_t)((h >> 10) & 0xFFu);
+  *gen     = (uint32_t)((h >> 18) & 0xFFFFFFu);
+  *slab_id = (uint32_t)(h >> 42);
+}
+
+/* Encode handle from slab (reads slab_id from slab, generation from registry) */
+static inline SlabHandle encode_handle(Slab* slab, SlabRegistry* reg, uint32_t slot, uint32_t size_class) {
+  uint32_t id = slab->slab_id;
+  uint32_t gen = reg_get_gen24(reg, id);
+  return handle_pack(id, gen, (uint8_t)slot, (uint8_t)size_class);
 }
 
 /* ------------------------------ Allocation ------------------------------ */
@@ -594,7 +764,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       
       void* p = slab_slot_ptr(cur, idx);
       if (out) {
-        *out = encode_handle(cur, idx, (uint32_t)ci);
+        *out = encode_handle(cur, &a->reg, idx, (uint32_t)ci);
       }
       return p;
     }
@@ -623,7 +793,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
 
     Slab* s = es->partial.head;
     if (!s) {
-      s = new_slab(sc, epoch);
+      s = new_slab(a, sc, epoch);
       if (!s) {
         pthread_mutex_unlock(&sc->lock);
         return NULL;
@@ -667,7 +837,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
 
     void* p = slab_slot_ptr(s, idx);
     if (out) {
-      *out = encode_handle(s, idx, (uint32_t)ci);
+      *out = encode_handle(s, &a->reg, idx, (uint32_t)ci);
     }
     return p;
   }
@@ -689,15 +859,19 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
 bool free_obj(SlabAllocator* a, SlabHandle h) {
   if (h == 0) return false;  /* NULL handle */
   
-  /* Decode opaque handle */
-  uint32_t slot, size_class;
-  Slab* s = decode_handle(h, &slot, &size_class);
+  /* FIX #2: Decode handle and validate through registry (ABA-proof) */
+  uint32_t slab_id, slot, size_class, gen;
+  handle_unpack(h, &slab_id, &gen, &slot, &size_class);
   
   if (size_class >= (uint32_t)k_num_classes) return false;
 
   SizeClassAlloc* sc = &a->classes[size_class];
   
-  /* Validate slab magic - safe because slabs stay mapped during runtime */
+  /* FIX #2: Validate slab through registry (checks generation for ABA safety) */
+  Slab* s = reg_lookup_validate(&a->reg, slab_id, gen);
+  if (!s) return false;  /* Invalid: wrong ID, stale generation, or unmapped */
+  
+  /* Double-check magic (defensive, should always pass if registry returned non-NULL) */
   if (atomic_load_explicit(&s->magic, memory_order_relaxed) != SLAB_MAGIC) return false;
   
   /* Get epoch state for this slab */
@@ -712,43 +886,31 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   /* New free_count is prev_fc + 1 */
   uint32_t new_fc = prev_fc + 1;
 
-  /* Phase 2: Check if slab became empty - recycle based on epoch state */
+  /* FIX #1: Epoch-aware recycling - only recycle empty slabs in CLOSING epochs
+   * 
+   * Key design decision:
+   * - ACTIVE epochs: Keep empty slabs "hot" for fast reuse (latency goal, RSS stable)
+   * - CLOSING epochs: Aggressively recycle empty slabs → cache → madvise → RSS drops
+   * 
+   * This makes epoch_close() actually matter for RSS - it's the explicit boundary
+   * between "keep memory hot" and "return memory to OS". */
   if (new_fc == s->object_count) {
     pthread_mutex_lock(&sc->lock);
     
-    /* Check epoch state for aggressive recycling */
     uint32_t epoch_state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_acquire);
     
     if (epoch_state == EPOCH_CLOSING) {
-      /* OPTION A: Aggressive recycling for CLOSING epochs
-       * Since epoch is CLOSING, we guarantee no new allocations into this epoch.
-       * Therefore, it's safe to recycle empty slabs regardless of list_id.
-       * The current_partial was already nulled in epoch_advance(), so no races. */
+      /* FIX #1: Aggressive recycling ONLY for CLOSING epochs
+       * 
+       * This is the key fix: empty slabs in CLOSING epochs get recycled + madvised,
+       * while ACTIVE epochs keep empty slabs around for fast reuse. */
       if (s->list_id == SLAB_LIST_FULL) {
         list_remove(&es->full, s);
       } else if (s->list_id == SLAB_LIST_PARTIAL) {
         list_remove(&es->partial, s);
       }
       
-      if (s->list_id != SLAB_LIST_NONE) {
-        s->list_id = SLAB_LIST_NONE;
-        sc->total_slabs--;
-        pthread_mutex_unlock(&sc->lock);
-        
-        /* Push to cache (or overflow if cache full) - outside lock */
-        cache_push(sc, s);
-        return true;
-      }
-    } else {
-      /* ACTIVE epochs: Recycle empty slabs from both FULL and PARTIAL lists
-       * Safety: Under sc->lock, with proper unlinking and current_partial clearing */
-      if (s->list_id == SLAB_LIST_FULL) {
-        list_remove(&es->full, s);
-      } else if (s->list_id == SLAB_LIST_PARTIAL) {
-        list_remove(&es->partial, s);
-      }
-      
-      /* Unpublish from current_partial if published */
+      /* Ensure not published in current_partial */
       Slab* expected = s;
       (void)atomic_compare_exchange_strong_explicit(
           &es->current_partial, &expected, NULL,
@@ -759,11 +921,14 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
         sc->total_slabs--;
         pthread_mutex_unlock(&sc->lock);
         
-        /* Push to cache (or overflow if cache full) - outside lock */
+        /* Push to cache → triggers madvise (FIX #3: outside lock) → RSS drops */
         cache_push(sc, s);
         return true;
       }
     }
+    /* FIX #1: For ACTIVE epochs, do NOT recycle empty slabs
+     * They stay on partial list for fast reuse (good latency, stable RSS).
+     * This makes epoch_close() the explicit control point for RSS reclamation. */
     
     pthread_mutex_unlock(&sc->lock);
     return true;
@@ -863,10 +1028,10 @@ void allocator_destroy(SlabAllocator* a) {
     pthread_mutex_unlock(&sc->lock);
     pthread_mutex_destroy(&sc->lock);
 
-    /* Drain slab cache */
+    /* Drain slab cache (now storing CachedSlab entries) */
     pthread_mutex_lock(&sc->cache_lock);
     for (size_t j = 0; j < sc->cache_size; j++) {
-      unmap_one_page(sc->slab_cache[j]);
+      unmap_one_page(sc->slab_cache[j].slab);
     }
     free(sc->slab_cache);
     sc->cache_size = 0;
@@ -884,6 +1049,9 @@ void allocator_destroy(SlabAllocator* a) {
     pthread_mutex_unlock(&sc->cache_lock);
     pthread_mutex_destroy(&sc->cache_lock);
   }
+  
+  /* Destroy slab registry */
+  reg_destroy(&a->reg);
 }
 
 /* ------------------------------ Performance counters ------------------------------ */
@@ -970,11 +1138,95 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
    */
   atomic_store_explicit(&a->epoch_state[epoch], EPOCH_CLOSING, memory_order_release);
   
-  /* Null current_partial for this epoch across all size classes
-   * Prevents threads from allocating into partially-filled slabs in CLOSING epoch */
+  /* Proactively scan for already-empty slabs and recycle them
+   * 
+   * This is the missing piece: slabs that became empty BEFORE epoch_close() was
+   * called are sitting on the partial list. The free_obj() path only recycles
+   * slabs at the moment they transition to empty, so we need to scan for slabs
+   * that are already empty when we mark the epoch as CLOSING.
+   */
   for (size_t i = 0; i < k_num_classes; i++) {
-    EpochState* es = &a->classes[i].epochs[epoch];
+    SizeClassAlloc* sc = &a->classes[i];
+    EpochState* es = &sc->epochs[epoch];
+    
+    /* Null current_partial first to prevent allocations */
     atomic_store_explicit(&es->current_partial, NULL, memory_order_release);
+    
+    /* Scan partial list for empty slabs (single-pass O(n) algorithm)
+     * 
+     * Strategy: Collect empty slabs in temporary array, then recycle outside lock.
+     * This avoids O(n²) restart-scan pattern and minimizes lock hold time.
+     */
+    pthread_mutex_lock(&sc->lock);
+    
+    /* Quick scan to count empty slabs */
+    size_t empty_count = 0;
+    for (Slab* s = es->partial.head; s; s = s->next) {
+      if (atomic_load_explicit(&s->free_count, memory_order_relaxed) == s->object_count) {
+        empty_count++;
+      }
+    }
+    for (Slab* s = es->full.head; s; s = s->next) {
+      if (atomic_load_explicit(&s->free_count, memory_order_relaxed) == s->object_count) {
+        empty_count++;
+      }
+    }
+    
+    if (empty_count > 0) {
+      /* Allocate temporary array (stack for small counts, heap for large) */
+      Slab** empty_slabs = NULL;
+      Slab* stack_buf[32];  /* Stack allocation for common case (<32 empty slabs) */
+      
+      if (empty_count <= 32) {
+        empty_slabs = stack_buf;
+      } else {
+        empty_slabs = (Slab**)malloc(empty_count * sizeof(Slab*));
+        if (!empty_slabs) {
+          pthread_mutex_unlock(&sc->lock);
+          return;  /* Out of memory - skip recycling this time */
+        }
+      }
+      
+      /* Collect empty slabs from both lists (single pass) */
+      size_t idx = 0;
+      Slab* cur = es->partial.head;
+      while (cur) {
+        Slab* next = cur->next;
+        if (atomic_load_explicit(&cur->free_count, memory_order_relaxed) == cur->object_count) {
+          list_remove(&es->partial, cur);
+          cur->list_id = SLAB_LIST_NONE;
+          sc->total_slabs--;
+          empty_slabs[idx++] = cur;
+        }
+        cur = next;
+      }
+      
+      cur = es->full.head;
+      while (cur) {
+        Slab* next = cur->next;
+        if (atomic_load_explicit(&cur->free_count, memory_order_relaxed) == cur->object_count) {
+          list_remove(&es->full, cur);
+          cur->list_id = SLAB_LIST_NONE;
+          sc->total_slabs--;
+          empty_slabs[idx++] = cur;
+        }
+        cur = next;
+      }
+      
+      pthread_mutex_unlock(&sc->lock);
+      
+      /* Recycle all empty slabs outside lock (madvise happens here) */
+      for (size_t j = 0; j < idx; j++) {
+        cache_push(sc, empty_slabs[j]);
+      }
+      
+      /* Free heap allocation if used */
+      if (empty_slabs != stack_buf) {
+        free(empty_slabs);
+      }
+    } else {
+      pthread_mutex_unlock(&sc->lock);
+    }
   }
   
   /* Epoch now drains: frees continue and empty slabs are aggressively recycled.
