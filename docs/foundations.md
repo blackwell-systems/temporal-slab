@@ -58,6 +58,8 @@ This document builds the theoretical foundation for temporal-slab from first pri
 
 **API Design**
 - [Handle-Based API vs Malloc-Style API](#handle-based-api-vs-malloc-style-api)
+- [Handle Encoding and Slab Registry](#handle-encoding-and-slab-registry)
+- [How Design Choices Prevent RSS Growth](#how-design-choices-prevent-rss-growth)
 - [What You Should Understand Now](#what-you-should-understand-now)
 
 ---
@@ -2937,11 +2939,148 @@ This is deterministic: always 1 L1 cache access (~4 cycles). No branches, no mis
 
 temporal-slab provides two APIs:
 
-**Handle-based:** `alloc_obj(alloc, size, &handle)` returns a pointer and an opaque handle. `free_obj(alloc, handle)` frees by handle. The handle encodes the slab pointer, slot index, and size class. No per-allocation metadata is stored (zero overhead). The application must track handles alongside pointers.
+**Handle-based:** `alloc_obj(alloc, size, &handle)` returns a pointer and an opaque handle. `free_obj(alloc, handle)` frees by handle. The handle encodes a registry ID, generation counter, slot index, and size class. No per-allocation metadata is stored (zero overhead). The application must track handles alongside pointers.
 
 **Malloc-style:** `slab_malloc(alloc, size)` returns a pointer. The handle is stored in an 8-byte header before the pointer. `slab_free(alloc, ptr)` reads the header, extracts the handle, and calls `free_obj` internally. This trades 8 bytes overhead per allocation for API compatibility.
 
 The handle-based API is suitable for performance-critical code where zero overhead is required and explicit handle management is acceptable. The malloc-style API is suitable for drop-in replacement where 8 bytes overhead is tolerable.
+
+## Handle Encoding and Slab Registry
+
+temporal-slab uses **indirect handles** that go through a slab registry rather than encoding raw pointers. This enables safe memory reclamation while maintaining handle validation.
+
+**Handle encoding (v1, 64-bit):**
+
+```
+[63:42] slab_id (22 bits)    - Registry index (max 4M slabs)
+[41:18] generation (24 bits)  - ABA protection (wraps after 16M reuses)
+[17:10] slot (8 bits)         - Object index within slab (max 255 objects)
+[9:2]   size_class (8 bits)   - Size class 0-255
+[1:0]   version (2 bits)      - Handle format version (v1=0b01)
+```
+
+**Slab registry architecture:**
+
+```c
+// Registry entry (stored off-page)
+struct SlabMeta {
+    Slab* ptr;      // Pointer to slab (NULL if unmapped)
+    uint32_t gen;   // Generation counter (survives madvise)
+};
+
+// Registry (one per allocator)
+struct SlabRegistry {
+    SlabMeta* metas;  // Array of [slab_id] → (ptr, gen)
+    uint32_t cap;     // Registry capacity
+};
+
+// Handle resolution
+SlabHandle h = alloc_obj(alloc, size, &h);
+                ↓
+Extract slab_id, gen, slot, class from handle
+                ↓
+SlabMeta* meta = &registry.metas[slab_id]
+                ↓
+Check: meta->gen == handle.gen? (ABA protection)
+                ↓
+Slab* slab = meta->ptr (NULL if unmapped)
+                ↓
+Validate and return object
+```
+
+**Why indirection?**
+
+Direct pointer encoding (v0.x approach):
+```
+Handle: [slab_ptr:48][slot:8][class:8]
+Problem: Can't safely unmap slabs (handle becomes dangling pointer)
+```
+
+Registry-based encoding (current):
+```
+Handle: [slab_id:22][gen:24][slot:8][class:8][ver:2]
+Solution: Registry entry can be NULL (safe unmapping)
+         Generation counter prevents ABA (recycled slab detection)
+```
+
+**Benefits of registry approach:**
+
+1. **Safe madvise/munmap:** Registry entry can mark slab as unmapped (ptr=NULL)
+2. **ABA protection:** Generation counter prevents use-after-recycle bugs
+3. **Portable handles:** No raw pointers, works across address spaces
+4. **Metadata survives madvise:** Generation stored off-page, immune to MADV_DONTNEED
+5. **Handle validation always works:** Even after slab unmapped, can return error
+
+**Trade-offs:**
+
+**Cost:**
+- One extra indirection per handle dereference (~4-5 cycles for L1 cache hit)
+- Registry memory: 12 bytes per slab (ptr + gen + padding)
+- Max 4M slabs (22-bit slab_id field)
+
+**Benefit:**
+- Can safely call madvise/munmap (Phase 1-3 RSS reclamation)
+- Stale handles detected via generation mismatch
+- No segfaults on invalid frees (returns false instead)
+
+**Example flow with madvise:**
+
+```c
+// Allocate in epoch 1
+EpochId e1 = epoch_current(alloc);
+SlabHandle h = alloc_obj_epoch(alloc, 128, e1, &h);
+// Handle: slab_id=42, gen=0, slot=0, class=2
+
+// Close epoch 1
+epoch_close(alloc, e1);
+
+// Free object
+free_obj(alloc, h);
+// Slab becomes empty
+
+// madvise releases physical memory
+madvise(slab, 4096, MADV_DONTNEED);
+// Slab data zeroed, but registry.metas[42] = {ptr=slab, gen=0} survives
+
+// Later: try to use stale handle
+free_obj(alloc, h);  // Same handle again
+→ Registry lookup: slab_id=42 → ptr=slab, gen=0
+→ Access slab->magic (page fault if madvised, but safe)
+→ Detect double-free, return false
+
+// Slab recycled for new allocations
+→ Registry: gen++ (now gen=1)
+→ Old handle (gen=0) now invalid
+
+// Old handle used again
+free_obj(alloc, h);  // gen=0
+→ Registry: gen=1 (mismatch!)
+→ Return false (ABA detected)
+```
+
+**Generation counter wrap-around:**
+
+With 24 bits, generation wraps after 16,777,216 reuses:
+```
+At 1M alloc/free per second per slab:
+Wrap time: 16.8 seconds
+
+Danger: If you hold a handle for >16.8 seconds AND the same slab
+        is recycled 16M times, ABA is possible (gen wraps to same value)
+
+Reality: Slabs reused every few milliseconds under typical churn
+         16M reuses of same slab in <16.8 seconds is implausible
+         Pathological case: Program must do nothing but alloc/free same slab
+```
+
+**Current status (implementation complete):**
+
+Phases 1-3 are implemented:
+- ✅ Phase 1: madvise(MADV_DONTNEED) releases physical memory
+- ✅ Phase 2: epoch_close() enables deterministic reclamation
+- ✅ Phase 3: Slab registry with generation counters (enables safe munmap)
+
+Handle encoding v1 is stable and production-ready.
 
 ## How Design Choices Prevent RSS Growth
 
