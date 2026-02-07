@@ -126,6 +126,11 @@ typedef struct SlabEpochStats {
   uint64_t epoch_era;                  /* Monotonic generation (Phase 2.2) */
   EpochLifecycleState state;           /* ACTIVE or CLOSING */
   
+  /* Phase 2.3: Rich metadata for debugging */
+  uint64_t open_since_ns;              /* Timestamp when epoch became ACTIVE (0=never) */
+  uint64_t alloc_count;                /* Number of live allocations in this epoch */
+  char label[32];                      /* Semantic label (e.g., "request:abc", "frame:1234") */
+  
   /* Slab counts (requires sc->lock) */
   uint32_t partial_slab_count;
   uint32_t full_slab_count;

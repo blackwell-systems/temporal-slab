@@ -184,6 +184,13 @@ struct SizeClassAlloc {
   size_t cache_overflow_len;
 };
 
+/* Phase 2.3: Epoch metadata for rich observability */
+typedef struct EpochMetadata {
+  uint64_t open_since_ns;       /* Timestamp when epoch became ACTIVE (0 if never opened) */
+  _Atomic uint64_t alloc_count; /* Number of live allocations in this epoch */
+  char label[32];               /* Semantic label (e.g., "request_id:abc", "frame:1234") */
+} EpochMetadata;
+
 /* Main allocator structure */
 struct SlabAllocator {
   SizeClassAlloc classes[8];  /* Expanded from 4 to 8 for HFT granularity */
@@ -198,6 +205,9 @@ struct SlabAllocator {
   /* Phase 2.2: Monotonic epoch era for observability */
   _Atomic uint64_t epoch_era_counter;  /* Increments on every epoch_advance */
   uint64_t epoch_era[EPOCH_COUNT];     /* Era when each epoch was last activated */
+  
+  /* Phase 2.3: Rich epoch metadata for debugging */
+  EpochMetadata epoch_meta[EPOCH_COUNT];
   
   /* Slab registry for portable handle encoding + ABA protection */
   SlabRegistry reg;

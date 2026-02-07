@@ -141,6 +141,11 @@ void slab_stats_epoch(SlabAllocator* alloc, uint32_t size_class, EpochId epoch, 
   /* Read epoch lifecycle state */
   out->state = atomic_load_explicit(&alloc->epoch_state[epoch], memory_order_relaxed);
   
+  /* Phase 2.3: Read epoch metadata */
+  out->open_since_ns = alloc->epoch_meta[epoch].open_since_ns;
+  out->alloc_count = atomic_load_explicit(&alloc->epoch_meta[epoch].alloc_count, memory_order_relaxed);
+  memcpy(out->label, alloc->epoch_meta[epoch].label, sizeof(out->label));
+  
   /* Read list lengths (brief lock) */
   pthread_mutex_lock(&sc->lock);
   
