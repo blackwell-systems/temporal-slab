@@ -1,52 +1,36 @@
+/* epoch_domain.h */
+
 #ifndef EPOCH_DOMAIN_H
 #define EPOCH_DOMAIN_H
 
 #include "slab_alloc.h"
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <pthread.h>
 
 /**
  * Epoch Domain: Structured Temporal Memory Management
- * 
- * Provides scoped, composable memory lifetime management on top of epochs.
- * Domains formalize the relationship between allocation scope and epoch lifecycle,
- * enabling RAII-style automatic cleanup and nested temporal scopes.
- * 
- * Key properties:
- * - Automatic epoch_close() on domain exit
- * - Nestable scopes with refcount tracking
- * - Thread-local context for implicit allocation binding
- * - Zero overhead over raw epoch usage
- * 
- * Example usage:
- * 
- *   // Request-scoped memory
- *   epoch_domain_t* request = epoch_domain_create(alloc);
- *   epoch_domain_enter(request);
- *       handle_request(conn);
- *   epoch_domain_exit(request);  // Automatic reclamation
- * 
- *   // Reusable frame domain
- *   epoch_domain_t* frame = epoch_domain_create(alloc);
- *   for (int i = 0; i < frames; i++) {
- *       epoch_domain_enter(frame);
- *           render_frame();
- *       epoch_domain_exit(frame);  // Deterministic cleanup
- *   }
+ *
+ * Contract (IMPORTANT):
+ * - Domains are thread-local scopes: enter/exit/destroy MUST occur on the creating thread.
+ * - Nesting is supported via a TLS stack (LIFO).
+ * - Domains may share an underlying epoch, but the domain object itself is not cross-thread.
  */
 
 typedef struct epoch_domain {
-    SlabAllocator* alloc;      // Allocator instance
-    EpochId epoch_id;          // Underlying epoch (ring index 0-15)
-    uint64_t epoch_era;        // Era when domain was created (for wrap-around safety)
-    uint32_t refcount;         // Nesting depth
-    bool auto_close;           // Close epoch on last exit?
+    SlabAllocator* alloc;      /* Allocator instance */
+    EpochId epoch_id;          /* Underlying epoch (ring index 0-15) */
+    uint64_t epoch_era;        /* Era captured at create/wrap time (wrap-around safety) */
+    uint32_t refcount;         /* Nesting depth (thread-local by contract) */
+    bool auto_close;           /* Close epoch on last exit? */
+
+    /* Enforce thread-local contract */
+    pthread_t owner_tid;
 } epoch_domain_t;
 
 /**
- * Create a new epoch domain.
- * Allocates a new epoch from the allocator and wraps it in a domain.
- * 
+ * Create a new epoch domain wrapping the allocator's current epoch.
+ *
  * @param alloc Allocator instance
  * @return New domain, or NULL on failure
  */
@@ -54,7 +38,7 @@ epoch_domain_t* epoch_domain_create(SlabAllocator* alloc);
 
 /**
  * Create a domain with explicit epoch ID (advanced usage).
- * 
+ *
  * @param alloc Allocator instance
  * @param epoch_id Existing epoch to wrap
  * @param auto_close Whether to close epoch on last exit
@@ -63,55 +47,42 @@ epoch_domain_t* epoch_domain_create(SlabAllocator* alloc);
 epoch_domain_t* epoch_domain_wrap(SlabAllocator* alloc, EpochId epoch_id, bool auto_close);
 
 /**
- * Enter a domain scope.
- * Increments refcount and sets thread-local context.
- * Can be called multiple times for nested scopes.
- * 
- * @param domain Domain to enter
+ * Enter a domain scope (nesting-safe).
+ * Pushes the domain onto the TLS domain stack.
  */
 void epoch_domain_enter(epoch_domain_t* domain);
 
 /**
- * Exit a domain scope.
- * Decrements refcount. If auto_close is enabled and refcount reaches 0,
- * automatically calls epoch_close() to reclaim memory.
- * 
- * @param domain Domain to exit
+ * Exit a domain scope (nesting-safe).
+ * Pops the domain from the TLS domain stack (must be LIFO).
+ * If auto_close is enabled and refcount reaches 0, may call epoch_close()
+ * after validating the epoch era and global epoch domain refcount.
  */
 void epoch_domain_exit(epoch_domain_t* domain);
 
 /**
- * Get the current thread-local domain.
- * Returns the innermost active domain, or NULL if none.
- * 
- * @return Current domain, or NULL
+ * Get the current thread-local domain (innermost / top of TLS stack).
  */
 epoch_domain_t* epoch_domain_current(void);
 
 /**
  * Get the allocator from the current domain.
- * Convenience function for implicit allocation binding.
- * 
- * @return Allocator from current domain, or NULL
  */
 SlabAllocator* epoch_domain_allocator(void);
 
 /**
  * Destroy a domain.
- * If auto_close is enabled, calls epoch_close(). 
- * Frees domain structure.
- * 
- * WARNING: Domain must not be active (refcount must be 0).
- * 
- * @param domain Domain to destroy
+ *
+ * Precondition: refcount == 0 and domain is not present on TLS stack.
+ * If auto_close is enabled, closes epoch only if era still matches.
  */
 void epoch_domain_destroy(epoch_domain_t* domain);
 
 /**
- * Force epoch closure regardless of refcount.
- * Use with caution - for explicit cleanup scenarios.
- * 
- * @param domain Domain to close
+ * Force epoch closure (advanced / explicit cleanup).
+ *
+ * Precondition: refcount == 0 and domain is not present on TLS stack.
+ * Closes epoch only if era still matches.
  */
 void epoch_domain_force_close(epoch_domain_t* domain);
 
