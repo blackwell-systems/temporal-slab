@@ -952,6 +952,35 @@ void epoch_advance(SlabAllocator* a) {
   /* Old epoch now drains: frees continue, but no new allocations refill slabs */
 }
 
+void epoch_close(SlabAllocator* a, EpochId epoch) {
+  if (!a || epoch >= a->epoch_count) return;
+  
+  /* Mark epoch as CLOSING - no new allocations allowed
+   * 
+   * This enables Phase 2 RSS reclamation: when slabs in this epoch become empty,
+   * they are immediately recycled. With ENABLE_RSS_RECLAMATION=1, madvise() is
+   * called to reclaim physical pages, causing RSS to drop.
+   * 
+   * Key difference from epoch_advance():
+   * - epoch_advance() closes old epoch and rotates to next
+   * - epoch_close() closes specific epoch without rotation
+   * 
+   * This allows applications to explicitly control reclamation boundaries
+   * aligned with application lifetime phases (requests, frames, batches).
+   */
+  atomic_store_explicit(&a->epoch_state[epoch], EPOCH_CLOSING, memory_order_release);
+  
+  /* Null current_partial for this epoch across all size classes
+   * Prevents threads from allocating into partially-filled slabs in CLOSING epoch */
+  for (size_t i = 0; i < k_num_classes; i++) {
+    EpochState* es = &a->classes[i].epochs[epoch];
+    atomic_store_explicit(&es->current_partial, NULL, memory_order_release);
+  }
+  
+  /* Epoch now drains: frees continue and empty slabs are aggressively recycled.
+   * With RSS reclamation enabled, physical pages are returned to OS as slabs drain. */
+}
+
 /*
  * Note: Tests moved to smoke_tests.c (Phase 1.6 file organization)
  * This file now contains only the allocator implementation.
