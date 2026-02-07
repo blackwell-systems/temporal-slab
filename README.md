@@ -28,7 +28,7 @@ temporal-slab achieves **RSS stability** (0% growth under steady churn), **compe
 
 **Phase 1+2: Epoch-Scoped RSS Reclamation (IMPLEMENTED)**
 
-**Status: Complete** - Critical bug fixed, production safety hardened, validated in benchmarks
+Complete. Critical bug fixed, production safety hardened, validated in benchmarks.
 
 **Implementation:**
 - Phase 1: `madvise(MADV_DONTNEED)` on empty slabs in CLOSING epochs
@@ -36,14 +36,13 @@ temporal-slab achieves **RSS stability** (0% growth under steady churn), **compe
 - Critical fix: Overflow slab_id corruption (CachedNode off-page storage)
 - Safety improvements: 24-bit generation, 2-bit versioning, memory ordering
 
-**Benchmark Results** (epoch_rss_bench):
-- 19.15 MiB marked reclaimable across 5 epochs (4,903 slabs)
-- 3.3% overall RSS drop under memory pressure (kernel advisory behavior)
-- 100% cache hit rate (perfect slab reuse)
+**Benchmark Results:**
+- Test: 5 epochs × 50,000 objects (128 bytes each)
+- Outcome: 19.15 MiB marked reclaimable (4,903 slabs), 3.3% RSS drop under pressure
+- Cache reuse: 100% hit rate (perfect slab reuse after madvise)
 - Pattern: Small epochs approach 100% reclaim, large epochs ~2%
 
-**Key Achievement:**
-Returns memory at **epoch granularity** - when application lifetime phases end, not when allocator heuristics decide. Traditional allocators cannot provide this capability.
+Returns memory at epoch granularity - when application lifetime phases end, not when allocator heuristics decide. Traditional allocators cannot provide this capability.
 
 **Phase 3: Handle Indirection + `munmap()` (Graduate-Level)**
 - Architecture: `handle → slab_id → slab_table[generation, state, ptr] → slab`
