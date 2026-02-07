@@ -1143,28 +1143,70 @@ while (has_more_batches()) {
 }
 ```
 
-**Future: Epoch recycling (not yet implemented):**
+**Epoch closing with epoch_close():**
 
-Currently, temporal-slab does not implement aggressive epoch recycling. Slabs become empty and are recycled through the normal FULL-only mechanism, but there is no explicit "close and drain this epoch" API.
-
-A future `epoch_close()` API could accelerate recycling:
+temporal-slab provides `epoch_close(alloc, epoch_id)` for explicit epoch reclamation:
 
 ```c
-void epoch_close(SlabAllocator* alloc, EpochId epoch) {
-    // Mark epoch as closed
-    // Stop refilling partially-empty slabs from this epoch
-    // Let them drain without new allocations
-    // Move all PARTIAL slabs to a "draining" list
-    // Recycle them aggressively once empty
+EpochId request_epoch = epoch_current(alloc);
+// ... allocate request objects in request_epoch ...
+// ... process request ...
+// ... free request objects ...
+
+epoch_close(alloc, request_epoch);  // Aggressive reclamation
+```
+
+When you call `epoch_close()`, the allocator:
+1. Marks the epoch as CLOSING (no new allocations allowed)
+2. Scans for already-empty slabs and recycles them immediately
+3. Enables aggressive recycling (empty slabs from this epoch are madvised on free)
+
+This provides **application-controlled memory reclamation** at lifetime boundaries.
+
+**Epoch ID vs Epoch Era:**
+
+Epoch IDs are ring indices (0-15) that wrap around. After 16 advances, you're back to epoch 0. This creates observability ambiguity:
+
+```
+Epoch 0 (era 0):  opened at T=0s, 1000 allocations
+Epoch 1 (era 1):  opened at T=5s, 2000 allocations
+...
+Epoch 15 (era 15): opened at T=75s, 500 allocations
+Epoch 0 (era 16):  opened at T=80s, 800 allocations  ← Same ID, different era!
+```
+
+To disambiguate, temporal-slab maintains a monotonic **epoch era counter**:
+- Increments on every `epoch_advance()` call (never wraps, 64-bit)
+- Each epoch stores its era when activated
+- Observability tools can distinguish epoch 0 era 0 from epoch 0 era 16
+
+This prevents graphs from showing "time going backward" when the ring wraps. It also enables era validation in epoch domains:
+
+```c
+// Domain created at era 100
+epoch_domain_t* domain = epoch_domain_create(alloc);
+domain->epoch_era = 100;
+
+// ... 20 epoch_advance() calls happen (ring wrapped) ...
+
+// Domain tries to close epoch
+if (current_era != domain->epoch_era) {
+    // Don't close! This is a different incarnation of the same epoch ID
 }
 ```
 
-This would enable:
-- **Faster RSS reclamation:** Drained epochs release memory sooner
-- **Explicit lifetime boundaries:** Applications can close epochs representing completed work
-- **Better memory attribution:** Track which epochs are holding memory
+**epoch_current() implementation:**
 
-However, the current design already achieves 0% RSS growth under steady-state churn without epoch recycling. The mechanism exists primarily to **prevent** growth, not to aggressively shrink RSS.
+The API returns a ring index (0-15), not the raw counter:
+
+```c
+EpochId epoch_current(SlabAllocator* a) {
+    uint32_t raw = atomic_load(&a->current_epoch);
+    return raw % a->epoch_count;  // Modulo operation: 16 → 0, 17 → 1, etc.
+}
+```
+
+This ensures `epoch_current()` always returns a valid epoch ID, even after millions of advances.
 
 ## Slab
 
