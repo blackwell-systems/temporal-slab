@@ -131,6 +131,9 @@ typedef struct EpochState {
 
   /* Fast-path current slab (lock-free) */
   _Atomic(Slab*) current_partial;
+  
+  /* Phase 2.1: O(1) reclaimable tracking (avoids O(n) scan in stats) */
+  _Atomic uint32_t empty_partial_count;  /* Slabs with free_count == object_count */
 } EpochState;
 
 /* Per-size-class allocator state */

@@ -142,25 +142,17 @@ void slab_stats_epoch(SlabAllocator* alloc, uint32_t size_class, EpochId epoch, 
   /* Read epoch lifecycle state */
   out->state = atomic_load_explicit(&alloc->epoch_state[epoch], memory_order_relaxed);
   
-  /* Read list lengths and scan for reclaimable slabs (brief lock) */
+  /* Read list lengths (brief lock) */
   pthread_mutex_lock(&sc->lock);
   
   EpochState* es = &sc->epochs[epoch];
   out->partial_slab_count = (uint32_t)es->partial.len;
   out->full_slab_count = (uint32_t)es->full.len;
   
-  /* Scan partial list for reclaimable (empty) slabs */
-  out->reclaimable_slab_count = 0;
-  Slab* s = es->partial.head;
-  while (s) {
-    uint32_t free_count = atomic_load_explicit(&s->free_count, memory_order_relaxed);
-    if (free_count == s->object_count) {
-      out->reclaimable_slab_count++;
-    }
-    s = s->next;
-  }
-  
   pthread_mutex_unlock(&sc->lock);
+  
+  /* Phase 2.1: O(1) reclaimable count (no scan needed) */
+  out->reclaimable_slab_count = atomic_load_explicit(&es->empty_partial_count, memory_order_relaxed);
   
   /* Derived metrics */
   out->estimated_rss_bytes = (uint64_t)(out->partial_slab_count + out->full_slab_count) * SLAB_PAGE_SIZE;
