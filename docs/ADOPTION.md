@@ -20,10 +20,11 @@ HFT systems require deterministic allocation latency. A single 10µs spike can c
 - Occasional mmap/munmap syscalls (2-10µs)
 
 temporal-slab provides:
-- **30-50 cycle fast path** (10-17ns at 3GHz)
+- **76ns p99 latency** (39× better than malloc's 2,962ns)
+- **166ns p99.9 latency** (69× better than malloc's 11,525ns)
+- **16× more predictable variance** (659× vs malloc's 10,585×)
 - **No compaction pauses** (objects never move)
 - **O(1) size class selection** (zero branch misprediction jitter)
-- **Predictable p99** (<2µs vs malloc's >10µs)
 
 **Typical HFT allocations:**
 - Order objects: 128-256 bytes
@@ -52,7 +53,7 @@ Control plane services (Kubernetes controllers, service meshes, API gateways, lo
 - Leads to OOM kills, production outages, wasted cloud spend
 - Requires periodic restarts (downtime, state loss)
 
-Benchmark results show temporal-slab at **0% RSS growth** over 1000 allocation cycles while malloc grows **108%** and jemalloc grows **58%**.
+Benchmark results show temporal-slab at **0-2.4% RSS growth** over 1000 churn cycles while malloc exhibits **unbounded drift** (11,174% measured growth over 100 cycles in sustained churn tests).
 
 **Typical control plane allocations:**
 - Session metadata: 64-256 bytes
@@ -64,9 +65,14 @@ Again, perfect fit for temporal-slab's size classes.
 
 **Real operational impact:**
 
-A control plane service with 50,000 active sessions:
-- malloc: 12 MB → 25 MB over 7 days (+108%)
-- temporal-slab: 12 MB → 12 MB (0% growth)
+A control plane service with sustained churn:
+- malloc: Unbounded drift (11,174% measured over 100 cycles)
+- temporal-slab: 0-2.4% growth over 1000 cycles
+
+**With epoch_close() API:**
+- 19.15 MiB reclaimable per epoch (5 epochs × 50K objects)
+- 3.3% RSS drop under memory pressure
+- 100% cache hit rate (perfect slab reuse)
 
 This saves:
 - Cloud spend (no overprovisioning needed)
@@ -133,20 +139,23 @@ Example services to instrument:
 
 Once you have "30 Days of temporal-slab in Production" with graphs showing 0% RSS growth and no incidents, adoption risk drops significantly.
 
-### Barrier 2: x86-64 Linux Only
+### Barrier 2: Platform Coverage
 
-**Problem:** Many control planes run on ARM64 (AWS Graviton, cloud-native infrastructure). HFT firms increasingly use ARM for power efficiency.
+**Current status:** x86-64 Linux primary target, portable C11 code.
 
-**Solution:** Port to ARM64.
+**Cloud deployment:** AWS Graviton (ARM64), cloud-native infrastructure increasingly ARM-based.
 
-**Effort estimate:** 2-3 weeks
+**Portability approach:**
+- C11 atomics are portable across architectures
+- POSIX mmap/munmap work on all Unix-like systems
+- Memory ordering semantics may differ (ARM weaker than x86)
 
-The code is mostly portable:
-- C11 atomics work on ARM64
-- mmap/munmap are POSIX
-- Main differences: memory ordering semantics (ARM is weaker than x86)
+**Validation needed:**
+- Test on ARM64 (AWS Graviton, Apple Silicon)
+- Test on other Linux distributions (Alpine, Arch, RHEL)
+- Consider macOS/BSD support for development environments
 
-**Priority:** High. This unlocks the cloud-native market.
+**Priority:** Medium. x86-64 Linux covers HFT and majority of cloud workloads initially.
 
 ### Barrier 3: Integration Friction
 
@@ -182,6 +191,16 @@ void operator delete(void* ptr) noexcept {
 static GLOBAL: TemporalSlabAllocator = TemporalSlabAllocator::new();
 ```
 
+**Epoch domains for structured lifetimes:**
+```c
+// Request-scoped allocation with automatic cleanup
+epoch_domain_t* request = epoch_domain_create(alloc);
+epoch_domain_enter(request);
+    handle_request(conn);  // Allocations tied to request
+epoch_domain_exit(request);  // Automatic epoch_close()
+epoch_domain_destroy(request);
+```
+
 **Packaging:**
 - Debian/Ubuntu: `.deb` package
 - RHEL/Fedora: `.rpm` package
@@ -190,7 +209,44 @@ static GLOBAL: TemporalSlabAllocator = TemporalSlabAllocator::new();
 
 **Priority:** Medium. Reduces friction but not a blocker for sophisticated users.
 
-### Barrier 4: Fear of Custom Allocators
+### Barrier 4: Observability and Debugging
+
+**Problem:** Teams need visibility into allocator behavior for production confidence.
+
+**Solution:** Built-in observability system.
+
+temporal-slab provides comprehensive telemetry:
+
+**Global stats:**
+```c
+SlabGlobalStats gs;
+slab_stats_global(alloc, &gs);
+// RSS (actual vs estimated), slow-path attribution, epoch state
+```
+
+**Per-size-class stats:**
+```c
+SlabClassStats cs;
+slab_stats_class(alloc, 2, &cs);  // 128-byte class
+// Cache effectiveness, madvise tracking, slab distribution
+```
+
+**Per-epoch stats:**
+```c
+SlabEpochStats es;
+slab_stats_epoch(alloc, 2, 5, &es);  // Class 2, epoch 5
+// Reclaimable memory, age, refcount (domain tracking)
+```
+
+**Diagnostic queries enabled:**
+- "Why did we go slow?" → slow_path_cache_miss vs slow_path_epoch_closed
+- "Why isn't RSS dropping?" → madvise_calls, madvise_failures, reclaimable_slab_count
+- "Which epoch owns most memory?" → estimated_rss_bytes per epoch
+- "Is there a memory leak?" → Long-lived epochs with non-zero refcount
+
+**Priority:** High. Observability is critical for production adoption.
+
+### Barrier 5: Fear of Custom Allocators
 
 **Problem:** Teams are wary of swapping allocators due to past bad experiences (crashes, leaks, undefined behavior).
 
@@ -214,6 +270,39 @@ Compare to malloc:
 
 **Priority:** Low. Documentation and messaging, not code changes.
 
+### Current Feature Status (Implementation Complete)
+
+**Phase 1: Core allocator** ✓
+- Lock-free fast path (atomic CAS)
+- 8 size classes (64-768 bytes)
+- Handle-based and malloc-style APIs
+- Conservative recycling (FULL-only)
+
+**Phase 2: RSS reclamation** ✓
+- madvise(MADV_DONTNEED) on empty slabs
+- epoch_close() API for deterministic reclamation
+- Slab registry with generation counters (ABA protection)
+- CachedNode architecture (madvise-safe reuse)
+
+**Phase 3: Observability** ✓
+- Global, per-class, per-epoch stats APIs
+- Slow-path attribution (cache miss vs epoch closed)
+- RSS tracking (madvise calls/bytes/failures)
+- stats_dump utility for production diagnostics
+
+**Phase 4: Epoch domains** ✓
+- RAII-style scoped lifetimes
+- Automatic epoch_close() on domain exit
+- Refcount tracking for nested scopes
+- Thread-local context for implicit binding
+
+**Documentation** ✓
+- foundations.md (3,222 lines, first-principles theory)
+- EPOCH_DOMAINS.md (pattern catalog, safety contracts)
+- VALUE_PROP.md (measured benchmark results)
+- ADOPTION.md (this document)
+- OBSERVABILITY_DESIGN.md (telemetry architecture)
+
 ## Path to Adoption (6-12 Month Roadmap)
 
 ### Phase 1: Production Validation (Month 1-2)
@@ -232,34 +321,37 @@ Compare to malloc:
 
 **Success criteria:**
 - Zero crashes
-- 0-5% RSS growth (vs 20-50% for baseline allocator)
-- p99 latency <2µs
+- 0-2.4% RSS growth (vs unbounded drift for baseline allocator)
+- p99 latency <100ns (vs 2-3µs for malloc)
+- 16× more predictable variance than malloc
 - Publishable graphs
 
 **Deliverable:** Blog post with before/after graphs, lessons learned, operational experience.
 
-### Phase 2: ARM64 + Packaging (Month 3)
+### Phase 2: Multi-Platform Validation + Packaging (Month 3)
 
-**Goal:** Unlock cloud-native and HFT ARM deployments.
+**Goal:** Validate portability and reduce integration friction.
 
 **Tasks:**
-1. Port to ARM64:
-   - Test on AWS Graviton EC2 instance
-   - Verify atomic operations (weaker memory model)
-   - Validate benchmarks match x86 behavior
+1. Test on additional platforms:
+   - AWS Graviton (ARM64 Linux)
+   - Apple Silicon (ARM64 macOS)
+   - Other Linux distributions (Alpine, RHEL, Arch)
+   - Verify atomic memory ordering on weaker models
 2. Create packages:
    - `.deb` for Ubuntu/Debian
    - `.rpm` for RHEL/Fedora
    - Homebrew formula for macOS
 3. Add CMake FetchContent example
-4. CI/CD for multiple architectures (GitHub Actions)
+4. CI/CD for multiple platforms (GitHub Actions)
 
 **Success criteria:**
-- All tests pass on ARM64
+- Tests pass on ARM64 (Linux + macOS)
 - Packages installable with single command
 - CMake integration documented
+- No platform-specific workarounds in hot path
 
-**Deliverable:** Multi-architecture release (v1.0).
+**Deliverable:** Multi-platform release (v1.0).
 
 ### Phase 3: Advocacy (Month 4-6)
 
@@ -429,22 +521,24 @@ MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000"
 ```
 
 **temporal-slab advantages:**
-- 0% RSS growth (jemalloc still drifts with aggressive tuning)
-- Sub-100ns fast path (jemalloc uses locks)
-- Predictable p99 (jemalloc has compaction pauses)
+- 0-2.4% RSS growth (jemalloc still drifts with aggressive tuning)
+- 76ns p99 (39× better than malloc, jemalloc similar to malloc)
+- 16× more predictable variance (659× vs 10,585×)
+- Application-controlled reclamation via epoch_close() (jemalloc uses heuristics)
 
 **Competitor 3: mimalloc**
 
 mimalloc is a specialized allocator optimizing for performance:
 
 **temporal-slab advantages:**
-- Bounded RSS guarantee (mimalloc does not prevent drift)
+- Structural RSS bounds (0-2.4% vs mimalloc's heuristic reclamation)
 - Epoch-based temporal grouping (mimalloc uses free lists)
-- No compaction pauses (mimalloc occasionally merges spans)
+- Application-controlled reclamation (mimalloc uses background threads)
+- 16× more predictable variance (structural determinism vs emergent behavior)
 
-**Verdict:** temporal-slab wins on bounded RSS and tail latency. Loses on generality (fixed sizes, 768 byte limit).
+**Verdict:** temporal-slab wins on bounded RSS, tail latency predictability, and deterministic behavior. Loses on generality (fixed sizes, 768 byte limit).
 
-For the target niche (small objects, high churn), temporal-slab is the best option.
+For the target niche (small objects, high churn, latency-sensitive), temporal-slab is the best option.
 
 ## Adoption Risks
 
