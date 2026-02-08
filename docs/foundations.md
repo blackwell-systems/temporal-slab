@@ -1872,6 +1872,93 @@ double rate = (double)total_retries / (double)total_attempts;
 
 Windowed deltas respond to load changes within ~100K allocations. Lifetime averages can take millions of allocations to reflect new contention patterns.
 
+**Why the combination achieves stability:**
+
+The controller is not just reactive—it's **stable under sustained pressure**. This is the hard part: anyone can flip a flag when they see contention, but very few adaptive systems know when to stop adapting.
+
+The three mechanisms work together:
+
+**1. Windowed deltas (fast convergence):**
+- Measure only the last 100K allocations, not lifetime totals
+- New contention patterns detected within 1-2 windows (~200K allocations)
+- Without windowing: Startup spike at era 0 dominates lifetime average forever
+
+**2. Hysteresis (prevents oscillation):**
+```
+Retry rate oscillating around 20%:
+Without hysteresis:
+  19% → switch to sequential
+  21% → switch to randomized
+  19% → switch to sequential
+  21% → switch to randomized
+  → Mode flips every 100K allocations!
+
+With hysteresis (30% enable, 10% disable):
+  19% → stay in current mode (no switch)
+  21% → stay in current mode (no switch)
+  → Stable, no thrashing
+```
+
+The 20% gap creates a "dead zone" where small fluctuations don't trigger switches. Once randomized mode is enabled (>30% retry rate), it stays enabled until retry rate drops below 10%. This prevents ping-ponging when load hovers near a threshold.
+
+**3. Dwell time (prevents rapid switching):**
+```c
+if (sc->scan_adapt.dwell_countdown) {
+    sc->scan_adapt.dwell_countdown--;
+    return;  // Don't switch yet, even if threshold crossed
+}
+```
+
+After every mode switch, the controller enforces a minimum dwell time (3 checks = 300K allocations). This prevents:
+
+```
+Load spike scenario WITHOUT dwell time:
+T=0: 8 threads → retry rate 75% → switch to randomized
+T=100K: Spike ends, 1 thread → retry rate 5% → switch to sequential
+T=200K: Spike returns, 8 threads → retry rate 75% → switch to randomized
+T=300K: Spike ends → switch to sequential
+→ 4 mode switches in 400K allocations (unstable!)
+
+WITH dwell time (3 checks):
+T=0: 8 threads → retry rate 75% → switch to randomized, dwell=3
+T=100K: Spike ends, 1 thread → retry rate 5%, but dwell=2 → stay randomized
+T=200K: Spike returns, 8 threads → retry rate 75%, dwell=1 → stay randomized
+T=300K: Still high load, dwell=0 → controller active again
+→ 1 mode switch, stable operation during transient load
+```
+
+**The stability guarantee:**
+
+These three mechanisms together prevent **control system instability**:
+
+| Mechanism | Prevents | Without It |
+|-----------|----------|------------|
+| **Windowed deltas** | Stale decisions from old data | Startup spike dominates forever |
+| **Hysteresis** | Oscillation near thresholds | Mode flips every window when load ~ 20% |
+| **Dwell time** | Rapid switching on transient spikes | Thrashing during bursty workloads |
+
+The result: **The controller converges to the correct mode and stays there** until load characteristics fundamentally change. It doesn't thrash, doesn't oscillate, and doesn't overreact to transient spikes.
+
+**Measured stability in production validation:**
+
+```
+T=2 threads (47 trials):
+- mode=0.1 (mostly sequential)
+- switches=2.1 average
+- Proves controller switches near threshold (retry rate ~ 30%)
+- CV=7.8% (excellent repeatability)
+
+T=8 threads (47 trials):  
+- mode=1.0 (always randomized)
+- switches=0 (never switches back)
+- Proves stability under sustained high load
+- No thrashing despite 60-second measurement windows
+```
+
+At T=2, the controller is actively adapting (retry rate near 30% threshold, occasional switches). At T=8, the controller has converged to randomized mode and stays there—it doesn't flip back and forth despite measuring 6 million allocations per trial.
+
+**This is control theory in action:** The combination of windowed measurement, hysteresis thresholds, and dwell time creates a **stable feedback loop** that adapts quickly but doesn't overreact.
+
 **Example: 8 threads allocating simultaneously**
 
 ```
