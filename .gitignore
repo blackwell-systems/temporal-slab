@@ -8,6 +8,8 @@ src/slab_lib.c
 # Executables
 src/slab_alloc
 src/benchmark_accurate
+src/benchmark_threads
+src/stats_dump
 src/smoke_tests
 src/smoke_tests_debug
 src/smoke_tests_tsan
@@ -15,6 +17,10 @@ src/churn_test
 src/test_public_api
 src/test_struct_layout
 src/test_malloc_wrapper
+src/domain_usage
+src/soak_test
+src/test_label_cardinality
+workloads/synthetic_bench
 
 # Test outputs
 *.log
