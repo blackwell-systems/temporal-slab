@@ -42,6 +42,14 @@ void slab_stats_global(SlabAllocator* alloc, SlabGlobalStats* out) {
     out->total_madvise_calls += atomic_load_explicit(&sc->madvise_calls, memory_order_relaxed);
     out->total_madvise_bytes += atomic_load_explicit(&sc->madvise_bytes, memory_order_relaxed);
     out->total_madvise_failures += atomic_load_explicit(&sc->madvise_failures, memory_order_relaxed);
+    
+    /* Phase 2.2: Lock-free contention totals */
+    out->total_bitmap_alloc_cas_retries += atomic_load_explicit(&sc->bitmap_alloc_cas_retries, memory_order_relaxed);
+    out->total_bitmap_free_cas_retries += atomic_load_explicit(&sc->bitmap_free_cas_retries, memory_order_relaxed);
+    out->total_current_partial_cas_failures += atomic_load_explicit(&sc->current_partial_cas_failures, memory_order_relaxed);
+    out->total_bitmap_alloc_attempts += atomic_load_explicit(&sc->bitmap_alloc_attempts, memory_order_relaxed);
+    out->total_bitmap_free_attempts += atomic_load_explicit(&sc->bitmap_free_attempts, memory_order_relaxed);
+    out->total_current_partial_cas_attempts += atomic_load_explicit(&sc->current_partial_cas_attempts, memory_order_relaxed);
   }
   
   /* Derived metrics (handle underflow gracefully) */
@@ -92,6 +100,44 @@ void slab_stats_class(SlabAllocator* alloc, uint32_t size_class, SlabClassStats*
   out->epoch_close_scanned_slabs = atomic_load_explicit(&sc->epoch_close_scanned_slabs, memory_order_relaxed);
   out->epoch_close_recycled_slabs = atomic_load_explicit(&sc->epoch_close_recycled_slabs, memory_order_relaxed);
   out->epoch_close_total_ns = atomic_load_explicit(&sc->epoch_close_total_ns, memory_order_relaxed);
+  
+  /* Phase 2.2: Lock-free contention metrics */
+  out->bitmap_alloc_cas_retries = atomic_load_explicit(&sc->bitmap_alloc_cas_retries, memory_order_relaxed);
+  out->bitmap_free_cas_retries = atomic_load_explicit(&sc->bitmap_free_cas_retries, memory_order_relaxed);
+  out->current_partial_cas_failures = atomic_load_explicit(&sc->current_partial_cas_failures, memory_order_relaxed);
+  out->bitmap_alloc_attempts = atomic_load_explicit(&sc->bitmap_alloc_attempts, memory_order_relaxed);
+  out->bitmap_free_attempts = atomic_load_explicit(&sc->bitmap_free_attempts, memory_order_relaxed);
+  out->current_partial_cas_attempts = atomic_load_explicit(&sc->current_partial_cas_attempts, memory_order_relaxed);
+  
+  /* Phase 2.2: Lock contention (Tier 0 trylock probe) */
+  out->lock_fast_acquire = atomic_load_explicit(&sc->lock_fast_acquire, memory_order_relaxed);
+  out->lock_contended = atomic_load_explicit(&sc->lock_contended, memory_order_relaxed);
+  
+  /* Phase 2.2: Compute derived contention metrics (avoid divide by zero) */
+  if (out->bitmap_alloc_attempts > 0) {
+    out->avg_alloc_cas_retries_per_attempt = (double)out->bitmap_alloc_cas_retries / out->bitmap_alloc_attempts;
+  } else {
+    out->avg_alloc_cas_retries_per_attempt = 0.0;
+  }
+  
+  if (out->bitmap_free_attempts > 0) {
+    out->avg_free_cas_retries_per_attempt = (double)out->bitmap_free_cas_retries / out->bitmap_free_attempts;
+  } else {
+    out->avg_free_cas_retries_per_attempt = 0.0;
+  }
+  
+  if (out->current_partial_cas_attempts > 0) {
+    out->current_partial_cas_failure_rate = (double)out->current_partial_cas_failures / out->current_partial_cas_attempts;
+  } else {
+    out->current_partial_cas_failure_rate = 0.0;
+  }
+  
+  uint64_t total_lock_ops = out->lock_fast_acquire + out->lock_contended;
+  if (total_lock_ops > 0) {
+    out->lock_contention_rate = (double)out->lock_contended / total_lock_ops;
+  } else {
+    out->lock_contention_rate = 0.0;
+  }
   
   /* Cache state snapshot (brief lock) */
   pthread_mutex_lock(&sc->cache_lock);
