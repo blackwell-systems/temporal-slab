@@ -73,8 +73,8 @@ test_era_stamping: test_era_stamping.c slab_lib.o
 	$(CC) $(CFLAGS) test_era_stamping.c slab_lib.o -o test_era_stamping
 
 # Canonical benchmark harness
-synthetic_bench: ../workloads/synthetic_bench.c slab_lib.o
-	$(CC) $(CFLAGS) ../workloads/synthetic_bench.c slab_lib.o -o ../workloads/synthetic_bench
+synthetic_bench: ../workloads/synthetic_bench.c slab_lib.o slab_stats.o
+	$(CC) $(CFLAGS) ../workloads/synthetic_bench.c slab_lib.o slab_stats.o -o ../workloads/synthetic_bench
 
 clean:
 	rm -f smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump slab_lib.c slab_lib.o epoch_domain.o slab_stats.o benchmark_threads_tsan slab_lib_tsan.o tsan_test ../workloads/synthetic_bench

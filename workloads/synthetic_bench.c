@@ -18,6 +18,7 @@
 
 #define _GNU_SOURCE
 #include <slab_alloc.h>
+#include <slab_stats.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -646,9 +647,128 @@ int main(int argc, char** argv) {
     pthread_t thread;
     pthread_create(&thread, NULL, worker_thread, &ws);
 
-    /* Main thread: monitor and stop after duration */
+    /* Main thread: monitor, export stats, and stop after duration */
+    uint64_t last_progress = start_time;
+    uint64_t last_stats_export = start_time;
+    
     while (get_time_ns() < end_time) {
         sleep(1);
+        
+        uint64_t now = get_time_ns();
+        
+        /* Export stats every 5 seconds (for live dashboard) */
+        if (cfg.allocator == ALLOCATOR_TSLAB && (now - last_stats_export) >= 5000000000ULL) {
+            FILE* f = fopen("/tmp/synthetic_bench_stats.json", "w");
+            if (f) {
+                SlabAllocator* a = (SlabAllocator*)backend->ctx;
+                SlabGlobalStats gs;
+                slab_stats_global(a, &gs);
+                
+                fprintf(f, "{\n");
+                fprintf(f, "  \"schema_version\": 1,\n");
+                fprintf(f, "  \"timestamp_ns\": %lu,\n", now);
+                fprintf(f, "  \"pid\": %d,\n", getpid());
+                fprintf(f, "  \"page_size\": 4096,\n");
+                fprintf(f, "  \"epoch_count\": 16,\n");
+                fprintf(f, "  \"version\": %u,\n", gs.version);
+                fprintf(f, "  \"current_epoch\": %u,\n", gs.current_epoch);
+                fprintf(f, "  \"active_epoch_count\": %u,\n", gs.active_epoch_count);
+                fprintf(f, "  \"closing_epoch_count\": %u,\n", gs.closing_epoch_count);
+                fprintf(f, "  \"total_slabs_allocated\": %lu,\n", gs.total_slabs_allocated);
+                fprintf(f, "  \"total_slabs_recycled\": %lu,\n", gs.total_slabs_recycled);
+                fprintf(f, "  \"net_slabs\": %lu,\n", gs.net_slabs);
+                fprintf(f, "  \"rss_bytes_current\": %lu,\n", gs.rss_bytes_current);
+                fprintf(f, "  \"estimated_slab_rss_bytes\": %lu,\n", gs.estimated_slab_rss_bytes);
+                fprintf(f, "  \"total_slow_path_hits\": %lu,\n", gs.total_slow_path_hits);
+                fprintf(f, "  \"total_cache_overflows\": %lu,\n", gs.total_cache_overflows);
+                fprintf(f, "  \"total_slow_cache_miss\": %lu,\n", gs.total_slow_cache_miss);
+                fprintf(f, "  \"total_slow_epoch_closed\": %lu,\n", gs.total_slow_epoch_closed);
+                fprintf(f, "  \"total_madvise_calls\": %lu,\n", gs.total_madvise_calls);
+                fprintf(f, "  \"total_madvise_bytes\": %lu,\n", gs.total_madvise_bytes);
+                fprintf(f, "  \"total_madvise_failures\": %lu,\n", gs.total_madvise_failures);
+                
+                /* Per-class stats */
+                fprintf(f, "  \"classes\": [\n");
+                for (uint32_t cls = 0; cls < 8; cls++) {
+                    SlabClassStats cs;
+                    slab_stats_class(a, cls, &cs);
+                    fprintf(f, "    {\n");
+                    fprintf(f, "      \"class_index\": %u,\n", cs.class_index);
+                    fprintf(f, "      \"object_size\": %u,\n", cs.object_size);
+                    fprintf(f, "      \"slow_path_hits\": %lu,\n", cs.slow_path_hits);
+                    fprintf(f, "      \"new_slab_count\": %lu,\n", cs.new_slab_count);
+                    fprintf(f, "      \"list_move_partial_to_full\": %lu,\n", cs.list_move_partial_to_full);
+                    fprintf(f, "      \"list_move_full_to_partial\": %lu,\n", cs.list_move_full_to_partial);
+                    fprintf(f, "      \"current_partial_null\": %lu,\n", cs.current_partial_null);
+                    fprintf(f, "      \"current_partial_full\": %lu,\n", cs.current_partial_full);
+                    fprintf(f, "      \"empty_slab_recycled\": %lu,\n", cs.empty_slab_recycled);
+                    fprintf(f, "      \"empty_slab_overflowed\": %lu,\n", cs.empty_slab_overflowed);
+                    fprintf(f, "      \"slow_path_cache_miss\": %lu,\n", cs.slow_path_cache_miss);
+                    fprintf(f, "      \"slow_path_epoch_closed\": %lu,\n", cs.slow_path_epoch_closed);
+                    fprintf(f, "      \"madvise_calls\": %lu,\n", cs.madvise_calls);
+                    fprintf(f, "      \"madvise_bytes\": %lu,\n", cs.madvise_bytes);
+                    fprintf(f, "      \"madvise_failures\": %lu,\n", cs.madvise_failures);
+                    fprintf(f, "      \"epoch_close_calls\": %lu,\n", cs.epoch_close_calls);
+                    fprintf(f, "      \"epoch_close_scanned_slabs\": %lu,\n", cs.epoch_close_scanned_slabs);
+                    fprintf(f, "      \"epoch_close_recycled_slabs\": %lu,\n", cs.epoch_close_recycled_slabs);
+                    fprintf(f, "      \"epoch_close_total_ns\": %lu,\n", cs.epoch_close_total_ns);
+                    fprintf(f, "      \"cache_size\": %u,\n", cs.cache_size);
+                    fprintf(f, "      \"cache_capacity\": %u,\n", cs.cache_capacity);
+                    fprintf(f, "      \"cache_overflow_len\": %u,\n", cs.cache_overflow_len);
+                    fprintf(f, "      \"total_partial_slabs\": %u,\n", cs.total_partial_slabs);
+                    fprintf(f, "      \"total_full_slabs\": %u,\n", cs.total_full_slabs);
+                    fprintf(f, "      \"recycle_rate_pct\": %.2f,\n", cs.recycle_rate_pct);
+                    fprintf(f, "      \"net_slabs\": %lu,\n", cs.net_slabs);
+                    fprintf(f, "      \"estimated_rss_bytes\": %lu\n", cs.estimated_rss_bytes);
+                    fprintf(f, "    }%s\n", (cls < 7) ? "," : "");
+                }
+                fprintf(f, "  ],\n");
+                
+                /* Per-epoch stats */
+                fprintf(f, "  \"epochs\": [\n");
+                int first_epoch = 1;
+                for (uint32_t cls = 0; cls < 8; cls++) {
+                    for (uint32_t ep = 0; ep < 16; ep++) {
+                        SlabEpochStats es;
+                        slab_stats_epoch(a, cls, ep, &es);
+                        
+                        if (!first_epoch) fprintf(f, ",\n");
+                        first_epoch = 0;
+                        
+                        fprintf(f, "    {\n");
+                        fprintf(f, "      \"class_index\": %u,\n", es.class_index);
+                        fprintf(f, "      \"object_size\": %u,\n", es.object_size);
+                        fprintf(f, "      \"epoch_id\": %u,\n", es.epoch_id);
+                        fprintf(f, "      \"epoch_era\": %lu,\n", es.epoch_era);
+                        fprintf(f, "      \"state\": \"%s\",\n", es.state == 0 ? "ACTIVE" : "CLOSING");
+                        fprintf(f, "      \"open_since_ns\": %lu,\n", es.open_since_ns);
+                        fprintf(f, "      \"alloc_count\": %lu,\n", es.alloc_count);
+                        fprintf(f, "      \"label\": \"%s\",\n", es.label);
+                        fprintf(f, "      \"rss_before_close\": %lu,\n", es.rss_before_close);
+                        fprintf(f, "      \"rss_after_close\": %lu,\n", es.rss_after_close);
+                        fprintf(f, "      \"partial_slab_count\": %u,\n", es.partial_slab_count);
+                        fprintf(f, "      \"full_slab_count\": %u,\n", es.full_slab_count);
+                        fprintf(f, "      \"estimated_rss_bytes\": %lu,\n", es.estimated_rss_bytes);
+                        fprintf(f, "      \"reclaimable_slab_count\": %u,\n", es.reclaimable_slab_count);
+                        fprintf(f, "      \"reclaimable_bytes\": %lu\n", es.reclaimable_bytes);
+                        fprintf(f, "    }");
+                    }
+                }
+                fprintf(f, "\n  ]\n");
+                fprintf(f, "}\n");
+                fclose(f);
+            }
+            last_stats_export = now;
+        }
+        
+        /* Print progress every 10 seconds */
+        if ((now - last_progress) >= 10000000000ULL) {
+            double elapsed_s = (now - start_time) / 1e9;
+            fprintf(stderr, "[%.0fs] Requests: %lu, Allocs: %lu, Frees: %lu, Leaked: %lu\n",
+                    elapsed_s, ws.requests_completed, ws.objects_allocated,
+                    ws.objects_freed, ws.objects_leaked);
+            last_progress = now;
+        }
     }
 
     ws.stop = true;
