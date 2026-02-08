@@ -32,6 +32,7 @@ This document builds the theoretical foundation for temporal-slab from first pri
 - [Epoch](#epoch)
 - [Epoch Advancement](#epoch-advancement)
 - [Epoch Ring Buffer Architecture](#epoch-ring-buffer-architecture)
+- [Epoch Domains](#epoch-domains)
 - [Slab](#slab)
 - [Size Class](#size-class)
 - [Internal Fragmentation](#internal-fragmentation)
@@ -50,6 +51,7 @@ This document builds the theoretical foundation for temporal-slab from first pri
 - [Cache Coherence](#cache-coherence)
 - [Memory Alignment](#memory-alignment)
 - [Compiler Barriers](#compiler-barriers)
+- [Thread-Local Storage (TLS)](#thread-local-storage-tls)
 - [Bounded RSS Through Conservative Recycling](#bounded-rss-through-conservative-recycling)
 - [Hazard Pointers and Reference Counting](#hazard-pointers-and-reference-counting)
 - [ABA Problem](#aba-problem)
@@ -1366,6 +1368,272 @@ Because:
 4. Maximum RSS = 16 epochs × max_objects_per_epoch × object_size
 
 This is the core architectural insight: **bounded circular buffer + temporal grouping = bounded RSS**.
+
+## Epoch Domains
+
+Epoch domains are RAII-style scoped lifetimes that provide finer-grained control over memory reclamation within epochs. While epochs separate allocations by time windows (e.g., every 10,000 requests), domains separate allocations by **nested scopes** (e.g., per-request, per-transaction, per-query).
+
+**The problem: Coarse-grained epochs**
+
+Epochs provide temporal separation, but they're application-wide boundaries:
+
+```c
+// Problem: All requests in a 10,000-request batch share an epoch
+EpochId batch_epoch = epoch_current(alloc);
+
+for (int i = 0; i < 10000; i++) {
+    process_request(alloc, batch_epoch);  // All use same epoch
+}
+
+// Can only reclaim after ALL 10,000 requests complete
+epoch_close(alloc, batch_epoch);
+```
+
+If request #1 completes in 10ms but request #9,999 takes 60 seconds, you cannot reclaim request #1's memory until request #9,999 finishes. Memory is trapped by the longest-lived allocation in the epoch.
+
+**Solution: Epoch domains (scoped lifetimes)**
+
+Domains subdivide epochs into **nested scopes** with explicit enter/exit boundaries:
+
+```c
+// Each request gets its own domain
+for (int i = 0; i < 10000; i++) {
+    epoch_domain_t* domain = epoch_domain_create(alloc);
+    epoch_domain_enter(alloc, domain);
+    
+    // All allocations in this domain
+    process_request(alloc);  // Uses current epoch via domain
+    
+    epoch_domain_exit(alloc, domain);
+    epoch_domain_destroy(alloc, domain);  // Can reclaim THIS request's memory
+}
+```
+
+When `epoch_domain_destroy()` is called, if `auto_close=true` and the domain's refcount reaches zero, the allocator can reclaim memory allocated in that domain's scope—even if other domains in the same epoch are still active.
+
+**Domain lifecycle (RAII pattern):**
+
+```c
+// 1. Create domain (associates with current epoch)
+epoch_domain_t* domain = epoch_domain_create(alloc);
+
+// 2. Enter domain (increments refcount, activates scope)
+epoch_domain_enter(alloc, domain);
+
+// 3. Allocations happen within the domain
+void* obj = slab_malloc(alloc, 128);  // Uses domain's epoch
+
+// 4. Exit domain (decrements refcount)
+epoch_domain_exit(alloc, domain);
+
+// 5. Destroy domain (can trigger epoch_close if auto_close=true)
+epoch_domain_destroy(alloc, domain);
+```
+
+**Domain refcount tracking:**
+
+Each epoch maintains a `domain_refcount` (formerly called `alloc_count`):
+
+```c
+struct EpochMetadata {
+    atomic_int domain_refcount;  // Number of active domains in this epoch
+    uint64_t epoch_era;           // Era for validation
+    char label[32];               // Semantic tag for debugging
+};
+```
+
+Operations:
+- `epoch_domain_enter()` → `domain_refcount++`
+- `epoch_domain_exit()` → `domain_refcount--`
+- When `domain_refcount` reaches 0 and domain has `auto_close=true`, the allocator can call `epoch_close()`
+
+**Why refcount, not allocation count?**
+
+Previously, `alloc_count` tracked live allocations in the epoch. This had two problems:
+
+1. **Semantic collision:** 10,000 live objects looked identical to 10,000 active domains
+2. **Hot-path overhead:** Every allocation/free incremented/decremented a shared counter
+
+The rename to `domain_refcount` clarifies the purpose: tracking domain boundaries (enter/exit), not individual allocations. This is a **cold-path** operation (happens per-request, not per-allocation), so the overhead is acceptable.
+
+**Thread-local contract:**
+
+Domains enforce a **thread-local ownership** contract:
+
+```c
+struct epoch_domain {
+    pthread_t owner_tid;         // Thread that created the domain
+    uint64_t epoch_era;          // Era for validation
+    EpochId epoch_id;            // Epoch ID (ring index)
+    bool auto_close;             // Trigger epoch_close on destroy?
+};
+```
+
+All domain operations assert ownership:
+
+```c
+void epoch_domain_enter(SlabAllocator* alloc, epoch_domain_t* domain) {
+    assert(pthread_equal(pthread_self(), domain->owner_tid));
+    // ... increment refcount ...
+}
+```
+
+This prevents bugs where one thread creates a domain and another thread tries to use it. Domains are **not** transferable between threads—they're strictly thread-local scopes.
+
+**Nested domains (TLS stack):**
+
+Domains can nest arbitrarily (up to 32 levels):
+
+```c
+// Thread-local stack of nested domains (max depth: 32)
+static __thread struct {
+    epoch_domain_t* stack[MAX_DOMAIN_DEPTH];
+    uint32_t depth;
+} tls_domain_stack;
+
+// Outer domain: Request processing
+epoch_domain_t* request_domain = epoch_domain_create(alloc);
+epoch_domain_enter(alloc, request_domain);
+
+    // Inner domain: Database transaction
+    epoch_domain_t* txn_domain = epoch_domain_create(alloc);
+    epoch_domain_enter(alloc, txn_domain);
+    
+        // Innermost domain: Query execution
+        epoch_domain_t* query_domain = epoch_domain_create(alloc);
+        epoch_domain_enter(alloc, query_domain);
+        
+        // Allocations here use query_domain's epoch
+        execute_query(alloc);
+        
+        epoch_domain_exit(alloc, query_domain);
+        epoch_domain_destroy(alloc, query_domain);
+    
+    epoch_domain_exit(alloc, txn_domain);
+    epoch_domain_destroy(alloc, txn_domain);
+
+epoch_domain_exit(alloc, request_domain);
+epoch_domain_destroy(alloc, request_domain);
+```
+
+The TLS stack enforces **LIFO (Last-In-First-Out)** unwind order. You cannot exit an outer domain before exiting all inner domains. This prevents use-after-free bugs from improper scope nesting.
+
+**Era validation prevents wraparound bugs:**
+
+Domains store both `epoch_id` (ring index) and `epoch_era` (monotonic counter):
+
+```c
+// Domain created at era 100
+epoch_domain_t* domain = epoch_domain_create(alloc);
+domain->epoch_era = 100;
+
+// ... 20 epoch_advance() calls happen (ring wrapped) ...
+
+// Destroy attempts auto-close
+if (domain->auto_close && domain_refcount == 0) {
+    if (current_era != domain->epoch_era) {
+        // DON'T CLOSE! This is a different epoch incarnation
+        return;
+    }
+    epoch_close(alloc, domain->epoch_id);
+}
+```
+
+Without era validation, auto-close could close the wrong epoch after the ring wraps (closing epoch 0 era 16 when domain was created for epoch 0 era 0).
+
+**Semantic labels for debugging:**
+
+Domains can set human-readable labels on epochs for production diagnostics:
+
+```c
+epoch_domain_t* domain = epoch_domain_create(alloc);
+slab_epoch_set_label(alloc, domain->epoch_id, "request-processing");
+
+// Later, in observability tools:
+SlabEpochStats stats = slab_stats_epoch(alloc, 5);
+printf("Epoch 5 (%s): %zu live allocations\n", 
+       stats.label, stats.live_objects);
+// Output: Epoch 5 (request-processing): 42,000 live allocations
+```
+
+Labels are stored per-epoch (32-character limit) and protected by a per-allocator mutex (rare writes, cold path). This enables correlation between allocator behavior and application phases in production debugging.
+
+**Auto-close behavior (default: false):**
+
+Domains support two modes:
+
+**Manual mode (auto_close=false, default):**
+```c
+epoch_domain_t* domain = epoch_domain_create(alloc);
+// Must explicitly call epoch_close() when done
+epoch_close(alloc, domain->epoch_id);
+```
+
+**Auto-close mode (auto_close=true):**
+```c
+epoch_domain_t* domain = epoch_domain_create_auto(alloc);
+epoch_domain_destroy(alloc, domain);
+// If domain_refcount=0, automatically calls epoch_close()
+```
+
+Default changed from `true` to `false` in Phase 2.3 because:
+- Explicit `epoch_close()` is safer (no surprise closures)
+- Prevents accidental premature closure when epochs are shared
+- Auto-close only useful for strictly request-scoped patterns
+
+**When to use domains:**
+
+| Pattern | Use Domain? | Why |
+|---------|-------------|-----|
+| **Batch processing** | No | All allocations die together at batch end |
+| **Request handling** | Yes | Each request has independent lifetime |
+| **Nested transactions** | Yes | Transaction → Query → Cache layers |
+| **Long-lived cache** | No | Allocations live for hours/days |
+| **Connection pools** | No | Connections persist across many requests |
+
+Domains add overhead (refcount tracking, TLS stack management), so only use them when you need **fine-grained reclamation boundaries** within epochs.
+
+**Observability integration:**
+
+Domain operations are fully observable:
+
+```c
+SlabEpochStats stats = slab_stats_epoch(alloc, epoch_id);
+printf("Epoch %u (era %lu):\n", epoch_id, stats.epoch_era);
+printf("  Label: %s\n", stats.label);
+printf("  Domain refcount: %d\n", stats.domain_refcount);
+printf("  Live objects: %zu\n", stats.live_objects);
+```
+
+This enables production debugging:
+- **Domain leak detection:** `domain_refcount > 0` after expected completion
+- **Phase correlation:** Labels show which application phase is active
+- **Memory attribution:** Correlate RSS spikes with specific request types
+
+**Example: HTTP request handler**
+
+```c
+void handle_request(SlabAllocator* alloc, Request* req) {
+    // Create request-scoped domain
+    epoch_domain_t* domain = epoch_domain_create(alloc);
+    slab_epoch_set_label(alloc, domain->epoch_id, req->path);
+    epoch_domain_enter(alloc, domain);
+    
+    // All allocations use domain's epoch
+    Response* resp = parse_request(alloc, req);
+    execute_handlers(alloc, req, resp);
+    serialize_response(alloc, resp);
+    
+    // Exit domain (decrements refcount)
+    epoch_domain_exit(alloc, domain);
+    epoch_domain_destroy(alloc, domain);
+    
+    // If auto_close=true and refcount=0, epoch is closed
+    // RSS reclaimed when all request objects freed
+}
+```
+
+Domains transform epochs from "10,000 requests" into "per-request boundaries," enabling deterministic reclamation at request completion rather than batch completion.
 
 ## Slab
 
@@ -2851,6 +3119,150 @@ mov rbx, [time]    ; t1 = now_ns()
 ```
 
 The barrier affects instruction ordering but compiles to zero bytes.
+
+## Thread-Local Storage (TLS)
+
+Thread-Local Storage (TLS) is a mechanism where each thread gets its own private copy of a variable. Instead of all threads sharing a single global variable, each thread sees its own independent instance. This eliminates contention and enables lock-free patterns.
+
+**The problem with shared globals:**
+
+```c
+// Global variable shared by all threads
+uint32_t scan_offset = 0;  // Problem: All threads use same offset
+
+// Thread 1 reads: scan_offset = 0
+// Thread 2 reads: scan_offset = 0
+// Thread 3 reads: scan_offset = 0
+// → Thundering herd! All threads start from same position
+```
+
+To make each thread use a different offset, you'd need a lock or atomic operations—adding overhead to every access.
+
+**Thread-local variables:**
+
+```c
+// Each thread gets its own copy
+__thread uint32_t scan_offset = 0;
+
+// Thread 1 has: scan_offset = 42
+// Thread 2 has: scan_offset = 17
+// Thread 3 has: scan_offset = 99
+// → No sharing, no contention, no synchronization needed
+```
+
+The `__thread` storage class specifier (or `thread_local` in C11) tells the compiler to create a separate copy per thread. Access is as fast as a regular variable—no atomic operations required.
+
+**How TLS works internally:**
+
+Each thread has a Thread Control Block (TCB) containing:
+- Stack pointer
+- Thread ID
+- **TLS segment base pointer** ← Points to this thread's TLS data
+
+When you access a `__thread` variable, the compiler generates:
+```asm
+mov rax, fs:0      ; Load TLS base pointer from segment register
+mov rbx, [rax+32]  ; Access thread-local variable at offset 32
+```
+
+On x86-64, the `fs` segment register points to the TCB. TLS access is typically 2-3 cycles (if TLS data is in L1 cache)—essentially free.
+
+**TLS initialization:**
+
+```c
+__thread uint32_t tls_offset = UINT32_MAX;  // Initial value
+
+uint32_t get_thread_offset() {
+    if (tls_offset == UINT32_MAX) {
+        // First access: Initialize with thread-specific value
+        uint64_t tid = (uint64_t)pthread_self();
+        tls_offset = hash(tid);  // Unique per thread
+    }
+    return tls_offset;
+}
+```
+
+**Lazy initialization pattern:** The first thread to access the TLS variable initializes it. Subsequent accesses just read the cached value. This is cheaper than computing the value on every access.
+
+**TLS in temporal-slab's adaptive scanning:**
+
+```c
+// TLS-cached scan offset per thread
+static __thread uint32_t tls_scan_offset = UINT32_MAX;
+
+static inline uint32_t get_tls_scan_offset(uint32_t words) {
+    if (tls_scan_offset == UINT32_MAX) {
+        uint64_t tid = (uint64_t)pthread_self();
+        uint32_t h = mix32(tid);  // 32-bit hash
+        tls_scan_offset = h;
+    }
+    return (words == 0) ? 0 : (tls_scan_offset % words);
+}
+```
+
+Each thread computes its offset once (hash of thread ID), then caches it in TLS. All subsequent bitmap scans use the cached value with zero synchronization overhead.
+
+**Benefits:**
+- **Zero contention:** No atomic operations, no cache line bouncing
+- **Fast access:** 2-3 cycles (L1 hit), same as normal variable
+- **Per-thread state:** Each thread gets unique starting point
+- **No initialization overhead:** Lazy initialization happens once
+
+**Cost:**
+- **Memory overhead:** `sizeof(variable) × num_threads`
+- **Not shared:** Cannot communicate between threads via TLS variables
+- **Cleanup complexity:** Must be destroyed when thread exits (automatic for `__thread`)
+
+**TLS stack pattern (used in epoch domains):**
+
+For nested structures like epoch domains, TLS can store a stack:
+
+```c
+#define MAX_DOMAIN_DEPTH 32
+
+// Per-thread stack of nested domains
+static __thread struct {
+    epoch_domain_t* stack[MAX_DOMAIN_DEPTH];
+    uint32_t depth;
+} tls_domain_stack = { .depth = 0 };
+
+// Push domain onto thread-local stack
+void domain_enter(epoch_domain_t* domain) {
+    assert(tls_domain_stack.depth < MAX_DOMAIN_DEPTH);
+    tls_domain_stack.stack[tls_domain_stack.depth++] = domain;
+}
+
+// Pop domain from thread-local stack
+void domain_exit() {
+    assert(tls_domain_stack.depth > 0);
+    tls_domain_stack.depth--;
+}
+```
+
+This enables **nested scopes** (transaction contains query contains cache lookup) without any synchronization. Each thread maintains its own independent stack.
+
+**TLS vs alternatives:**
+
+| Approach | Access Cost | Contention | Complexity |
+|----------|-------------|------------|------------|
+| **Global variable + lock** | 100-200 cycles (mutex) | High | Low |
+| **Global variable + atomic** | 20-40 cycles (CAS) | Medium | Medium |
+| **Hash table (tid → data)** | 10-20 cycles (lookup) | Low | High |
+| **Thread-local storage** | 2-3 cycles (TLS load) | None | Low |
+
+TLS is the fastest way to maintain per-thread state. temporal-slab uses it for:
+1. **Scan offsets** (adaptive bitmap scanning)
+2. **Domain stack** (nested epoch domain tracking)
+3. **Thread ownership** (pthread_t stored in TLS for assertions)
+
+**Why TLS matters for HFT:**
+
+High-frequency trading systems cannot tolerate synchronization overhead. TLS enables:
+- **Deterministic access:** No lock contention, no CAS retries
+- **Predictable latency:** 2-3 cycles is consistent across all loads
+- **Zero jitter:** No variance from contention spikes
+
+By using TLS for per-thread state, temporal-slab avoids the synchronization overhead that would add 20-100 cycles to every operation.
 
 ## Bounded RSS Through Conservative Recycling
 
