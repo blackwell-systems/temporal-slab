@@ -213,12 +213,20 @@ struct SizeClassAlloc {
 
   /* Phase 2.2+: Adaptive bitmap scan state (HFT-friendly: no clocks, windowed deltas) */
   struct {
-    uint64_t last_attempts;      /* Snapshot for windowed delta */
-    uint64_t last_retries;       /* Snapshot for windowed delta */
-    uint32_t mode;               /* 0=sequential, 1=randomized */
-    uint32_t dwell_countdown;    /* Checks remaining before allowing mode change */
-    uint32_t checks;             /* Total adaptation checks (observability) */
-    uint32_t switches;           /* Total mode switches (observability) */
+    /* Window state (updated by controller) */
+    _Atomic uint64_t last_attempts;
+    _Atomic uint64_t last_retries;
+
+    /* Controller state */
+    _Atomic uint32_t mode;        /* 0 = sequential, 1 = randomized */
+    uint32_t         dwell_countdown;
+
+    /* Observability (export-safe) */
+    _Atomic uint32_t checks;
+    _Atomic uint32_t switches;
+
+    /* Single-writer guard for scan_adapt_check() */
+    _Atomic uint32_t in_check;    /* 0 = idle, 1 = held */
   } scan_adapt;
 
   /* Slab cache: free page stack to avoid mmap() in hot path */

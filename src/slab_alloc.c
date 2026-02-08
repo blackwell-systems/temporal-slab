@@ -134,38 +134,78 @@ static inline uint32_t get_tls_scan_offset(uint32_t words) {
 }
 
 static inline void scan_adapt_check(SizeClassAlloc* sc) {
+  /* Single-writer guard: cheap, lock-free */
+  uint32_t expected = 0;
+  if (!atomic_compare_exchange_strong_explicit(
+          &sc->scan_adapt.in_check, &expected, 1,
+          memory_order_acquire, memory_order_relaxed)) {
+    return; /* Another thread is already running the controller */
+  }
+
+  /* Snapshot global counters (monotonic) */
   uint64_t attempts = atomic_load_explicit(&sc->bitmap_alloc_attempts, memory_order_relaxed);
-  uint64_t retries = atomic_load_explicit(&sc->bitmap_alloc_cas_retries, memory_order_relaxed);
+  uint64_t retries  = atomic_load_explicit(&sc->bitmap_alloc_cas_retries, memory_order_relaxed);
 
-  uint64_t da = attempts - sc->scan_adapt.last_attempts;
-  uint64_t dr = retries - sc->scan_adapt.last_retries;
+  /* Load previous window endpoints */
+  uint64_t last_a = atomic_load_explicit(&sc->scan_adapt.last_attempts, memory_order_relaxed);
+  uint64_t last_r = atomic_load_explicit(&sc->scan_adapt.last_retries,  memory_order_relaxed);
 
-  sc->scan_adapt.last_attempts = attempts;
-  sc->scan_adapt.last_retries = retries;
-  sc->scan_adapt.checks++;
+  uint64_t da = attempts - last_a;
+  uint64_t dr = retries  - last_r;
 
-  if (da < 100000) return;
+  /* Publish new window endpoints */
+  atomic_store_explicit(&sc->scan_adapt.last_attempts, attempts, memory_order_relaxed);
+  atomic_store_explicit(&sc->scan_adapt.last_retries,  retries,  memory_order_relaxed);
 
-  double rate = (double)dr / (double)da;
+  /* Observable: this is now real and export-safe */
+  atomic_fetch_add_explicit(&sc->scan_adapt.checks, 1, memory_order_relaxed);
 
-  const double ENABLE = 0.30;
-  const double DISABLE = 0.10;
-
-  if (sc->scan_adapt.dwell_countdown) {
-    sc->scan_adapt.dwell_countdown--;
+  /* Require a minimum window size for stable rate */
+  if (da < 100000) {
+    atomic_store_explicit(&sc->scan_adapt.in_check, 0, memory_order_release);
     return;
   }
 
-  uint32_t mode = sc->scan_adapt.mode;
-  if (mode == 0 && rate > ENABLE) {
-    sc->scan_adapt.mode = 1;
-    sc->scan_adapt.switches++;
-    sc->scan_adapt.dwell_countdown = 50;
-  } else if (mode == 1 && rate < DISABLE) {
-    sc->scan_adapt.mode = 0;
-    sc->scan_adapt.switches++;
-    sc->scan_adapt.dwell_countdown = 50;
+  double rate = (double)dr / (double)da;
+
+  const double ENABLE  = 0.30;
+  const double DISABLE = 0.10;
+
+  /* Dwell/hysteresis (single-writer, plain store is fine) */
+  if (sc->scan_adapt.dwell_countdown) {
+    sc->scan_adapt.dwell_countdown--;
+    atomic_store_explicit(&sc->scan_adapt.in_check, 0, memory_order_release);
+    return;
   }
+
+  uint32_t mode = atomic_load_explicit(&sc->scan_adapt.mode, memory_order_relaxed);
+
+  if (mode == 0 && rate > ENABLE) {
+    atomic_store_explicit(&sc->scan_adapt.mode, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&sc->scan_adapt.switches, 1, memory_order_relaxed);
+    sc->scan_adapt.dwell_countdown = 50;
+
+#ifdef DEBUG_SCAN_ADAPT
+    fprintf(stderr,
+            "[scan_adapt] class=%u mode 0->1 dr=%lu da=%lu rate=%.4f attempts=%lu\n",
+            (unsigned)(sc - sc->parent_alloc->classes),
+            (unsigned long)dr, (unsigned long)da, rate, (unsigned long)attempts);
+#endif
+
+  } else if (mode == 1 && rate < DISABLE) {
+    atomic_store_explicit(&sc->scan_adapt.mode, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&sc->scan_adapt.switches, 1, memory_order_relaxed);
+    sc->scan_adapt.dwell_countdown = 50;
+
+#ifdef DEBUG_SCAN_ADAPT
+    fprintf(stderr,
+            "[scan_adapt] class=%u mode 1->0 dr=%lu da=%lu rate=%.4f attempts=%lu\n",
+            (unsigned)(sc - sc->parent_alloc->classes),
+            (unsigned long)dr, (unsigned long)da, rate, (unsigned long)attempts);
+#endif
+  }
+
+  atomic_store_explicit(&sc->scan_adapt.in_check, 0, memory_order_release);
 }
 
 /* ------------------------------ Utilities ------------------------------ */
@@ -470,14 +510,8 @@ static uint32_t slab_alloc_slot_atomic(Slab* s, SizeClassAlloc* sc, uint32_t* ou
    * Mode is updated via windowed deltas (not lifetime average) for fast convergence.
    */
   uint32_t start_word = 0;
-  if (sc->scan_adapt.mode == 1) {
+  if (atomic_load_explicit(&sc->scan_adapt.mode, memory_order_relaxed) == 1) {
     start_word = get_tls_scan_offset(words);
-  }
-
-  /* Trigger adaptive check every 2^18 allocations (262k) */
-  uint64_t attempts = atomic_load_explicit(&sc->bitmap_alloc_attempts, memory_order_relaxed);
-  if ((attempts & ((1u<<18)-1)) == 0) {
-    scan_adapt_check(sc);
   }
   
   for (uint32_t i = 0; i < words; i++) {
@@ -1001,7 +1035,10 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     
     if (idx != UINT32_MAX) {
       /* Phase 2.2: Record successful allocation + CAS retries */
-      atomic_fetch_add_explicit(&sc->bitmap_alloc_attempts, 1, memory_order_relaxed);
+      uint64_t prev_attempts =
+          atomic_fetch_add_explicit(&sc->bitmap_alloc_attempts, 1, memory_order_relaxed);
+      uint64_t cur_attempts = prev_attempts + 1;
+      
       if (retries > 0) {
         atomic_fetch_add_explicit(&sc->bitmap_alloc_cas_retries, retries, memory_order_relaxed);
 #ifdef ENABLE_LABEL_CONTENTION
@@ -1009,6 +1046,11 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
         uint8_t lid = current_label_id(sc->parent_alloc);
         atomic_fetch_add_explicit(&sc->bitmap_alloc_cas_retries_by_label[lid], retries, memory_order_relaxed);
 #endif
+      }
+      
+      /* Phase 2.2+: Adaptive controller heartbeat (every 2^18 successful allocs) */
+      if ((cur_attempts & ((1u << 18) - 1u)) == 0u) {
+        scan_adapt_check(sc);
       }
       
       /* Phase 2.1: If allocating from empty slab, decrement empty counter */
@@ -1098,7 +1140,10 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     }
     
     /* Phase 2.2: Record successful allocation + CAS retries */
-    atomic_fetch_add_explicit(&sc->bitmap_alloc_attempts, 1, memory_order_relaxed);
+    uint64_t prev_attempts =
+        atomic_fetch_add_explicit(&sc->bitmap_alloc_attempts, 1, memory_order_relaxed);
+    uint64_t cur_attempts = prev_attempts + 1;
+    
     if (retries > 0) {
       atomic_fetch_add_explicit(&sc->bitmap_alloc_cas_retries, retries, memory_order_relaxed);
 #ifdef ENABLE_LABEL_CONTENTION
@@ -1106,6 +1151,11 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       uint8_t lid = current_label_id(sc->parent_alloc);
       atomic_fetch_add_explicit(&sc->bitmap_alloc_cas_retries_by_label[lid], retries, memory_order_relaxed);
 #endif
+    }
+    
+    /* Phase 2.2+: Adaptive controller heartbeat (every 2^18 successful allocs) */
+    if ((cur_attempts & ((1u << 18) - 1u)) == 0u) {
+      scan_adapt_check(sc);
     }
     
     /* Phase 2.1: If allocating from empty slab, decrement empty counter */
