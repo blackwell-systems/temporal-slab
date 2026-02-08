@@ -104,6 +104,70 @@ static const size_t   k_num_classes   = sizeof(k_size_classes) / sizeof(k_size_c
 static uint8_t k_class_lookup[MAX_ALLOC_SIZE + 1];
 static pthread_once_t k_lookup_once = PTHREAD_ONCE_INIT;
 
+/* Phase 2.2+: Adaptive bitmap scanning helpers (HFT-friendly: no clocks, windowed deltas)
+ *
+ * Adaptive policy uses:
+ * - Windowed deltas (not lifetime average) for fast convergence
+ * - Allocation-count triggered checks (no clock reads)
+ * - TLS-cached offsets (computed once per thread)
+ * - Minimum dwell time to prevent flapping
+ */
+
+static inline uint32_t mix32(uint64_t x) {
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33;
+  x *= 0xc4ceb9fe1a85ec53ULL;
+  x ^= x >> 33;
+  return (uint32_t)x;
+}
+
+static __thread uint32_t tls_scan_offset = UINT32_MAX;
+
+static inline uint32_t get_tls_scan_offset(uint32_t words) {
+  if (tls_scan_offset == UINT32_MAX) {
+    uint64_t tid = (uint64_t)(uintptr_t)pthread_self();
+    uint32_t h = mix32(tid);
+    tls_scan_offset = h;
+  }
+  return (words == 0) ? 0 : (tls_scan_offset % words);
+}
+
+static inline void scan_adapt_check(SizeClassAlloc* sc) {
+  uint64_t attempts = atomic_load_explicit(&sc->bitmap_alloc_attempts, memory_order_relaxed);
+  uint64_t retries = atomic_load_explicit(&sc->bitmap_alloc_cas_retries, memory_order_relaxed);
+
+  uint64_t da = attempts - sc->scan_adapt.last_attempts;
+  uint64_t dr = retries - sc->scan_adapt.last_retries;
+
+  sc->scan_adapt.last_attempts = attempts;
+  sc->scan_adapt.last_retries = retries;
+  sc->scan_adapt.checks++;
+
+  if (da < 100000) return;
+
+  double rate = (double)dr / (double)da;
+
+  const double ENABLE = 0.30;
+  const double DISABLE = 0.10;
+
+  if (sc->scan_adapt.dwell_countdown) {
+    sc->scan_adapt.dwell_countdown--;
+    return;
+  }
+
+  uint32_t mode = sc->scan_adapt.mode;
+  if (mode == 0 && rate > ENABLE) {
+    sc->scan_adapt.mode = 1;
+    sc->scan_adapt.switches++;
+    sc->scan_adapt.dwell_countdown = 50;
+  } else if (mode == 1 && rate < DISABLE) {
+    sc->scan_adapt.mode = 0;
+    sc->scan_adapt.switches++;
+    sc->scan_adapt.dwell_countdown = 50;
+  }
+}
+
 /* ------------------------------ Utilities ------------------------------ */
 
 uint64_t now_ns(void) {
@@ -393,12 +457,31 @@ static void unmap_one_page(void* p) {
   If out_prev_fc is non-NULL, stores previous free_count (for transition detection).
   If out_retries is non-NULL, stores CAS retry count (for contention tracking).
 */
-static uint32_t slab_alloc_slot_atomic(Slab* s, uint32_t* out_prev_fc, uint32_t* out_retries) {
+static uint32_t slab_alloc_slot_atomic(Slab* s, SizeClassAlloc* sc, uint32_t* out_prev_fc, uint32_t* out_retries) {
   _Atomic uint32_t* bm = slab_bitmap_ptr(s);
   const uint32_t words = slab_bitmap_words(s->object_count);
-  uint32_t retries = 0;  /* Phase 2.2: Track CAS contention */
+  uint32_t retries = 0;
 
-  for (uint32_t w = 0; w < words; w++) {
+  /* Phase 2.2+: Adaptive bitmap scanning with TLS-cached offset
+   * 
+   * Mode 0: Sequential scan (0,1,2...) - best for low contention
+   * Mode 1: Randomized start (TLS-cached) - best for high contention
+   * 
+   * Mode is updated via windowed deltas (not lifetime average) for fast convergence.
+   */
+  uint32_t start_word = 0;
+  if (sc->scan_adapt.mode == 1) {
+    start_word = get_tls_scan_offset(words);
+  }
+
+  /* Trigger adaptive check every 2^18 allocations (262k) */
+  uint64_t attempts = atomic_load_explicit(&sc->bitmap_alloc_attempts, memory_order_relaxed);
+  if ((attempts & ((1u<<18)-1)) == 0) {
+    scan_adapt_check(sc);
+  }
+  
+  for (uint32_t i = 0; i < words; i++) {
+    uint32_t w = (start_word + i) % words;
     while (1) {
       uint32_t x = atomic_load_explicit(&bm[w], memory_order_relaxed);
       if (x == 0xFFFFFFFFu) break;
@@ -914,7 +997,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
   if (cur && atomic_load_explicit(&cur->magic, memory_order_relaxed) == SLAB_MAGIC) {
     uint32_t prev_fc = 0;
     uint32_t retries = 0;  /* Phase 2.2: Track CAS retries */
-    uint32_t idx = slab_alloc_slot_atomic(cur, &prev_fc, &retries);
+    uint32_t idx = slab_alloc_slot_atomic(cur, sc, &prev_fc, &retries);
     
     if (idx != UINT32_MAX) {
       /* Phase 2.2: Record successful allocation + CAS retries */
@@ -1007,7 +1090,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     /* Now allocate from published slab */
     uint32_t prev_fc = 0;
     uint32_t retries = 0;  /* Phase 2.2: Track CAS retries */
-    uint32_t idx = slab_alloc_slot_atomic(s, &prev_fc, &retries);
+    uint32_t idx = slab_alloc_slot_atomic(s, sc, &prev_fc, &retries);
     
     if (idx == UINT32_MAX) {
       /* Rare: slab filled between publish and our alloc - retry loop */

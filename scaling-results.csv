@@ -1,0 +1,5 @@
+threads,alloc_attempts,alloc_retries,retries_per_alloc,lock_contended,lock_acquisitions,contention_rate
+1,,,0,,0,0
+2,,,0,,0,0
+4,,,0,,0,0
+8,,,0,,0,0

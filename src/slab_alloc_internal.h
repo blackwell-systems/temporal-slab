@@ -211,6 +211,16 @@ struct SizeClassAlloc {
   _Atomic uint64_t bitmap_free_cas_retries_by_label[MAX_LABEL_IDS];
 #endif
 
+  /* Phase 2.2+: Adaptive bitmap scan state (HFT-friendly: no clocks, windowed deltas) */
+  struct {
+    uint64_t last_attempts;      /* Snapshot for windowed delta */
+    uint64_t last_retries;       /* Snapshot for windowed delta */
+    uint32_t mode;               /* 0=sequential, 1=randomized */
+    uint32_t dwell_countdown;    /* Checks remaining before allowing mode change */
+    uint32_t checks;             /* Total adaptation checks (observability) */
+    uint32_t switches;           /* Total mode switches (observability) */
+  } scan_adapt;
+
   /* Slab cache: free page stack to avoid mmap() in hot path */
   CachedSlab* slab_cache;  /* Changed to store (Slab*, slab_id) pairs */
   size_t cache_capacity;
