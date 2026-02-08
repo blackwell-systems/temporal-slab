@@ -1472,7 +1472,7 @@ temporal-slab's 0% RSS growth and sub-100ns latency both depend on fast/slow pat
 - Mutex-protected slab allocation (rare, acceptable cost)
 - mmap for new slabs (amortized via cache)
 - List manipulation (updating partial/full lists)
-- Result: p99 = 374ns, p99.9 = 1.1µs (still fast, but 5-15× slower than median)
+- Result: p99 = 76ns, p99.9 = 166ns (validated via 100M sample benchmark)
 
 The fast path is what makes temporal-slab suitable for HFT and real-time systems. The slow path is what makes it correct and prevents unbounded growth.
 

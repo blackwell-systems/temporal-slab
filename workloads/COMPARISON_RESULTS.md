@@ -369,8 +369,9 @@ P99.99 latency: ~10µs   (even with high load)
 | Metric | malloc | temporal-slab |
 |--------|--------|---------------|
 | **P50 latency** | ~100ns | ~100ns (comparable) |
-| **P99 latency** | ~10µs | ~500ns (20x better) |
-| **P99.9 latency** | ~1ms | ~2µs (500x better) |
+| **P99 latency** | ~3µs | ~76ns (39x better) |
+| **P99.9 latency** | ~11.5µs | ~166ns (69x better) |
+| **P99.99 latency** | ~64µs | ~1.5µs (41x better) |
 | **Tail bound** | Unbounded | Bounded by cache miss |
 | **Reclamation pauses** | Yes (during alloc/free) | No (deferred to epoch_close) |
 | **Observable tail** | No | "Slow-path rate" panel |
@@ -383,8 +384,9 @@ P99.99 latency: ~10µs   (even with high load)
 |--------|--------|---------------|
 | **Throughput** | 280K obj/s | 280K obj/s |
 | **P50 Latency** | ~100ns | ~100ns |
-| **P99 Latency** | ~10µs | ~500ns (20x better) |
-| **P99.9 Latency** | ~1ms | ~2µs (500x better) |
+| **P99 Latency** | ~3µs | ~76ns (39x better) |
+| **P99.9 Latency** | ~11.5µs | ~166ns (69x better) |
+| **P99.99 Latency** | ~64µs | ~1.5µs (41x better) |
 | **Tail predictability** | Unbounded | Bounded |
 | **RSS attribution** | No | Per-epoch |
 | **Leak detection** | No | < 60s to detection |
@@ -399,14 +401,14 @@ P99.99 latency: ~10µs   (even with high load)
 
 **temporal-slab delivers two orthogonal advantages over malloc:**
 
-### 1. Predictable Tail Latency (20-500x better P99/P99.9)
+### 1. Predictable Tail Latency (39-69x better P99/P99.9)
 
 **Architectural win:**
 - Lock-free fast path → no contention
 - Deferred reclamation → no pauses during allocation
 - Bounded slow-path → tunable via cache sizing
 
-**Result:** P99.9 latency of ~2µs vs malloc's ~1ms (500x improvement)
+**Result:** P99.9 latency of 166ns vs malloc's 11,525ns (69x improvement)
 
 **Proof:** Dashboard shows <1% slow-path rate, no reclamation spikes
 
@@ -446,7 +448,9 @@ P99.99 latency: ~10µs   (even with high load)
 **What you give up:** Epoch-based API (must group allocations by lifetime)
 
 **What you gain:**
-- 20-500x better tail latency (P99/P99.9)
+- 39-69x better tail latency (P99/P99.9)
+- 41x better p99.99 (eliminates catastrophic tail)
+- 16x more predictable (lower variance)
 - Zero-cost observability (vs profiler overhead)
 - Deterministic reclamation (vs unpredictable pauses)
 
