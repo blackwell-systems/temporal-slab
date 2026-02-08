@@ -250,6 +250,10 @@ make
 - **Bounded RSS** - Cache + overflow lists prevent memory leaks under pressure
 - **Opaque handles** - 64-bit encoding hides implementation details
 - **Dual API** - Handle-based (zero overhead) and malloc-style (8-byte header)
+- **HFT-safe contention observability** - Tier 0 probe (zero jitter, <0.1% overhead, always-on)
+  - Lock contention tracking (trylock probe pattern)
+  - CAS retry metrics (bitmap + fast-path pointer swaps)
+  - Validated scaling: 0% → 20% contention across 1→16 threads (healthy plateau)
 
 ## Performance Summary
 
