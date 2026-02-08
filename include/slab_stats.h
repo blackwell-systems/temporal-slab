@@ -63,6 +63,14 @@ typedef struct SlabGlobalStats {
   uint64_t total_madvise_calls;
   uint64_t total_madvise_bytes;
   uint64_t total_madvise_failures;
+  
+  /* Phase 2.2: Lock-free contention totals */
+  uint64_t total_bitmap_alloc_cas_retries;       /* Sum across all classes */
+  uint64_t total_bitmap_free_cas_retries;
+  uint64_t total_current_partial_cas_failures;
+  uint64_t total_bitmap_alloc_attempts;          /* Denominators */
+  uint64_t total_bitmap_free_attempts;
+  uint64_t total_current_partial_cas_attempts;
 } SlabGlobalStats;
 
 /* ==================== Per-Class Statistics ==================== */
@@ -101,6 +109,26 @@ typedef struct SlabClassStats {
   uint64_t epoch_close_scanned_slabs;  /* Total slabs scanned for reclaimable */
   uint64_t epoch_close_recycled_slabs; /* Slabs actually recycled */
   uint64_t epoch_close_total_ns;       /* Total time spent in epoch_close() */
+  
+  /* Phase 2.2: Lock-free contention metrics */
+  uint64_t bitmap_alloc_cas_retries;     /* CAS spins in allocation */
+  uint64_t bitmap_free_cas_retries;      /* CAS spins in free */
+  uint64_t current_partial_cas_failures; /* Fast-path pointer swap failures */
+  
+  /* Phase 2.2: Denominators for correct ratios */
+  uint64_t bitmap_alloc_attempts;        /* Successful allocations */
+  uint64_t bitmap_free_attempts;         /* Successful frees */
+  uint64_t current_partial_cas_attempts; /* All current_partial CAS attempts */
+  
+  /* Phase 2.2: Lock contention (Tier 0 trylock probe, always-on) */
+  uint64_t lock_fast_acquire;                /* Trylock succeeded (no contention) */
+  uint64_t lock_contended;                   /* Trylock failed, had to wait */
+  
+  /* Phase 2.2: Derived contention metrics */
+  double avg_alloc_cas_retries_per_attempt;  /* retries / alloc_attempts */
+  double avg_free_cas_retries_per_attempt;   /* retries / free_attempts */
+  double current_partial_cas_failure_rate;   /* failures / cas_attempts */
+  double lock_contention_rate;               /* contended / (fast + contended) */
   
   /* Cache state snapshot (requires cache_lock) */
   uint32_t cache_size;                 /* Slabs currently in array cache */

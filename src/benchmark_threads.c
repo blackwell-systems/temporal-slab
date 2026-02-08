@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "slab_alloc_internal.h"
+#include "slab_stats.h"
 
 /* Test parameters */
 #define OBJECT_SIZE 128
@@ -202,6 +203,20 @@ static void run_scaling_test(int num_threads, FILE* csv_file) {
     fprintf(csv_file, "temporal-slab,%d,%.0f,%.1f,%.0f,%.0f,%.0f\n",
             num_threads, throughput, avg_avg, avg_p50, avg_p95, avg_p99);
   }
+  
+  /* Phase 2.2: Dump contention metrics for 128B class */
+  SlabClassStats cs;
+  slab_stats_class(state.alloc, 2, &cs);  /* class 2 = 128B */
+  printf("\nContention Metrics (128B class):\n");
+  printf("  Bitmap alloc: %lu attempts, %lu retries (%.4f retries/op)\n",
+         cs.bitmap_alloc_attempts, cs.bitmap_alloc_cas_retries, cs.avg_alloc_cas_retries_per_attempt);
+  printf("  Bitmap free:  %lu attempts, %lu retries (%.4f retries/op)\n",
+         cs.bitmap_free_attempts, cs.bitmap_free_cas_retries, cs.avg_free_cas_retries_per_attempt);
+  printf("  current_partial CAS: %lu attempts, %lu failures (%.2f%% failure rate)\n",
+         cs.current_partial_cas_attempts, cs.current_partial_cas_failures, 
+         cs.current_partial_cas_failure_rate * 100);
+  printf("  Lock contention: %lu fast, %lu blocked (%.2f%% contention rate)\n",
+         cs.lock_fast_acquire, cs.lock_contended, cs.lock_contention_rate * 100);
   
   /* Cleanup */
   for (int i = 0; i < num_threads; i++) {

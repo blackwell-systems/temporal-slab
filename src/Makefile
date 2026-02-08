@@ -38,8 +38,8 @@ benchmark_accurate: benchmark_accurate.c slab_lib.o
 	$(CC) $(CFLAGS) benchmark_accurate.c slab_lib.o -o benchmark_accurate
 
 # Multi-threaded scaling benchmark
-benchmark_threads: benchmark_threads.c slab_lib.o
-	$(CC) $(CFLAGS) benchmark_threads.c slab_lib.o -o benchmark_threads
+benchmark_threads: benchmark_threads.c slab_lib.o slab_stats.o
+	$(CC) $(CFLAGS) benchmark_threads.c slab_lib.o slab_stats.o -o benchmark_threads
 
 # Soak test executable (long-running stability test)
 soak_test: soak_test.c slab_lib.o

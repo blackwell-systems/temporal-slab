@@ -31,6 +31,23 @@
 #define SLAB_PAGE_SIZE 4096u
 #endif
 
+/* Phase 2.2: Tier 0 lock contention probe (HFT-friendly, always-on)
+ * 
+ * Measures contention occurrence without clock syscalls (~1-2 instruction overhead).
+ * Answers: "Are threads blocking on this lock?"
+ * 
+ * Pattern: Try fast path (trylock), fall back to blocking lock on contention.
+ * Cost: ~2ns best case (trylock succeeds), same as normal lock on contention.
+ */
+#define LOCK_WITH_PROBE(mutex, sc) do { \
+  if (pthread_mutex_trylock(mutex) == 0) { \
+    atomic_fetch_add_explicit(&(sc)->lock_fast_acquire, 1, memory_order_relaxed); \
+  } else { \
+    atomic_fetch_add_explicit(&(sc)->lock_contended, 1, memory_order_relaxed); \
+    pthread_mutex_lock(mutex); \
+  } \
+} while (0)
+
 _Static_assert((SLAB_PAGE_SIZE & (SLAB_PAGE_SIZE - 1)) == 0, "SLAB_PAGE_SIZE must be power of two");
 
 /* Phase 1 RSS Reclamation: Enable madvise(MADV_DONTNEED) on empty slabs
@@ -348,10 +365,12 @@ static void unmap_one_page(void* p) {
 /*
   Returns slot index (0..object_count-1) on success, UINT32_MAX on failure.
   If out_prev_fc is non-NULL, stores previous free_count (for transition detection).
+  If out_retries is non-NULL, stores CAS retry count (for contention tracking).
 */
-static uint32_t slab_alloc_slot_atomic(Slab* s, uint32_t* out_prev_fc) {
+static uint32_t slab_alloc_slot_atomic(Slab* s, uint32_t* out_prev_fc, uint32_t* out_retries) {
   _Atomic uint32_t* bm = slab_bitmap_ptr(s);
   const uint32_t words = slab_bitmap_words(s->object_count);
+  uint32_t retries = 0;  /* Phase 2.2: Track CAS contention */
 
   for (uint32_t w = 0; w < words; w++) {
     while (1) {
@@ -381,29 +400,38 @@ static uint32_t slab_alloc_slot_atomic(Slab* s, uint32_t* out_prev_fc) {
         /* Precise transition detection: return previous free_count */
         uint32_t prev_fc = atomic_fetch_sub_explicit(&s->free_count, 1u, memory_order_relaxed);
         if (out_prev_fc) *out_prev_fc = prev_fc;
+        if (out_retries) *out_retries = retries;  /* Phase 2.2: Return retry count */
         return w * 32u + bit;
       }
+      /* Phase 2.2: CAS failed - count retry */
+      retries++;
     }
   }
 
+  if (out_retries) *out_retries = retries;  /* Phase 2.2: Failed allocation, still report retries */
   return UINT32_MAX;
 }
 
 /*
   Returns true on success, false if slot was already free.
   If out_prev_fc is non-NULL, stores previous free_count (for 0->1 transition detection).
+  If out_retries is non-NULL, stores CAS retry count (for contention tracking).
 */
-static bool slab_free_slot_atomic(Slab* s, uint32_t idx, uint32_t* out_prev_fc) {
+static bool slab_free_slot_atomic(Slab* s, uint32_t idx, uint32_t* out_prev_fc, uint32_t* out_retries) {
   if (idx >= s->object_count) return false;
 
   _Atomic uint32_t* bm = slab_bitmap_ptr(s);
   uint32_t w = idx / 32u;
   uint32_t bit = idx % 32u;
   uint32_t mask = 1u << bit;
+  uint32_t retries = 0;  /* Phase 2.2: Track CAS contention */
 
   while (1) {
     uint32_t x = atomic_load_explicit(&bm[w], memory_order_relaxed);
-    if ((x & mask) == 0u) return false; /* already free */
+    if ((x & mask) == 0u) {
+      if (out_retries) *out_retries = retries;  /* Phase 2.2: Double-free detected, still report retries */
+      return false; /* already free */
+    }
 
     uint32_t desired = x & ~mask;
     if (atomic_compare_exchange_weak_explicit(
@@ -413,8 +441,11 @@ static bool slab_free_slot_atomic(Slab* s, uint32_t idx, uint32_t* out_prev_fc) 
       /* Precise transition detection: return previous free_count */
       uint32_t prev_fc = atomic_fetch_add_explicit(&s->free_count, 1u, memory_order_relaxed);
       if (out_prev_fc) *out_prev_fc = prev_fc;
+      if (out_retries) *out_retries = retries;  /* Phase 2.2: Return retry count */
       return true;
     }
+    /* Phase 2.2: CAS failed - count retry */
+    retries++;
   }
 }
 
@@ -519,6 +550,16 @@ void allocator_init(SlabAllocator* a) {
     atomic_store_explicit(&a->classes[i].madvise_calls, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].madvise_bytes, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].madvise_failures, 0, memory_order_relaxed);
+    
+    /* Phase 2.2: Initialize lock-free contention counters */
+    atomic_store_explicit(&a->classes[i].bitmap_alloc_cas_retries, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].bitmap_free_cas_retries, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].current_partial_cas_failures, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].bitmap_alloc_attempts, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].bitmap_free_attempts, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].current_partial_cas_attempts, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].lock_fast_acquire, 0, memory_order_relaxed);
+    atomic_store_explicit(&a->classes[i].lock_contended, 0, memory_order_relaxed);
 
     /* Initialize slab cache (32 pages per size class = 128KB) */
     a->classes[i].cache_capacity = 32;
@@ -828,9 +869,16 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
   
   if (cur && atomic_load_explicit(&cur->magic, memory_order_relaxed) == SLAB_MAGIC) {
     uint32_t prev_fc = 0;
-    uint32_t idx = slab_alloc_slot_atomic(cur, &prev_fc);
+    uint32_t retries = 0;  /* Phase 2.2: Track CAS retries */
+    uint32_t idx = slab_alloc_slot_atomic(cur, &prev_fc, &retries);
     
     if (idx != UINT32_MAX) {
+      /* Phase 2.2: Record successful allocation + CAS retries */
+      atomic_fetch_add_explicit(&sc->bitmap_alloc_attempts, 1, memory_order_relaxed);
+      if (retries > 0) {
+        atomic_fetch_add_explicit(&sc->bitmap_alloc_cas_retries, retries, memory_order_relaxed);
+      }
+      
       /* Phase 2.1: If allocating from empty slab, decrement empty counter */
       if (prev_fc == cur->object_count) {
         atomic_fetch_sub_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
@@ -839,7 +887,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       /* Precise transition detection: check if WE caused 1->0 */
       if (prev_fc == 1) {
         /* Slab is now full - move PARTIAL->FULL and publish new current */
-        pthread_mutex_lock(&sc->lock);
+        LOCK_WITH_PROBE(&sc->lock, sc);  /* Phase 2.2: Trylock probe (hot path) */
         if (cur->list_id == SLAB_LIST_PARTIAL) {
           atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
           list_remove(&es->partial, cur);
@@ -863,10 +911,16 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     
     /* Allocation failed (slab was full) - null current_partial and go slow */
     atomic_fetch_add_explicit(&sc->current_partial_full, 1, memory_order_relaxed);
+    
+    /* Phase 2.2: Track current_partial CAS attempts and failures */
+    atomic_fetch_add_explicit(&sc->current_partial_cas_attempts, 1, memory_order_relaxed);
     Slab* expected = cur;
-    atomic_compare_exchange_strong_explicit(
+    bool swapped = atomic_compare_exchange_strong_explicit(
       &es->current_partial, &expected, NULL,
       memory_order_release, memory_order_relaxed);
+    if (!swapped) {
+      atomic_fetch_add_explicit(&sc->current_partial_cas_failures, 1, memory_order_relaxed);
+    }
   } else if (!cur) {
     /* current_partial was NULL - count this miss */
     atomic_fetch_add_explicit(&sc->current_partial_null, 1, memory_order_relaxed);
@@ -881,7 +935,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     }
     
     atomic_fetch_add_explicit(&sc->slow_path_hits, 1, memory_order_relaxed);
-    pthread_mutex_lock(&sc->lock);
+    LOCK_WITH_PROBE(&sc->lock, sc);  /* Phase 2.2: Trylock probe (hot path) */
 
     Slab* s = es->partial.head;
     if (!s) {
@@ -903,11 +957,18 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
 
     /* Now allocate from published slab */
     uint32_t prev_fc = 0;
-    uint32_t idx = slab_alloc_slot_atomic(s, &prev_fc);
+    uint32_t retries = 0;  /* Phase 2.2: Track CAS retries */
+    uint32_t idx = slab_alloc_slot_atomic(s, &prev_fc, &retries);
     
     if (idx == UINT32_MAX) {
       /* Rare: slab filled between publish and our alloc - retry loop */
       continue;
+    }
+    
+    /* Phase 2.2: Record successful allocation + CAS retries */
+    atomic_fetch_add_explicit(&sc->bitmap_alloc_attempts, 1, memory_order_relaxed);
+    if (retries > 0) {
+      atomic_fetch_add_explicit(&sc->bitmap_alloc_cas_retries, retries, memory_order_relaxed);
     }
     
     /* Phase 2.1: If allocating from empty slab, decrement empty counter */
@@ -917,7 +978,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
 
     /* Check if we caused 1->0 transition */
     if (prev_fc == 1) {
-      pthread_mutex_lock(&sc->lock);
+      LOCK_WITH_PROBE(&sc->lock, sc);  /* Phase 2.2: Trylock probe (hot path) */
       if (s->list_id == SLAB_LIST_PARTIAL) {
         atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
         list_remove(&es->partial, s);
@@ -979,7 +1040,14 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
 
   /* Precise transition detection: get previous free_count from fetch_add */
   uint32_t prev_fc = 0;
-  if (!slab_free_slot_atomic(s, slot, &prev_fc)) return false;
+  uint32_t retries = 0;  /* Phase 2.2: Track CAS retries */
+  if (!slab_free_slot_atomic(s, slot, &prev_fc, &retries)) return false;
+  
+  /* Phase 2.2: Record successful free + CAS retries */
+  atomic_fetch_add_explicit(&sc->bitmap_free_attempts, 1, memory_order_relaxed);
+  if (retries > 0) {
+    atomic_fetch_add_explicit(&sc->bitmap_free_cas_retries, retries, memory_order_relaxed);
+  }
   
   /* New free_count is prev_fc + 1 */
   uint32_t new_fc = prev_fc + 1;
@@ -993,7 +1061,7 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
    * This makes epoch_close() actually matter for RSS - it's the explicit boundary
    * between "keep memory hot" and "return memory to OS". */
   if (new_fc == s->object_count) {
-    pthread_mutex_lock(&sc->lock);
+    LOCK_WITH_PROBE(&sc->lock, sc);  /* Phase 2.2: Trylock probe (hot path) */
     
     uint32_t epoch_state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_relaxed);
     
@@ -1014,10 +1082,15 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
       }
       
       /* Ensure not published in current_partial */
+      /* Phase 2.2: Track current_partial CAS attempts and failures */
+      atomic_fetch_add_explicit(&sc->current_partial_cas_attempts, 1, memory_order_relaxed);
       Slab* expected = s;
-      (void)atomic_compare_exchange_strong_explicit(
+      bool swapped = atomic_compare_exchange_strong_explicit(
           &es->current_partial, &expected, NULL,
           memory_order_release, memory_order_relaxed);
+      if (!swapped) {
+        atomic_fetch_add_explicit(&sc->current_partial_cas_failures, 1, memory_order_relaxed);
+      }
       
       if (s->list_id != SLAB_LIST_NONE) {
         s->list_id = SLAB_LIST_NONE;
@@ -1045,7 +1118,7 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
 
   /* Check if WE caused 0->1 transition (slab was full, now has space) */
   if (prev_fc == 0) {
-    pthread_mutex_lock(&sc->lock);
+    LOCK_WITH_PROBE(&sc->lock, sc);  /* Phase 2.2: Trylock probe (hot path) */
     if (s->list_id == SLAB_LIST_FULL) {
       atomic_fetch_add_explicit(&sc->list_move_full_to_partial, 1, memory_order_relaxed);
       list_remove(&es->full, s);
@@ -1054,10 +1127,15 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
       
       /* Publish as current_partial if NULL (reduce slow-path trips) */
       assert(s->list_id == SLAB_LIST_PARTIAL);
+      /* Phase 2.2: Track current_partial CAS attempts and failures */
+      atomic_fetch_add_explicit(&sc->current_partial_cas_attempts, 1, memory_order_relaxed);
       Slab* expected = NULL;
-      atomic_compare_exchange_strong_explicit(
+      bool swapped = atomic_compare_exchange_strong_explicit(
         &es->current_partial, &expected, s,
         memory_order_release, memory_order_relaxed);
+      if (!swapped) {
+        atomic_fetch_add_explicit(&sc->current_partial_cas_failures, 1, memory_order_relaxed);
+      }
     }
     pthread_mutex_unlock(&sc->lock);
   }
@@ -1293,7 +1371,7 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
      * Strategy: Collect empty slabs in temporary array, then recycle outside lock.
      * This avoids O(n²) restart-scan pattern and minimizes lock hold time.
      */
-    pthread_mutex_lock(&sc->lock);
+    LOCK_WITH_PROBE(&sc->lock, sc);  /* Phase 2.2: Trylock probe (hot path) */
     
     /* Quick scan to count empty slabs */
     size_t empty_count = 0;

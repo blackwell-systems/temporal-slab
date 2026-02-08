@@ -176,6 +176,20 @@ struct SizeClassAlloc {
   _Atomic uint64_t epoch_close_scanned_slabs;   /* Total slabs scanned for reclaimable */
   _Atomic uint64_t epoch_close_recycled_slabs;  /* Slabs actually recycled */
   _Atomic uint64_t epoch_close_total_ns;        /* Total time spent in epoch_close() */
+  
+  /* Phase 2.2: Lock-free contention metrics */
+  _Atomic uint64_t bitmap_alloc_cas_retries;     /* CAS spins in slab_alloc_slot_ctz */
+  _Atomic uint64_t bitmap_free_cas_retries;      /* CAS spins in slab_free_slot_atomic */
+  _Atomic uint64_t current_partial_cas_failures; /* current_partial pointer update failures */
+  
+  /* Phase 2.2: Denominators for correct ratios */
+  _Atomic uint64_t bitmap_alloc_attempts;        /* Successful allocations (denominator) */
+  _Atomic uint64_t bitmap_free_attempts;         /* Successful frees (denominator) */
+  _Atomic uint64_t current_partial_cas_attempts; /* All current_partial CAS attempts (denominator) */
+  
+  /* Phase 2.2: Lock contention metrics - Tier 0 (always-on trylock probe) */
+  _Atomic uint64_t lock_fast_acquire;            /* Trylock succeeded (no contention) */
+  _Atomic uint64_t lock_contended;               /* Trylock failed, had to wait */
 
   /* Slab cache: free page stack to avoid mmap() in hot path */
   CachedSlab* slab_cache;  /* Changed to store (Slab*, slab_id) pairs */

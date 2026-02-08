@@ -117,6 +117,12 @@ static void print_json_global(SlabAllocator* alloc) {
   printf("  \"total_madvise_calls\": %lu,\n", gs.total_madvise_calls);
   printf("  \"total_madvise_bytes\": %lu,\n", gs.total_madvise_bytes);
   printf("  \"total_madvise_failures\": %lu,\n", gs.total_madvise_failures);
+  printf("  \"total_bitmap_alloc_cas_retries\": %lu,\n", gs.total_bitmap_alloc_cas_retries);
+  printf("  \"total_bitmap_free_cas_retries\": %lu,\n", gs.total_bitmap_free_cas_retries);
+  printf("  \"total_current_partial_cas_failures\": %lu,\n", gs.total_current_partial_cas_failures);
+  printf("  \"total_bitmap_alloc_attempts\": %lu,\n", gs.total_bitmap_alloc_attempts);
+  printf("  \"total_bitmap_free_attempts\": %lu,\n", gs.total_bitmap_free_attempts);
+  printf("  \"total_current_partial_cas_attempts\": %lu,\n", gs.total_current_partial_cas_attempts);
   printf("  \"classes\": [\n");
   
   for (uint32_t cls = 0; cls < 8; cls++) {
@@ -144,6 +150,18 @@ static void print_json_global(SlabAllocator* alloc) {
     printf("      \"epoch_close_scanned_slabs\": %lu,\n", cs.epoch_close_scanned_slabs);
     printf("      \"epoch_close_recycled_slabs\": %lu,\n", cs.epoch_close_recycled_slabs);
     printf("      \"epoch_close_total_ns\": %lu,\n", cs.epoch_close_total_ns);
+    printf("      \"bitmap_alloc_cas_retries\": %lu,\n", cs.bitmap_alloc_cas_retries);
+    printf("      \"bitmap_free_cas_retries\": %lu,\n", cs.bitmap_free_cas_retries);
+    printf("      \"current_partial_cas_failures\": %lu,\n", cs.current_partial_cas_failures);
+    printf("      \"bitmap_alloc_attempts\": %lu,\n", cs.bitmap_alloc_attempts);
+    printf("      \"bitmap_free_attempts\": %lu,\n", cs.bitmap_free_attempts);
+    printf("      \"current_partial_cas_attempts\": %lu,\n", cs.current_partial_cas_attempts);
+    printf("      \"lock_fast_acquire\": %lu,\n", cs.lock_fast_acquire);
+    printf("      \"lock_contended\": %lu,\n", cs.lock_contended);
+    printf("      \"avg_alloc_cas_retries_per_attempt\": %.6f,\n", cs.avg_alloc_cas_retries_per_attempt);
+    printf("      \"avg_free_cas_retries_per_attempt\": %.6f,\n", cs.avg_free_cas_retries_per_attempt);
+    printf("      \"current_partial_cas_failure_rate\": %.6f,\n", cs.current_partial_cas_failure_rate);
+    printf("      \"lock_contention_rate\": %.6f,\n", cs.lock_contention_rate);
     printf("      \"cache_size\": %u,\n", cs.cache_size);
     printf("      \"cache_capacity\": %u,\n", cs.cache_capacity);
     printf("      \"cache_overflow_len\": %u,\n", cs.cache_overflow_len);
