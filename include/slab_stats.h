@@ -25,7 +25,7 @@
  * - Epoch stats: O(partial_slabs) = scan to find reclaimable
  */
 
-#define SLAB_STATS_VERSION 1
+#define SLAB_STATS_VERSION 2  /* Phase 2.3: Added per-label contention maps */
 
 /* ==================== Global Statistics ==================== */
 
@@ -129,6 +129,21 @@ typedef struct SlabClassStats {
   double avg_free_cas_retries_per_attempt;   /* retries / free_attempts */
   double current_partial_cas_failure_rate;   /* failures / cas_attempts */
   double lock_contention_rate;               /* contended / (fast + contended) */
+  
+#ifdef ENABLE_LABEL_CONTENTION
+  /* Phase 2.3: Per-label contention attribution (compile-time optional)
+   * 
+   * These arrays map label_id (0-15) to contention counters.
+   * - ID 0: unlabeled (no active domain)
+   * - ID 1-15: registered semantic labels ("request", "frame", "gc", etc.)
+   * 
+   * To interpret label_ids, cross-reference with allocator->label_registry.labels[]
+   */
+  uint64_t lock_fast_acquire_by_label[16];         /* Per-label fast acquire counts */
+  uint64_t lock_contended_by_label[16];            /* Per-label contention counts */
+  uint64_t bitmap_alloc_cas_retries_by_label[16];  /* Per-label CAS retry counts */
+  uint64_t bitmap_free_cas_retries_by_label[16];   /* Per-label free CAS retries */
+#endif
   
   /* Cache state snapshot (requires cache_lock) */
   uint32_t cache_size;                 /* Slabs currently in array cache */

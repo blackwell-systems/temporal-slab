@@ -139,6 +139,16 @@ void slab_stats_class(SlabAllocator* alloc, uint32_t size_class, SlabClassStats*
     out->lock_contention_rate = 0.0;
   }
   
+#ifdef ENABLE_LABEL_CONTENTION
+  /* Phase 2.3: Per-label contention attribution */
+  for (uint8_t lid = 0; lid < 16; lid++) {
+    out->lock_fast_acquire_by_label[lid] = atomic_load_explicit(&sc->lock_fast_acquire_by_label[lid], memory_order_relaxed);
+    out->lock_contended_by_label[lid] = atomic_load_explicit(&sc->lock_contended_by_label[lid], memory_order_relaxed);
+    out->bitmap_alloc_cas_retries_by_label[lid] = atomic_load_explicit(&sc->bitmap_alloc_cas_retries_by_label[lid], memory_order_relaxed);
+    out->bitmap_free_cas_retries_by_label[lid] = atomic_load_explicit(&sc->bitmap_free_cas_retries_by_label[lid], memory_order_relaxed);
+  }
+#endif
+  
   /* Cache state snapshot (brief lock) */
   pthread_mutex_lock(&sc->cache_lock);
   out->cache_size = (uint32_t)sc->cache_size;

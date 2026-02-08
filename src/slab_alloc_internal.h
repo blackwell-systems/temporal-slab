@@ -139,6 +139,15 @@ typedef struct EpochState {
   _Atomic uint32_t empty_partial_count;  /* Slabs with free_count == object_count */
 } EpochState;
 
+/* Phase 2.3: Label registry for bounded semantic attribution */
+#define MAX_LABEL_IDS 16  /* ID 0 = unlabeled, IDs 1-15 = semantic labels */
+
+typedef struct LabelRegistry {
+  char labels[MAX_LABEL_IDS][32];  /* label_id -> label string */
+  uint8_t count;                   /* Next available ID (capped at MAX_LABEL_IDS) */
+  pthread_mutex_t lock;            /* Protects label registration (cold path only) */
+} LabelRegistry;
+
 /* Per-size-class allocator state */
 struct SizeClassAlloc {
   uint32_t object_size;
@@ -147,6 +156,9 @@ struct SizeClassAlloc {
   EpochState* epochs;  /* Dynamically allocated [EPOCH_COUNT] */
 
   pthread_mutex_t lock;
+  
+  /* Backpointer to parent allocator (for label_id lookup in hot path) */
+  struct SlabAllocator* parent_alloc;
 
   size_t total_slabs;
 
@@ -190,6 +202,14 @@ struct SizeClassAlloc {
   /* Phase 2.2: Lock contention metrics - Tier 0 (always-on trylock probe) */
   _Atomic uint64_t lock_fast_acquire;            /* Trylock succeeded (no contention) */
   _Atomic uint64_t lock_contended;               /* Trylock failed, had to wait */
+  
+#ifdef ENABLE_LABEL_CONTENTION
+  /* Phase 2.3: Per-label contention attribution (compile-time optional) */
+  _Atomic uint64_t lock_fast_acquire_by_label[MAX_LABEL_IDS];
+  _Atomic uint64_t lock_contended_by_label[MAX_LABEL_IDS];
+  _Atomic uint64_t bitmap_alloc_cas_retries_by_label[MAX_LABEL_IDS];
+  _Atomic uint64_t bitmap_free_cas_retries_by_label[MAX_LABEL_IDS];
+#endif
 
   /* Slab cache: free page stack to avoid mmap() in hot path */
   CachedSlab* slab_cache;  /* Changed to store (Slab*, slab_id) pairs */
@@ -208,7 +228,8 @@ struct SizeClassAlloc {
 typedef struct EpochMetadata {
   uint64_t open_since_ns;           /* Timestamp when epoch became ACTIVE (0 if never opened) */
   _Atomic uint64_t domain_refcount; /* Domain scopes (enter/exit tracking) - Phase 2.3 */
-  char label[32];                   /* Semantic label (e.g., "request_id:abc", "frame:1234") */
+  char label[32];                   /* Semantic label (e.g., "request", "frame", "gc") */
+  uint8_t label_id;                 /* Phase 2.3: Stable small ID (0 = unlabeled, 1-15 = registered labels) */
   
   /* Phase 2.4: RSS delta tracking for reclamation quantification */
   uint64_t rss_before_close;        /* RSS snapshot at start of epoch_close() (0 if never closed) */
@@ -233,6 +254,9 @@ struct SlabAllocator {
   /* Phase 2.3: Rich epoch metadata for debugging */
   EpochMetadata epoch_meta[EPOCH_COUNT];
   pthread_mutex_t epoch_label_lock;  /* Protects label writes (rare, cold path) */
+  
+  /* Phase 2.3: Global label registry for bounded semantic attribution */
+  LabelRegistry label_registry;
   
   /* Slab registry for portable handle encoding + ABA protection */
   SlabRegistry reg;
