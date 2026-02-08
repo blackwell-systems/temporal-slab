@@ -2,7 +2,7 @@
 
 Current state of the Phase 2 observability roadmap and what's next.
 
-**Last updated:** 2025-02-07
+**Last updated:** 2026-02-07
 
 ---
 
