@@ -9,14 +9,14 @@ Current state of the Phase 2 observability roadmap and what's next.
 ## Executive Summary
 
 **Phase 2.0: COMPLETE** - Production-ready monitoring with external tooling  
-**Phase 2.1: PARTIALLY DESIGNED** - Epoch-close telemetry  
-**Phase 2.2: COMPLETE** - Era stamping implemented  
+**Phase 2.1: COMPLETE** - Epoch-close telemetry + era stamping  
+**Phase 2.2: COMPLETE** - Multi-threading contention observability (HFT-safe)  
 **Phase 2.3: COMPLETE** - Semantic attribution (labels, refcount, leak detection)  
 **Phase 2.4: DESIGNED** - Kernel cooperation telemetry  
 
-**Current capability:** Full structural observability with Prometheus + Grafana dashboard, sub-1% overhead, root cause attribution for slow-path and RSS behavior, **semantic attribution for leak detection and memory accountability**.
+**Current capability:** Full structural observability with Prometheus + Grafana dashboard, sub-1% overhead, root cause attribution for slow-path and RSS behavior, **HFT-safe contention tracking (zero jitter)**, and semantic attribution for leak detection.
 
-**Next milestone:** Phase 2.1 (epoch-close telemetry) or comparative benchmarks vs malloc/jemalloc.
+**Next milestone:** Phase 2.4 (kernel cooperation telemetry) or comparative benchmarks vs malloc/jemalloc.
 
 ---
 
@@ -77,11 +77,11 @@ Current state of the Phase 2 observability roadmap and what's next.
 
 ---
 
-## Phase 2.1: Epoch-Close Telemetry [PARTIAL] PARTIALLY DESIGNED
+## Phase 2.1: Epoch-Close Telemetry + Era Stamping [COMPLETE]
 
 ### Status
 
-**Implementation:** Not started  
+**Implementation:** COMPLETE  
 **Design:** Complete (OBSERVABILITY_DESIGN.md)  
 **Blockers:** None  
 
@@ -138,52 +138,97 @@ epoch_close_recycled_slabs: 50
 
 ---
 
-## Phase 2.2: Era Stamping [COMPLETE] COMPLETE
+## Phase 2.2: Multi-Threading Contention Observability [COMPLETE]
 
 ### Status
 
-**Implementation:** [COMPLETE] Complete  
-**Tested:** [COMPLETE] All code compiled, not yet in production workload  
+**Implementation:** COMPLETE (2026-02-07)  
+**Tested:** COMPLETE (1→16 thread validation)  
+**Blockers:** None  
 
 ### What Was Delivered
 
-**Allocator changes:**
+**Allocator implementation (11 new atomic counters):**
 ```c
-struct SlabAllocator {
-  _Atomic uint64_t epoch_era_counter;  /* Monotonic generation */
-  uint64_t epoch_era[EPOCH_COUNT];     /* Era when each epoch was last activated */
-};
-
-struct Slab {
-  uint64_t era;  /* Era when slab was created/reused */
-};
+// Per-class contention metrics
+_Atomic uint64_t bitmap_alloc_cas_retries;      /* CAS retry loops during allocation */
+_Atomic uint64_t bitmap_free_cas_retries;       /* CAS retry loops during free */
+_Atomic uint64_t current_partial_cas_failures;  /* Pointer-swap CAS failures */
+_Atomic uint64_t bitmap_alloc_attempts;         /* Successful allocations (denominator) */
+_Atomic uint64_t bitmap_free_attempts;          /* Successful frees (denominator) */
+_Atomic uint64_t current_partial_cas_attempts;  /* All CAS attempts (denominator) */
+_Atomic uint64_t lock_fast_acquire;             /* Trylock succeeded (no blocking) */
+_Atomic uint64_t lock_contended;                /* Trylock failed (had to block) */
 ```
 
-**Incremented on:** `epoch_advance()` (current_epoch moves to next ID)
+**LOCK_WITH_PROBE macro (Tier 0 probe):**
+```c
+#define LOCK_WITH_PROBE(mutex, sc) do { \
+  if (pthread_mutex_trylock(mutex) == 0) { \
+    atomic_fetch_add(&(sc)->lock_fast_acquire, 1, memory_order_relaxed); \
+  } else { \
+    atomic_fetch_add(&(sc)->lock_contended, 1, memory_order_relaxed); \
+    pthread_mutex_lock(mutex); \
+  } \
+} while (0)
+```
 
-**Used for:** Disambiguate epoch ID reuse (epoch 5 era 100 ≠ epoch 5 era 101)
+**External tooling (temporal-slab-tools):**
+- [COMPLETE] 9 Prometheus metrics (raw counters only, HFT-safe)
+- [COMPLETE] 5 Grafana panels (lock contention + CAS retries)
+- [COMPLETE] Divide-by-zero guards in all PromQL queries
+- [COMPLETE] Single-line HELP text with HFT callouts
+
+**Grafana dashboard (5 new panels, 24→29 total):**
+- Lock Contention Rate: 5% yellow, 20% red thresholds
+- Bitmap Alloc CAS Retries/Op: 0.01 yellow, 0.05 red
+- Bitmap Free CAS Retries/Op: no thresholds (usually near zero)
+- current_partial CAS Failure Rate: 80-100% normal (not alarm)
+- Merged into main dashboard
+
+**Documentation:**
+- [COMPLETE] `CONTENTION_RESULTS.md` - Empirical validation tables (0% → 20% contention, 1→16 threads)
+- [COMPLETE] `PHASE_2.2_PROMETHEUS_SPEC.md` - PR-ready spec with PromQL queries
+- [COMPLETE] `GRAFANA_DEMO.md` - Step-by-step visualization guide
+- [COMPLETE] `demo_threading.sh` - Threading capabilities demonstration
+
+**Performance validation:**
+- Overhead: <0.1% (atomic increments only)
+- Jitter: Zero (no clock syscalls in Tier 0 probe)
+- Scaling: Lock contention plateaus at 20% for 16 threads (healthy)
+- CAS retries: <0.05 retries/op for 16 threads (excellent)
 
 ### Why It Matters
 
-**Problem solved:** Epoch IDs wrap (0-15 ring buffer). Without era, can't tell:
-- "Epoch 5 from 10 minutes ago" vs "Epoch 5 from this second"
+**HFT Production Requirements:**
+- **Variance >> mean:** Jitter more important than average overhead
+- **Zero jitter:** clock_gettime costs ~60ns, unpredictable (unacceptable for HFT)
+- **Tier 0 probe:** ~2ns overhead, zero variance, production-safe always-on
 
 **Phase 2.2 enables:**
-- **Monotonic observability:** Stats consumer tracks `(epoch_id, era)` pair
-- **No confusion on wrap:** Era increments every advance, never repeats
-- **Historical queries:** "Which slabs were allocated in epoch 5 era 100?"
+1. **Lock contention diagnosis:** Which size classes are blocking threads?
+2. **CAS retry tracking:** How much bitmap/fast-path contention exists?
+3. **Scaling validation:** Does contention scale linearly or exponentially?
+4. **Tuning guidance:** When to add per-thread caches, slab sizing
 
-**Example:**
-```json
-{
-  "epoch_id": 5,
-  "epoch_era": 150,
-  "age_sec": 600
-}
+**Example Grafana queries:**
+```promql
+# Lock contention rate (% of acquisitions that blocked)
+sum by (object_size) (
+  rate(temporal_slab_class_lock_contended_total[1m])
+  /
+  clamp_min(rate(temporal_slab_class_lock_acquisitions_total[1m]), 0.0001)
+) * 100
+
+# CAS retry rate (retries per operation)
+sum by (object_size) (
+  rate(temporal_slab_class_bitmap_alloc_cas_retries_total[1m])
+  /
+  clamp_min(rate(temporal_slab_class_bitmap_alloc_attempts_total[1m]), 0.0001)
+)
 ```
-**Interpretation:** "Epoch 5 (generation 150) has been open 10 minutes."
 
-If `epoch_id` wraps to 5 again, `epoch_era` will be 166 (distinguishable).
+**HFT Production Policy:** Tier 0 probe always-on, clock timing off.
 
 ---
 

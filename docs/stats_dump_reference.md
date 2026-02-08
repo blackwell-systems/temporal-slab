@@ -963,6 +963,93 @@ print(f"Reclamation yield: {metrics['reclamation_yield']:.1%}")
 
 ---
 
+### 6. Multi-Threading Contention Metrics (Phase 2.2)
+
+Phase 2.2 adds HFT-safe contention observability via Tier 0 probe pattern (zero jitter, <0.1% overhead).
+
+**New per-class fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `bitmap_alloc_cas_retries` | uint64 | Total CAS retry loops during bitmap allocation (not attempts) |
+| `bitmap_free_cas_retries` | uint64 | Total CAS retry loops during bitmap free (not attempts) |
+| `current_partial_cas_failures` | uint64 | Pointer-swap CAS failures on current_partial |
+| `bitmap_alloc_attempts` | uint64 | Successful bitmap allocations (denominator for retries/op) |
+| `bitmap_free_attempts` | uint64 | Successful bitmap frees (denominator for retries/op) |
+| `current_partial_cas_attempts` | uint64 | All current_partial CAS attempts (denominator for failure rate) |
+| `lock_fast_acquire` | uint64 | Lock acquisitions where trylock succeeded (no blocking) |
+| `lock_contended` | uint64 | Lock acquisitions where trylock failed first (had to block) |
+| `avg_alloc_cas_retries_per_attempt` | float64 | Derived: `bitmap_alloc_cas_retries / bitmap_alloc_attempts` |
+| `avg_free_cas_retries_per_attempt` | float64 | Derived: `bitmap_free_cas_retries / bitmap_free_attempts` |
+| `lock_contention_rate` | float64 | Derived: `lock_contended / (lock_fast_acquire + lock_contended)` |
+
+**Tier 0 Probe Pattern:**
+- **Zero jitter:** No clock syscalls (clock_gettime costs ~60ns, unpredictable)
+- **Low overhead:** ~2ns per lock acquisition (single trylock instruction)
+- **Production-safe:** Always-on for HFT systems (variance >> mean requirement)
+
+**Example JSON:**
+```json
+{
+  "classes": [
+    {
+      "class_index": 2,
+      "object_size": 128,
+      "bitmap_alloc_cas_retries": 1500,
+      "bitmap_free_cas_retries": 20,
+      "current_partial_cas_failures": 85000,
+      "bitmap_alloc_attempts": 100000,
+      "bitmap_free_attempts": 98000,
+      "current_partial_cas_attempts": 110000,
+      "lock_fast_acquire": 250000,
+      "lock_contended": 50000,
+      "avg_alloc_cas_retries_per_attempt": 0.015,
+      "avg_free_cas_retries_per_attempt": 0.0002,
+      "lock_contention_rate": 0.1667
+    }
+  ]
+}
+```
+
+**Diagnostic patterns:**
+
+```python
+def contention_diagnostics(snap1, snap2):
+    """Analyze multi-threading contention between snapshots."""
+    delta_time = (snap2.timestamp_ns - snap1.timestamp_ns) / 1e9
+    
+    for cls in snap2.classes:
+        cls1 = snap1.classes[cls.class_index]
+        
+        # Lock contention rate
+        delta_fast = cls.lock_fast_acquire - cls1.lock_fast_acquire
+        delta_contended = cls.lock_contended - cls1.lock_contended
+        lock_rate = delta_contended / (delta_fast + delta_contended) if (delta_fast + delta_contended) > 0 else 0
+        
+        # CAS retry rate
+        delta_retries = cls.bitmap_alloc_cas_retries - cls1.bitmap_alloc_cas_retries
+        delta_attempts = cls.bitmap_alloc_attempts - cls1.bitmap_alloc_attempts
+        cas_retry_rate = delta_retries / delta_attempts if delta_attempts > 0 else 0
+        
+        print(f"Class {cls.object_size}B:")
+        print(f"  Lock contention: {lock_rate:.1%}")
+        print(f"  CAS retries/op: {cas_retry_rate:.4f}")
+        
+        # Alert thresholds
+        if lock_rate > 0.20:
+            print(f"  ⚠️  HIGH: Consider per-thread caches")
+        if cas_retry_rate > 0.05:
+            print(f"  ⚠️  HIGH: Consider larger slabs or reduce thread count")
+```
+
+**Healthy ranges (validated 1→16 threads):**
+- **Lock contention:** <20% (plateaus, not exponential)
+- **CAS retries (alloc):** <0.05 retries/op (excellent lock-free design)
+- **CAS retries (free):** <0.001 retries/op (free path is uncontended)
+- **current_partial failures:** 80-100% (NORMAL - includes expected state mismatches)
+
+---
+
 ## Schema Evolution
 
 ### Adding Fields (Backward Compatible)
