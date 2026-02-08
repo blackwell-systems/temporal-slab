@@ -687,6 +687,11 @@ int main(int argc, char** argv) {
                 fprintf(f, "  \"total_madvise_bytes\": %lu,\n", gs.total_madvise_bytes);
                 fprintf(f, "  \"total_madvise_failures\": %lu,\n", gs.total_madvise_failures);
                 
+                fprintf(f, "  \"benchmark_requests_completed\": %lu,\n", ws.requests_completed);
+                fprintf(f, "  \"benchmark_objects_allocated\": %lu,\n", ws.objects_allocated);
+                fprintf(f, "  \"benchmark_objects_freed\": %lu,\n", ws.objects_freed);
+                fprintf(f, "  \"benchmark_objects_leaked\": %lu,\n", ws.objects_leaked);
+                
                 /* Per-class stats */
                 fprintf(f, "  \"classes\": [\n");
                 for (uint32_t cls = 0; cls < 8; cls++) {
