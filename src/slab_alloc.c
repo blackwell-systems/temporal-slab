@@ -10,6 +10,7 @@
 
 #define _GNU_SOURCE
 #include "slab_alloc_internal.h"
+#include "epoch_domain.h"  /* Phase 2.3: For TLS label attribution */
 #include <errno.h>
 #include <inttypes.h>
 #include <stdatomic.h>
@@ -31,14 +32,38 @@
 #define SLAB_PAGE_SIZE 4096u
 #endif
 
+/* Phase 2.3: Hot-path label ID lookup for contention attribution */
+#ifdef ENABLE_LABEL_CONTENTION
+static inline uint8_t current_label_id(SlabAllocator* alloc) {
+  epoch_domain_t* d = epoch_domain_current();
+  if (!d) return 0;  /* No active domain = ID 0 (unlabeled) */
+  return alloc->epoch_meta[d->epoch_id].label_id;
+}
+#endif
+
 /* Phase 2.2: Tier 0 lock contention probe (HFT-friendly, always-on)
+ * Phase 2.3: Extended with optional per-label attribution
  * 
  * Measures contention occurrence without clock syscalls (~1-2 instruction overhead).
- * Answers: "Are threads blocking on this lock?"
+ * Answers: "Are threads blocking on this lock?" and "Which label is contending?"
  * 
  * Pattern: Try fast path (trylock), fall back to blocking lock on contention.
- * Cost: ~2ns best case (trylock succeeds), same as normal lock on contention.
+ * Cost: ~2ns best case (trylock succeeds), +5ns if ENABLE_LABEL_CONTENTION.
  */
+#ifdef ENABLE_LABEL_CONTENTION
+#define LOCK_WITH_PROBE(mutex, sc) do { \
+  if (pthread_mutex_trylock(mutex) == 0) { \
+    atomic_fetch_add_explicit(&(sc)->lock_fast_acquire, 1, memory_order_relaxed); \
+    uint8_t lid = current_label_id((sc)->parent_alloc); \
+    atomic_fetch_add_explicit(&(sc)->lock_fast_acquire_by_label[lid], 1, memory_order_relaxed); \
+  } else { \
+    atomic_fetch_add_explicit(&(sc)->lock_contended, 1, memory_order_relaxed); \
+    uint8_t lid = current_label_id((sc)->parent_alloc); \
+    atomic_fetch_add_explicit(&(sc)->lock_contended_by_label[lid], 1, memory_order_relaxed); \
+    pthread_mutex_lock(mutex); \
+  } \
+} while (0)
+#else
 #define LOCK_WITH_PROBE(mutex, sc) do { \
   if (pthread_mutex_trylock(mutex) == 0) { \
     atomic_fetch_add_explicit(&(sc)->lock_fast_acquire, 1, memory_order_relaxed); \
@@ -47,6 +72,7 @@
     pthread_mutex_lock(mutex); \
   } \
 } while (0)
+#endif
 
 _Static_assert((SLAB_PAGE_SIZE & (SLAB_PAGE_SIZE - 1)) == 0, "SLAB_PAGE_SIZE must be power of two");
 
@@ -494,11 +520,18 @@ void allocator_init(SlabAllocator* a) {
     a->epoch_meta[e].open_since_ns = 0;  /* 0 = never opened */
     atomic_store_explicit(&a->epoch_meta[e].domain_refcount, 0, memory_order_relaxed);
     a->epoch_meta[e].label[0] = '\0';  /* Empty label */
+    a->epoch_meta[e].label_id = 0;  /* Phase 2.3: ID 0 = unlabeled */
     
     /* Phase 2.4: Initialize RSS delta tracking */
     a->epoch_meta[e].rss_before_close = 0;  /* 0 = never closed */
     a->epoch_meta[e].rss_after_close = 0;
   }
+  
+  /* Phase 2.3: Initialize label registry for bounded semantic attribution */
+  pthread_mutex_init(&a->label_registry.lock, NULL);
+  a->label_registry.count = 1;  /* ID 0 reserved for unlabeled */
+  memset(a->label_registry.labels, 0, sizeof(a->label_registry.labels));
+  strncpy(a->label_registry.labels[0], "(unlabeled)", 31);
   
   /* Zero out non-atomic fields (classes array) */
   for (size_t i = 0; i < k_num_classes; i++) {
@@ -511,6 +544,7 @@ void allocator_init(SlabAllocator* a) {
   
   for (size_t i = 0; i < k_num_classes; i++) {
     a->classes[i].object_size = k_size_classes[i];
+    a->classes[i].parent_alloc = a;  /* Phase 2.3: Backpointer for label_id lookup */
     pthread_mutex_init(&a->classes[i].lock, NULL);
     a->classes[i].total_slabs = 0;
 
@@ -560,6 +594,16 @@ void allocator_init(SlabAllocator* a) {
     atomic_store_explicit(&a->classes[i].current_partial_cas_attempts, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].lock_fast_acquire, 0, memory_order_relaxed);
     atomic_store_explicit(&a->classes[i].lock_contended, 0, memory_order_relaxed);
+    
+#ifdef ENABLE_LABEL_CONTENTION
+    /* Phase 2.3: Initialize per-label contention counters */
+    for (uint8_t lid = 0; lid < MAX_LABEL_IDS; lid++) {
+      atomic_store_explicit(&a->classes[i].lock_fast_acquire_by_label[lid], 0, memory_order_relaxed);
+      atomic_store_explicit(&a->classes[i].lock_contended_by_label[lid], 0, memory_order_relaxed);
+      atomic_store_explicit(&a->classes[i].bitmap_alloc_cas_retries_by_label[lid], 0, memory_order_relaxed);
+      atomic_store_explicit(&a->classes[i].bitmap_free_cas_retries_by_label[lid], 0, memory_order_relaxed);
+    }
+#endif
 
     /* Initialize slab cache (32 pages per size class = 128KB) */
     a->classes[i].cache_capacity = 32;
@@ -877,6 +921,11 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       atomic_fetch_add_explicit(&sc->bitmap_alloc_attempts, 1, memory_order_relaxed);
       if (retries > 0) {
         atomic_fetch_add_explicit(&sc->bitmap_alloc_cas_retries, retries, memory_order_relaxed);
+#ifdef ENABLE_LABEL_CONTENTION
+        /* Phase 2.3: Attribute CAS retries to current label */
+        uint8_t lid = current_label_id(sc->parent_alloc);
+        atomic_fetch_add_explicit(&sc->bitmap_alloc_cas_retries_by_label[lid], retries, memory_order_relaxed);
+#endif
       }
       
       /* Phase 2.1: If allocating from empty slab, decrement empty counter */
@@ -969,6 +1018,11 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     atomic_fetch_add_explicit(&sc->bitmap_alloc_attempts, 1, memory_order_relaxed);
     if (retries > 0) {
       atomic_fetch_add_explicit(&sc->bitmap_alloc_cas_retries, retries, memory_order_relaxed);
+#ifdef ENABLE_LABEL_CONTENTION
+      /* Phase 2.3: Attribute CAS retries to current label */
+      uint8_t lid = current_label_id(sc->parent_alloc);
+      atomic_fetch_add_explicit(&sc->bitmap_alloc_cas_retries_by_label[lid], retries, memory_order_relaxed);
+#endif
     }
     
     /* Phase 2.1: If allocating from empty slab, decrement empty counter */
@@ -1479,9 +1533,35 @@ void slab_epoch_set_label(SlabAllocator* a, EpochId epoch, const char* label) {
   
   EpochMetadata* meta = &a->epoch_meta[epoch];
   
+  /* Phase 2.3: Assign or reuse label ID (bounded cardinality) */
+  pthread_mutex_lock(&a->label_registry.lock);
+  
+  uint8_t label_id = 0;  /* Default: unlabeled */
+  
+  /* Search for existing label (reuse ID) */
+  for (uint8_t i = 1; i < a->label_registry.count; i++) {
+    if (strncmp(a->label_registry.labels[i], label, 31) == 0) {
+      label_id = i;
+      break;
+    }
+  }
+  
+  /* If not found and space available, allocate new ID */
+  if (label_id == 0 && a->label_registry.count < MAX_LABEL_IDS) {
+    label_id = a->label_registry.count++;
+    strncpy(a->label_registry.labels[label_id], label, 31);
+    a->label_registry.labels[label_id][31] = '\0';
+  }
+  
+  /* If registry full, label_id remains 0 (unlabeled / other bucket) */
+  
+  pthread_mutex_unlock(&a->label_registry.lock);
+  
+  /* Update epoch metadata (no lock needed, rarely written) */
   pthread_mutex_lock(&a->epoch_label_lock);
   strncpy(meta->label, label, sizeof(meta->label) - 1);
   meta->label[sizeof(meta->label) - 1] = '\0';  /* Ensure null termination */
+  meta->label_id = label_id;  /* Phase 2.3: Store stable ID */
   pthread_mutex_unlock(&a->epoch_label_lock);
 }
 

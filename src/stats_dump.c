@@ -22,6 +22,7 @@
 #include <slab_alloc.h>
 #include <slab_stats.h>
 #include <slab_diagnostics.h>
+#include "slab_alloc_internal.h"  /* Phase 2.3: For label_registry access */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -123,6 +124,24 @@ static void print_json_global(SlabAllocator* alloc) {
   printf("  \"total_bitmap_alloc_attempts\": %lu,\n", gs.total_bitmap_alloc_attempts);
   printf("  \"total_bitmap_free_attempts\": %lu,\n", gs.total_bitmap_free_attempts);
   printf("  \"total_current_partial_cas_attempts\": %lu,\n", gs.total_current_partial_cas_attempts);
+  
+  /* Phase 2.3: Label registry export (for decoding label_ids in per-label metrics) */
+  printf("  \"label_registry\": {\n");
+  printf("    \"count\": %u,\n", alloc->label_registry.count);
+  printf("    \"max_labels\": %d,\n", MAX_LABEL_IDS);
+  printf("    \"labels\": {\n");
+  for (uint8_t lid = 0; lid < alloc->label_registry.count && lid < MAX_LABEL_IDS; lid++) {
+    printf("      \"%u\": ", lid);
+    print_json_string(alloc->label_registry.labels[lid]);
+    if (lid < alloc->label_registry.count - 1) {
+      printf(",\n");
+    } else {
+      printf("\n");
+    }
+  }
+  printf("    }\n");
+  printf("  },\n");
+  
   printf("  \"classes\": [\n");
   
   for (uint32_t cls = 0; cls < 8; cls++) {
@@ -162,6 +181,53 @@ static void print_json_global(SlabAllocator* alloc) {
     printf("      \"avg_free_cas_retries_per_attempt\": %.6f,\n", cs.avg_free_cas_retries_per_attempt);
     printf("      \"current_partial_cas_failure_rate\": %.6f,\n", cs.current_partial_cas_failure_rate);
     printf("      \"lock_contention_rate\": %.6f,\n", cs.lock_contention_rate);
+    
+#ifdef ENABLE_LABEL_CONTENTION
+    /* Phase 2.3: Per-label contention attribution maps */
+    printf("      \"contention_by_label\": {\n");
+    printf("        \"lock_fast_acquire\": {\n");
+    for (uint8_t lid = 0; lid < alloc->label_registry.count && lid < MAX_LABEL_IDS; lid++) {
+      printf("          \"%u\": %lu", lid, cs.lock_fast_acquire_by_label[lid]);
+      if (lid < alloc->label_registry.count - 1) {
+        printf(",\n");
+      } else {
+        printf("\n");
+      }
+    }
+    printf("        },\n");
+    printf("        \"lock_contended\": {\n");
+    for (uint8_t lid = 0; lid < alloc->label_registry.count && lid < MAX_LABEL_IDS; lid++) {
+      printf("          \"%u\": %lu", lid, cs.lock_contended_by_label[lid]);
+      if (lid < alloc->label_registry.count - 1) {
+        printf(",\n");
+      } else {
+        printf("\n");
+      }
+    }
+    printf("        },\n");
+    printf("        \"bitmap_alloc_cas_retries\": {\n");
+    for (uint8_t lid = 0; lid < alloc->label_registry.count && lid < MAX_LABEL_IDS; lid++) {
+      printf("          \"%u\": %lu", lid, cs.bitmap_alloc_cas_retries_by_label[lid]);
+      if (lid < alloc->label_registry.count - 1) {
+        printf(",\n");
+      } else {
+        printf("\n");
+      }
+    }
+    printf("        },\n");
+    printf("        \"bitmap_free_cas_retries\": {\n");
+    for (uint8_t lid = 0; lid < alloc->label_registry.count && lid < MAX_LABEL_IDS; lid++) {
+      printf("          \"%u\": %lu", lid, cs.bitmap_free_cas_retries_by_label[lid]);
+      if (lid < alloc->label_registry.count - 1) {
+        printf(",\n");
+      } else {
+        printf("\n");
+      }
+    }
+    printf("        }\n");
+    printf("      },\n");
+#endif
+    
     printf("      \"cache_size\": %u,\n", cs.cache_size);
     printf("      \"cache_capacity\": %u,\n", cs.cache_capacity);
     printf("      \"cache_overflow_len\": %u,\n", cs.cache_overflow_len);
