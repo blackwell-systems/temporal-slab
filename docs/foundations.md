@@ -1473,6 +1473,10 @@ When multiple threads allocate from the same slab concurrently, the choice of wh
 
 **The thundering herd problem:**
 
+The **thundering herd** is a classic concurrency problem where multiple threads wake up or converge on the same resource simultaneously, but only one can proceed, causing the others to waste cycles contending. The term comes from the image of a herd of cattle stampeding toward a single gate—most get blocked, creating chaos.
+
+In bitmap scanning, the thundering herd occurs when all threads start scanning from the same position:
+
 ```c
 // Naive: Always scan from bit 0
 uint64_t bitmap = slab->bitmap;
@@ -1493,7 +1497,7 @@ Result: All 4 threads target bit 0
         → Wasted cycles on repeated contention
 ```
 
-This is the **thundering herd**: multiple threads converge on the same slot because they all start scanning from the same position. Each CAS failure wastes ~20-40 cycles. With 8 threads competing, the retry rate can reach 70-80%, turning 40-cycle allocations into 200+ cycle operations.
+Each CAS failure wastes ~20-40 cycles. With 8 threads competing, the retry rate can reach 70-80%, turning 40-cycle allocations into 200+ cycle operations. This is the thundering herd in action: deterministic scanning creates a predictable contention point.
 
 **Sequential scanning (mode 0):**
 
