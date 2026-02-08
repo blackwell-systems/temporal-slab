@@ -2740,7 +2740,7 @@ madvise(slab, MADV_DONTNEED):
 - No mmap needed to reuse → zero syscall overhead
 ```
 
-**Implementation strategy (Phase 1 roadmap):**
+**Implementation strategy:**
 
 ```c
 // When epoch is closed and all slabs are empty:
@@ -2842,7 +2842,7 @@ malloc has no concept of epochs. It doesn't know which objects were allocated to
 
 temporal-slab explicitly tracks lifetime phases via epochs. The application signals phase transitions with `epoch_advance()` or `epoch_close()`. This provides the allocator information that malloc fundamentally lacks.
 
-**The `epoch_close()` API (Phase 2 roadmap):**
+**The `epoch_close()` API:**
 
 ```c
 // Application logic
@@ -3077,7 +3077,7 @@ Solution: Registry entry can be NULL (safe unmapping)
 - Max 4M slabs (22-bit slab_id field)
 
 **Benefit:**
-- Can safely call madvise/munmap (Phase 1-3 RSS reclamation)
+- Can safely call madvise/munmap for RSS reclamation
 - Stale handles detected via generation mismatch
 - No segfaults on invalid frees (returns false instead)
 
@@ -3131,12 +3131,12 @@ Reality: Slabs reused every few milliseconds under typical churn
          Pathological case: Program must do nothing but alloc/free same slab
 ```
 
-**Current status (implementation complete):**
+**Implementation status:**
 
-Phases 1-3 are implemented:
-- ✅ Phase 1: madvise(MADV_DONTNEED) releases physical memory
-- ✅ Phase 2: epoch_close() enables deterministic reclamation
-- ✅ Phase 3: Slab registry with generation counters (enables safe munmap)
+All memory reclamation features are implemented:
+- madvise(MADV_DONTNEED) releases physical memory
+- epoch_close() enables deterministic reclamation
+- Slab registry with generation counters enables safe munmap
 
 Handle encoding v1 is stable and production-ready.
 
@@ -3279,9 +3279,9 @@ The allocator does not predict lifetimes or require application hints. Lifetime 
 
 **Current implementation (v1.0):**
 
-All phases complete:
-- Phase 1: madvise releases physical memory (RSS competitive with malloc)
-- Phase 2: epoch_close() enables application-controlled reclamation
-- Phase 3: Slab registry enables safe handle validation after madvise/munmap
+All memory management features are production-ready:
+- madvise releases physical memory (RSS competitive with malloc)
+- epoch_close() enables application-controlled reclamation
+- Slab registry enables safe handle validation after madvise/munmap
 
 The implementation details—how bitmaps encode slot state, how atomic CAS loops allocate slots, how registry indirection works, how generation counters prevent ABA—follow from these foundational concepts. Those details are in the source code. This document provides the foundation to understand why they exist and how they enable temporal-slab's unique guarantees.
