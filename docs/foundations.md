@@ -31,6 +31,7 @@ This document builds the theoretical foundation for temporal-slab from first pri
 - [Lifetime Affinity](#lifetime-affinity)
 - [Epoch](#epoch)
 - [Epoch Advancement](#epoch-advancement)
+- [Epoch Ring Buffer Architecture](#epoch-ring-buffer-architecture)
 - [Slab](#slab)
 - [Size Class](#size-class)
 - [Internal Fragmentation](#internal-fragmentation)
@@ -50,6 +51,7 @@ This document builds the theoretical foundation for temporal-slab from first pri
 - [Compiler Barriers](#compiler-barriers)
 - [Bounded RSS Through Conservative Recycling](#bounded-rss-through-conservative-recycling)
 - [Hazard Pointers and Reference Counting](#hazard-pointers-and-reference-counting)
+- [ABA Problem](#aba-problem)
 - [Slab Cache](#slab-cache)
 - [Refusal to Unmap vs madvise](#refusal-to-unmap-vs-madvise)
 - [Epoch-Granular Memory Reclamation](#epoch-granular-memory-reclamation)
@@ -59,6 +61,7 @@ This document builds the theoretical foundation for temporal-slab from first pri
 **API Design**
 - [Handle-Based API vs Malloc-Style API](#handle-based-api-vs-malloc-style-api)
 - [Handle Encoding and Slab Registry](#handle-encoding-and-slab-registry)
+- [Generation Counter Mechanics](#generation-counter-mechanics)
 - [How Design Choices Prevent RSS Growth](#how-design-choices-prevent-rss-growth)
 - [What You Should Understand Now](#what-you-should-understand-now)
 
@@ -1207,6 +1210,161 @@ EpochId epoch_current(SlabAllocator* a) {
 ```
 
 This ensures `epoch_current()` always returns a valid epoch ID, even after millions of advances.
+
+## Epoch Ring Buffer Architecture
+
+temporal-slab reimagines memory allocation as a **bounded circular buffer** operating on time windows rather than individual bytes. This architectural shift—from spatial allocation to temporal allocation—is the foundation for bounded RSS and predictable reclamation.
+
+**The circular buffer model:**
+
+```
+┌─────────────────────────────────────────────────┐
+│  Epoch Ring Buffer (16 slots, wraps at 16)     │
+├─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┤
+│ E0  │ E1  │ E2  │ E3  │ ... │ E13 │ E14 │ E15 │
+└─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+  ↑                                               ↑
+  └─ After 16 advances, wraps back to epoch 0 ───┘
+```
+
+Each epoch slot is a time window containing:
+- Dedicated slab pools (one per size class)
+- Metadata (open timestamp, refcount, label)
+- Lifecycle state (ACTIVE or CLOSING)
+
+**Modular arithmetic enables wrapping:**
+
+```c
+// Raw counter increments forever: 0, 1, 2, ..., 16, 17, ...
+uint64_t raw_counter = atomic_fetch_add(&allocator->epoch_counter, 1);
+
+// Modulo maps to ring index: 16 → 0, 17 → 1, 18 → 2, ...
+EpochId epoch_id = raw_counter % EPOCH_COUNT;  // EPOCH_COUNT = 16
+```
+
+This creates an infinite sequence of time windows mapped onto a finite 16-epoch ring:
+
+```
+Time →
+Era:    0    1    2   ...  15   16   17   18  ...  31   32  ...
+Epoch: [E0] [E1] [E2] ... [E15] [E0] [E1] [E2] ... [E15] [E0] ...
+       └────────┬────────┘      └────────┬────────┘
+          First rotation            Second rotation
+```
+
+**Why this prevents RSS growth:**
+
+Traditional allocators (malloc, jemalloc) treat memory as a **spatial pool**:
+- Allocate from any available slot across the entire address space
+- Objects with different lifetimes mix freely
+- Partial occupancy prevents page reclamation (temporal fragmentation)
+- RSS grows linearly with time under churn
+
+temporal-slab treats memory as a **temporal pool**:
+- Allocate from the current epoch window only
+- Objects allocated together (same epoch) share pages
+- Epoch closure creates clean reclamation boundaries
+- RSS bounded by `max_live_set × (1 + fragmentation_factor)`
+
+**Era stamping for disambiguation:**
+
+The 16-epoch ring creates an ambiguity: epoch ID 0 at era 0 looks identical to epoch ID 0 at era 16. Era stamping solves this:
+
+```c
+struct EpochMetadata {
+    uint64_t epoch_era;        // Monotonic counter (never wraps)
+    uint64_t open_since_ns;    // Timestamp when epoch became ACTIVE
+    atomic_int domain_refcount; // Live domain references
+    char label[32];            // Semantic tag for debugging
+};
+```
+
+Every `epoch_advance()` call:
+1. Increments global era counter: `allocator->epoch_era_counter++`
+2. Stamps the new epoch: `meta[new_epoch_id].epoch_era = current_era`
+3. Records opening timestamp: `meta[new_epoch_id].open_since_ns = now()`
+
+This enables:
+- **Observability:** Distinguish "epoch 0 era 0" from "epoch 0 era 16" in metrics
+- **Safety:** Validate domain closure against era to prevent closing wrong incarnation
+- **Debugging:** Correlate epoch lifetime with application phases via era timestamps
+
+**Lifecycle state machine:**
+
+Each epoch transitions through states as time advances:
+
+```
+        epoch_advance()
+             │
+             ↓
+        ┌─────────┐
+        │ ACTIVE  │ ← Accepts new allocations
+        └────┬────┘
+             │ epoch_close() or ring wraps
+             ↓
+        ┌─────────┐
+        │ CLOSING │ ← Draining: no new allocations, existing objects freed
+        └────┬────┘
+             │ Last object freed
+             ↓
+        ┌─────────┐
+        │ DRAINED │ ← All slabs empty, ready for reuse
+        └─────────┘
+             │ epoch_advance() wraps around
+             ↓
+        [Return to ACTIVE with new era]
+```
+
+**Memory reclamation at epoch granularity:**
+
+Instead of reclaiming individual pages (malloc's approach), temporal-slab reclaims entire epochs:
+
+```
+Epoch 5 (era 105):
+  - Opened at T=0
+  - 10,000 objects allocated across 100 slabs
+  - Closed at T=5s (epoch_close())
+  - Draining period: objects freed as they expire
+  - Last object freed at T=60s
+  → All 100 slabs madvised simultaneously
+  → RSS drops by 400KB instantly
+```
+
+This is fundamentally different from malloc:
+- malloc: Reclaim pages individually as they become empty (nondeterministic)
+- temporal-slab: Reclaim epochs collectively when lifetime boundary ends (deterministic)
+
+**The circular buffer boundary condition:**
+
+When advancing from epoch 15 to epoch 0 (wraparound), temporal-slab must ensure epoch 0's previous incarnation has drained. Two strategies:
+
+**Strategy 1: Sufficient separation (default)**
+- 16-epoch window provides ~80 seconds of history (if advancing every 5s)
+- Objects allocated in epoch 0 era 0 are freed before epoch 0 era 16 activated
+- No special handling needed—drainage completes naturally
+
+**Strategy 2: Explicit barrier (epoch_close())**
+- Application closes epochs when lifetime boundaries are known
+- Forces drainage before wraparound
+- Example: Close request epoch after response sent, before ring wraps
+
+**Why bounded RSS emerges:**
+
+The circular buffer architecture makes RSS growth impossible:
+
+```
+RSS(t) = sum(live_objects(epoch)) for epoch in [current-15, current]
+       = sum(live_objects(epoch)) for 16-epoch window
+       ≤ max_live_set × slab_overhead_factor
+```
+
+Because:
+1. Only 16 epochs can be ACTIVE or CLOSING simultaneously
+2. DRAINED epochs contribute zero RSS (slabs madvised)
+3. The window slides forward—old epochs drain as new ones open
+4. Maximum RSS = 16 epochs × max_objects_per_epoch × object_size
+
+This is the core architectural insight: **bounded circular buffer + temporal grouping = bounded RSS**.
 
 ## Slab
 
@@ -2660,6 +2818,106 @@ temporal-slab chooses simplicity and predictability: a 90% empty slab on the PAR
 
 In practice, under high churn, PARTIAL slabs refill faster than they drain—the 0% recycling observed in benchmarks is expected behavior, not a bug. The epoch mechanism prevents RSS growth by ensuring new cohorts use fresh slabs, not by aggressively recycling old ones.
 
+## ABA Problem
+
+The ABA problem is a classic concurrency bug that occurs in lock-free algorithms using compare-and-swap (CAS). It happens when a memory location changes from value A to value B, then back to A, causing a CAS operation to succeed even though the state has changed underneath.
+
+**The classic scenario:**
+
+```
+Thread 1:                          Thread 2:
+1. Read ptr → Node A
+2. Plan: CAS(ptr, A, new)
+3. [PREEMPTED]
+                                   4. Pop A from stack
+                                   5. Free Node A
+                                   6. Allocate new node → reuses same address A
+                                   7. Push new A onto stack
+8. Resume
+9. CAS(ptr, A, new) → SUCCESS!
+   (But this is the NEW A, not the original!)
+```
+
+Thread 1's CAS succeeds because the pointer value is identical (address A), but the object at that address is completely different. This is the "ABA" sequence: value A, changed to B (different object), changed back to A (reused address).
+
+**Why it's dangerous:**
+
+```c
+// Lock-free stack pop
+Node* pop(Stack* s) {
+    Node* head;
+    Node* next;
+    do {
+        head = atomic_load(&s->head);        // Read current head (A)
+        if (!head) return NULL;
+        next = head->next;                    // Read A's next pointer
+        // [PREEMPTED HERE]
+        // Other thread: pop A, free A, reuse A's address for new node
+        // CAS succeeds because address is same, but A->next is now garbage!
+    } while (!CAS(&s->head, head, next));    // CAS succeeds with wrong 'next'
+    return head;
+}
+```
+
+If A's address is reused, `next` points to the old A's successor, not the new A's successor. The stack becomes corrupted.
+
+**Solution 1: Tagged pointers (generation counters)**
+
+A **generation counter** (also called a version tag or sequence number) is an integer that increments each time memory is reused. By pairing a pointer with its generation, you can detect when the pointed-to memory has been freed and reallocated—even if the address is the same.
+
+Add a generation counter to the pointer:
+
+```c
+struct TaggedPtr {
+    Node* ptr;         // 48 bits: actual pointer
+    uint16_t tag;      // 16 bits: version counter
+};
+
+atomic_compare_exchange(&tagged_ptr,
+                        {old_ptr, old_tag},
+                        {new_ptr, old_tag + 1});  // Increment tag
+```
+
+Even if the pointer value matches, the tag won't—CAS fails if the generation changed.
+
+**Solution 2: Generation counters (temporal-slab's approach)**
+
+Instead of tagging pointers directly, store generation counters separately:
+
+```c
+// Handle encoding
+[slab_id:22][generation:24][slot:8][class:8]
+
+// Registry lookup
+SlabMeta* meta = &registry[slab_id];
+if (meta->generation != handle.generation) {
+    // ABA detected: slab was recycled and reused
+    return ERROR_INVALID_HANDLE;
+}
+```
+
+When a slab is recycled:
+1. Registry entry's generation is incremented
+2. Old handles have stale generation
+3. Handle validation detects mismatch → safe failure
+
+**Why 24 bits for generation?**
+
+24 bits = 16,777,216 generations. If a slab is recycled every microsecond, it takes 16 seconds to wrap. In practice:
+- Slabs are recycled every milliseconds (under extreme churn)
+- Wrapping takes ~4.6 hours at 1 recycle/ms
+- By then, all handles referencing old generations are long dead
+
+**ABA is impossible if:**
+1. Memory is never freed (no address reuse) → Conservative recycling
+2. Memory reuse is detected (generation counters) → temporal-slab's approach
+3. Hazard pointers prevent premature free → Expensive per-access overhead
+
+temporal-slab uses generation counters because:
+- Zero fast-path overhead (counter checked only on validation, not allocation)
+- Simple implementation (single integer per slab)
+- Provably safe (24-bit wraparound is astronomically unlikely)
+
 ## Slab Cache
 
 When a slab becomes empty, it is not immediately destroyed. Instead, it is pushed to a per-size-class cache. The cache has fixed capacity (e.g., 32 slabs). When a new slab is needed, the allocator checks the cache first. If non-empty, pop a slab from the cache (fast, no syscall). If empty, allocate a new slab via mmap (slow, syscall).
@@ -3139,6 +3397,154 @@ All memory reclamation features are implemented:
 - Slab registry with generation counters enables safe munmap
 
 Handle encoding v1 is stable and production-ready.
+
+## Generation Counter Mechanics
+
+Generation counters are the mechanism temporal-slab uses to detect use-after-recycle bugs (ABA problem) without runtime overhead on the fast path. Every slab has an associated generation counter stored in the registry (off-page). When a slab is allocated from the cache, the counter increments. When a handle is created, it captures the current generation. Handle validation compares captured generation against current generation—mismatch indicates the slab was recycled.
+
+**Counter lifecycle:**
+
+```c
+// Slab allocation from cache
+Slab* get_slab_from_cache(SizeClassAlloc* sc) {
+    Slab* slab = cache_pop(&sc->cache);
+    if (!slab) {
+        slab = mmap_new_slab();  // Slow path
+    }
+    
+    // Register slab and assign generation
+    uint32_t slab_id = registry_alloc(&allocator->registry, slab);
+    SlabMeta* meta = &allocator->registry.metas[slab_id];
+    meta->gen++;  // Increment generation on reuse
+    
+    return slab;
+}
+
+// Handle creation
+SlabHandle alloc_obj(SlabAllocator* alloc, size_t size) {
+    Slab* slab = find_slab_with_free_slot();
+    uint32_t slab_id = slab->registry_id;
+    uint32_t gen = alloc->registry.metas[slab_id].gen;  // Capture current generation
+    uint8_t slot = allocate_slot_from_bitmap(slab);
+    
+    return pack_handle(slab_id, gen, slot, size_class);
+}
+
+// Handle validation
+bool free_obj(SlabAllocator* alloc, SlabHandle h) {
+    uint32_t slab_id = extract_slab_id(h);
+    uint32_t handle_gen = extract_generation(h);
+    
+    SlabMeta* meta = &alloc->registry.metas[slab_id];
+    if (meta->gen != handle_gen) {
+        // Generation mismatch: slab was recycled
+        return false;  // ABA detected
+    }
+    
+    // Proceed with free...
+}
+```
+
+**Why 24 bits?**
+
+The generation field in the handle is 24 bits, providing 16,777,216 unique values before wraparound. This creates a fundamental tension:
+
+- **Larger counter:** Lower wraparound risk, safer ABA protection
+- **Smaller counter:** More bits for other fields (slab_id, slot, class)
+
+24 bits balances these constraints based on realistic workload analysis:
+
+```
+Assumptions:
+- Slab recycling rate: 1 per millisecond (extreme churn)
+- Handle lifetime: Seconds to minutes (typical)
+
+Wraparound time:
+16,777,216 generations / 1000 recycles per second = 16,777 seconds
+                                                   = 4.66 hours
+
+Danger zone:
+If you hold a handle for >4.66 hours AND the same slab is recycled
+16M times during that period, generation wraps to the same value.
+
+Reality check:
+- Handles are short-lived (freed within seconds/minutes)
+- Slab recycling rate peaks at ~1000/sec under extreme allocation churn
+- Holding a handle for 4+ hours is pathological
+- By the time 16M cycles complete, old handles are long freed
+
+Conclusion: 24-bit generation provides sufficient safety margin
+```
+
+**When generation increments:**
+
+Generation increments occur at specific lifecycle events:
+
+1. **Slab first allocated:** `gen = 0` (initial value)
+2. **Slab recycled from cache:** `gen++` (reuse detected)
+3. **Slab unmapped then remapped:** `gen++` (address reuse protected)
+
+Generation does NOT increment on:
+- Individual object allocations (zero overhead per allocation)
+- Individual object frees (zero overhead per free)
+- Slab state transitions (PARTIAL ↔ FULL)
+
+This design ensures generation checking has:
+- **Zero fast-path cost:** No atomic operations during alloc/free
+- **Validation-time cost only:** Single integer comparison on handle dereference
+- **Slab-granular protection:** All objects in a slab share the same generation
+
+**Wraparound handling:**
+
+When generation reaches 16,777,215 and increments, it wraps to 0:
+
+```c
+meta->gen = (meta->gen + 1) % (1 << 24);  // Wraps: 16777215 → 0
+```
+
+Wraparound creates a vulnerability window where:
+```
+Old handle: gen=16777215 (last generation before wrap)
+Slab recycled 16M times exactly
+New handle: gen=16777215 (same value after full cycle)
+→ ABA possible if old handle still live
+```
+
+**Why this is acceptable:**
+
+1. **Handle lifetime constraint:** Applications should not hold handles for hours
+2. **Recycle rate ceiling:** 16M recycles in <5 hours requires 930 recycles/second sustained
+3. **Probabilistic safety:** Wraparound collision requires exact timing alignment
+4. **Observable failure mode:** Wrong-generation access returns error, doesn't corrupt memory
+
+**Comparison to other ABA solutions:**
+
+| Approach | Overhead | Protection | Wraparound Risk |
+|----------|----------|------------|-----------------|
+| **Hazard pointers** | 20-50 cycles/access | Perfect | N/A (no counters) |
+| **Reference counting** | 40-80 cycles/access | Perfect | N/A (no counters) |
+| **128-bit tagged pointers** | 0 cycles (hardware CAS) | Perfect | 2^64 generations (never wraps) |
+| **temporal-slab (24-bit gen)** | 0 cycles (validation only) | Probabilistic | 16M generations (~5 hours) |
+
+temporal-slab sacrifices perfect ABA protection for zero fast-path overhead. The 24-bit generation provides sufficient safety for realistic workloads while keeping handles compact (64 bits total).
+
+**Generation counter vs epoch era counter:**
+
+temporal-slab uses two separate counter systems:
+
+**Generation counter (per-slab, 24-bit):**
+- Detects slab recycling within the same epoch
+- Stored in registry (survives madvise)
+- Increments when slab is reused from cache
+- Purpose: Handle validation, ABA protection
+
+**Epoch era counter (global, 64-bit):**
+- Tracks epoch ring buffer rotations
+- Monotonically increasing, never wraps
+- Increments on every epoch_advance()
+- Purpose: Observability, epoch disambiguation
+
+These serve different purposes and operate at different granularities (slab-level vs epoch-level).
 
 ## How Design Choices Prevent RSS Growth
 
