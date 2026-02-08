@@ -113,6 +113,11 @@ void slab_stats_class(SlabAllocator* alloc, uint32_t size_class, SlabClassStats*
   out->lock_fast_acquire = atomic_load_explicit(&sc->lock_fast_acquire, memory_order_relaxed);
   out->lock_contended = atomic_load_explicit(&sc->lock_contended, memory_order_relaxed);
   
+  /* Phase 2.2+: Adaptive bitmap scanning observability */
+  out->scan_adapt_checks = sc->scan_adapt.checks;
+  out->scan_adapt_switches = sc->scan_adapt.switches;
+  out->scan_mode = sc->scan_adapt.mode;
+  
   /* Phase 2.2: Compute derived contention metrics (avoid divide by zero) */
   if (out->bitmap_alloc_attempts > 0) {
     out->avg_alloc_cas_retries_per_attempt = (double)out->bitmap_alloc_cas_retries / out->bitmap_alloc_attempts;

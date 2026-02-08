@@ -124,6 +124,11 @@ typedef struct SlabClassStats {
   uint64_t lock_fast_acquire;                /* Trylock succeeded (no contention) */
   uint64_t lock_contended;                   /* Trylock failed, had to wait */
   
+  /* Phase 2.2+: Adaptive bitmap scanning observability */
+  uint32_t scan_adapt_checks;                /* Total adaptation checks performed */
+  uint32_t scan_adapt_switches;              /* Total mode switches (0<->1) */
+  uint32_t scan_mode;                        /* Current mode (0=sequential, 1=randomized) */
+  
   /* Phase 2.2: Derived contention metrics */
   double avg_alloc_cas_retries_per_attempt;  /* retries / alloc_attempts */
   double avg_free_cas_retries_per_attempt;   /* retries / free_attempts */
