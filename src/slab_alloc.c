@@ -1052,8 +1052,10 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
   void* page = map_one_page();
   if (!page) return NULL;  /* mmap failed (out of memory) */
 
+#if ENABLE_DIAGNOSTIC_COUNTERS
   /* Track committed bytes (mmap'd memory) for RSS analysis */
   atomic_fetch_add_explicit(&sc->committed_bytes, SLAB_PAGE_SIZE, memory_order_relaxed);
+#endif
 
   s = (Slab*)page;  /* Slab header lives at start of page */
 
@@ -1277,8 +1279,10 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
         *out = encode_handle(cur, &a->reg, idx, (uint32_t)ci);
       }
       
+#if ENABLE_DIAGNOSTIC_COUNTERS
       /* Track live bytes (bytes allocated to live objects) for leak detection */
       atomic_fetch_add_explicit(&sc->live_bytes, sc->object_size, memory_order_relaxed);
+#endif
       
       return p;  /* Fast path success! */
     }
@@ -1395,8 +1399,10 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       *out = encode_handle(s, &a->reg, idx, (uint32_t)ci);
     }
     
+#if ENABLE_DIAGNOSTIC_COUNTERS
     /* Track live bytes for slow path allocation success */
     atomic_fetch_add_explicit(&sc->live_bytes, sc->object_size, memory_order_relaxed);
+#endif
     
     return p;
   }
@@ -1458,8 +1464,10 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
     atomic_fetch_add_explicit(&sc->bitmap_free_cas_retries, retries, memory_order_relaxed);
   }
   
+#if ENABLE_DIAGNOSTIC_COUNTERS
   /* Track live bytes decrement (only reached after successful free at line 1444) */
   atomic_fetch_sub_explicit(&sc->live_bytes, sc->object_size, memory_order_relaxed);
+#endif
   
   uint32_t new_fc = prev_fc + 1;  /* New free_count after our free */
 
@@ -1625,8 +1633,10 @@ void allocator_destroy(SlabAllocator* a) {
     /* Drain slab cache (now storing CachedSlab entries) */
     pthread_mutex_lock(&sc->cache_lock);
     for (size_t j = 0; j < sc->cache_size; j++) {
+#if ENABLE_DIAGNOSTIC_COUNTERS
       /* Decrement committed_bytes before munmap for accurate cleanup tracking */
       atomic_fetch_sub_explicit(&sc->committed_bytes, SLAB_PAGE_SIZE, memory_order_relaxed);
+#endif
       unmap_one_page(sc->slab_cache[j].slab);
     }
     free(sc->slab_cache);
