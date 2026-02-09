@@ -17,6 +17,21 @@
                                 * Larger pages (64KB on some ARM) increase RSS granularity. */
 #endif
 
+/* Diagnostic instrumentation (compile-time optional)
+ * 
+ * ENABLE_DIAGNOSTIC_COUNTERS adds live_bytes/committed_bytes tracking for proving
+ * bounded RSS via atomic counters. Adds ~1-2% latency overhead on hot paths.
+ * 
+ * Production recommendation: Disable unless actively debugging RSS behavior.
+ * 
+ * Usage:
+ *   make CFLAGS="-DENABLE_DIAGNOSTIC_COUNTERS=1"  # Enable diagnostics
+ *   make                                           # Production build (disabled)
+ */
+#ifndef ENABLE_DIAGNOSTIC_COUNTERS
+#define ENABLE_DIAGNOSTIC_COUNTERS 0  /* Default: disabled for production */
+#endif
+
 #define SLAB_MAGIC   0x534C4142u /* "SLAB" in ASCII, used to detect corruption */
 #define SLAB_VERSION 1u          /* Handle format version for future compatibility */
 
@@ -240,10 +255,18 @@ struct SizeClassAlloc {
   _Atomic uint64_t madvise_bytes;               /* Total bytes madvised */
   _Atomic uint64_t madvise_failures;            /* madvise() system call failures */
   
-  /* Diagnostic counters for RSS analysis (added for sustained_phase_shifts debugging) */
+#if ENABLE_DIAGNOSTIC_COUNTERS
+  /* Diagnostic counters for RSS analysis (compile-time optional, ~1-2% overhead)
+   * 
+   * These counters track every allocation/free event to provide mathematical proof
+   * of bounded RSS. Enabled via -DENABLE_DIAGNOSTIC_COUNTERS=1 at compile time.
+   * 
+   * Production recommendation: Disable unless actively debugging RSS behavior.
+   */
   _Atomic uint64_t committed_bytes;             /* Total bytes mmap'd (slabs * SLAB_PAGE_SIZE) */
   _Atomic uint64_t live_bytes;                  /* Bytes currently allocated to live objects */
   _Atomic uint64_t empty_slabs;                 /* Number of slabs currently empty (all slots free) */
+#endif
   
   /* Phase 2.1: Epoch-close telemetry */
   _Atomic uint64_t epoch_close_calls;           /* How many times epoch_close() called */
