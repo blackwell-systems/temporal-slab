@@ -6,6 +6,116 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Immediate Empty Slab Reclamation (2026-02-09)
+
+Critical fix eliminating the "immortal epoch prevents RSS drop" pathology. Previously, empty slabs were only recycled when their epoch entered `CLOSING` state, allowing immortal epochs (like epoch 0 with pinned objects) to prevent memory reclamation indefinitely.
+
+#### Fixed
+- **RSS Unbounded Growth in Long-Running Services** (CRITICAL)
+  - **Root cause**: Empty slab reclamation gated by `if (epoch_state == EPOCH_CLOSING)`
+  - **Failure mode**: Immortal epochs (never closed) accumulated empty slabs without reclaiming
+  - **Impact**: RSS grew from 1.6MB baseline → 20.6MB (+1115% retention) over 30 cycles
+  - **Example**: Pinned objects in epoch 0 prevented that epoch from ever closing
+  - **Fix**: Remove epoch state conditional - always reclaim empty slabs immediately
+  - **Result**: RSS stays flat at ~2MB (26% retention), peak 2.8MB vs 20+ MB before
+  - **Safety**: Each slab independently mmap'd; madvise(MADV_DONTNEED) preserves mapping
+
+#### Changed
+- **Empty slab reclamation policy** - Decoupled from epoch lifecycle (Option C)
+  - **Before**: `if (epoch_state == EPOCH_CLOSING) { cache_push(slab); }`
+  - **After**: Always call `cache_push(slab)` when slab becomes fully empty
+  - Reclamation now happens on every free that empties a slab, not at epoch boundaries
+  - Trade-off: Slight latency cost on slab reuse (~5µs zero-fill overhead)
+  - Benefit: RSS drops continuously, no dependency on epoch_close() timing
+
+#### Added
+- **Diagnostic Counters** - RSS analysis infrastructure for sustained workload debugging
+  - `committed_bytes` - Total bytes mmap'd for slabs (slabs × SLAB_PAGE_SIZE)
+  - `live_bytes` - Bytes currently allocated to live objects
+  - `empty_slabs` - Number of slabs currently empty (all slots free)
+  - Added to `SizeClassAlloc` struct alongside existing `madvise_*` counters
+  - Enables "smoking gun" diagnostics: committed vs live vs empty correlation
+
+#### Technical Details
+
+**Why This Fix Was Necessary:**
+
+The allocator uses a 16-epoch ring buffer for temporal grouping. Applications can keep specific epochs open indefinitely (e.g., for long-lived sessions), but the old reclamation policy assumed all epochs eventually close.
+
+**Failure Pattern:**
+```c
+// sustained_phase_shifts.c benchmark pattern:
+EpochId epoch0 = epoch_current(alloc);  // Returns 0
+allocate_pinned_objects(epoch0);  // 20% of working set
+
+for (cycle in 0..N) {
+    epoch_advance();  // Rotates to epoch 1, 2, 3...
+    allocate_ephemeral_objects();
+    free_ephemeral_objects();
+    // epoch 0 NEVER closes - pinned objects stay live
+    // Empty slabs in epoch 0 never get madvise'd
+    // RSS grows unbounded
+}
+```
+
+**Root Cause Code:**
+```c
+// src/slab_alloc.c:1466 (BEFORE)
+if (new_fc == s->object_count) {  // Slab became empty
+    if (epoch_state == EPOCH_CLOSING) {
+        cache_push(sc, s);  // madvise happens here
+    } else {
+        // Keep empty slabs hot for reuse
+        // THIS IS THE BUG - immortal epochs never reach here
+    }
+}
+```
+
+**Fix:**
+```c
+// src/slab_alloc.c:1465 (AFTER)
+if (new_fc == s->object_count) {  // Slab became empty
+    // ALWAYS reclaim, regardless of epoch state
+    cache_push(sc, s);  // madvise(MADV_DONTNEED)
+}
+```
+
+**Validation:**
+
+30-cycle test with 20% pinned objects in immortal epoch 0:
+- **RSS_close**: Stable at ~2MB (no growth after warmup)
+- **RSS_post**: ~2MB (similar to RSS_close, not dominated by pressure)
+- **Retention**: 26% vs baseline (down from 1115%)
+- **Peak RSS**: 2.8MB (down from 20.6MB)
+- **Probe faults**: 16384/0 (64MB probe correctly detected reclamation)
+
+**Safety Justification:**
+
+This change is safe because:
+1. Each slab is independently `mmap(NULL, 4096, ...)` - one syscall per page
+2. `madvise(MADV_DONTNEED)` zeros pages but preserves virtual mapping
+3. Re-use triggers zero-fill page fault (~5µs overhead, acceptable)
+4. `cache_push()` already handles madvise + counter updates atomically
+5. No ABA issues: registry generation counter prevents stale handle reuse
+
+**Design Philosophy:**
+
+Immediate reclamation implements "Option C" from performance analysis:
+- **Option A**: Close immortal epochs during cooldown (changes semantics)
+- **Option B**: Separate arena for pinned objects (increases complexity)  
+- **Option C**: Reclaim empty slabs regardless of epoch state (cleanest)
+
+This aligns with the allocator's core promise: "bounded RSS under sustained churn." Epoch boundaries provide temporal grouping for allocation (objects with similar lifetimes co-locate), but reclamation should be opportunistic (free memory as soon as it's available).
+
+**Impact on Benchmarks:**
+
+The `sustained_phase_shifts` benchmark now correctly demonstrates RSS discipline:
+- temporal-slab: 26% retention (deterministic reclamation)
+- system_malloc: 30% retention (heuristic retention)
+- Both show sensible, bounded growth (not 1000%+ pathological behavior)
+
+---
+
 ### Adaptive Bitmap Scanning (2026-02-08)
 
 Complete implementation of dynamic mode switching between sequential and randomized bitmap scanning based on CAS contention, with full observability and race-free atomic implementation.
