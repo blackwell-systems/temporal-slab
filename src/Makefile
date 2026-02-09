@@ -13,8 +13,11 @@ slab_lib_tsan.o: slab_lib.c
 tsan_test: tsan_test.c slab_lib_tsan.o
 	$(CC) $(TSAN_FLAGS) tsan_test.c slab_lib_tsan.o -o tsan_test
 
-benchmark_threads_tsan: benchmark_threads.c slab_lib_tsan.o
-	$(CC) $(TSAN_FLAGS) benchmark_threads.c slab_lib_tsan.o -o benchmark_threads_tsan
+slab_stats_tsan.o: slab_stats.c
+	$(CC) $(TSAN_FLAGS) -c slab_stats.c -o slab_stats_tsan.o
+
+benchmark_threads_tsan: benchmark_threads.c slab_lib_tsan.o slab_stats_tsan.o
+	$(CC) $(TSAN_FLAGS) benchmark_threads.c slab_lib_tsan.o slab_stats_tsan.o -o benchmark_threads_tsan
 
 # Core library object (implementation only, no main)
 slab_lib.c: slab_alloc.c

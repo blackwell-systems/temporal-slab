@@ -44,12 +44,21 @@ typedef struct {
   double avg;
 } ThreadResult;
 
-/* Shared state */
+/* Forward declaration */
+typedef struct BenchState BenchState;
+
+/* Thread argument */
 typedef struct {
+  BenchState* state;
+  int thread_id;
+} ThreadArg;
+
+/* Shared state */
+struct BenchState {
   SlabAllocator* alloc;
   _Atomic int start_flag;
   ThreadResult results[MAX_THREADS];
-} BenchState;
+};
 
 static int compare_uint64(const void* a, const void* b) {
   uint64_t x = *(const uint64_t*)a;
@@ -68,14 +77,15 @@ static uint64_t percentile(uint64_t* arr, size_t n, double p) {
 }
 
 static void* worker_thread(void* arg) {
-  BenchState* state = (BenchState*)arg;
-  long thread_id = (long)pthread_self() % MAX_THREADS;
+  ThreadArg* targ = (ThreadArg*)arg;
+  BenchState* state = targ->state;
+  int thread_id = targ->thread_id;
   ThreadResult* result = &state->results[thread_id];
   
   /* Allocate latency array */
   result->latencies = (uint64_t*)malloc(OPS_PER_THREAD * sizeof(uint64_t));
   if (!result->latencies) {
-    fprintf(stderr, "Thread %ld: Failed to allocate latency array\n", thread_id);
+    fprintf(stderr, "Thread %d: Failed to allocate latency array\n", thread_id);
     return NULL;
   }
   result->count = OPS_PER_THREAD;
@@ -83,7 +93,7 @@ static void* worker_thread(void* arg) {
   /* Allocate handle array */
   SlabHandle* handles = (SlabHandle*)calloc(OPS_PER_THREAD, sizeof(SlabHandle));
   if (!handles) {
-    fprintf(stderr, "Thread %ld: Failed to allocate handle array\n", thread_id);
+    fprintf(stderr, "Thread %d: Failed to allocate handle array\n", thread_id);
     free(result->latencies);
     return NULL;
   }
@@ -100,7 +110,7 @@ static void* worker_thread(void* arg) {
     uint64_t t1 = now_ns();
     
     if (!p) {
-      fprintf(stderr, "Thread %ld: Allocation failed at %d\n", thread_id, i);
+      fprintf(stderr, "Thread %d: Allocation failed at %d\n", thread_id, i);
       break;
     }
     
@@ -144,8 +154,11 @@ static void run_scaling_test(int num_threads, FILE* csv_file) {
   
   /* Create threads */
   pthread_t threads[MAX_THREADS];
+  ThreadArg thread_args[MAX_THREADS];
   for (int i = 0; i < num_threads; i++) {
-    if (pthread_create(&threads[i], NULL, worker_thread, &state) != 0) {
+    thread_args[i].state = &state;
+    thread_args[i].thread_id = i;
+    if (pthread_create(&threads[i], NULL, worker_thread, &thread_args[i]) != 0) {
       fprintf(stderr, "Failed to create thread %d\n", i);
       return;
     }
