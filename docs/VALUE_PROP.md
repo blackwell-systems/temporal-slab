@@ -10,20 +10,20 @@ It replaces spatial "hole-finding" with **temporal grouping**, ensuring objects 
 
 ### Eliminates Tail Latency Spikes
 
-**Measured results (100M allocations, 128-byte objects):**
+**Measured results (100M allocations, 128-byte objects, WSL2 environment):**
 
 | Percentile | temporal-slab | system_malloc | Advantage |
 |------------|---------------|---------------|-----------|
-| p50 | 30 ns | 24 ns | 0.8× (baseline trade-off) |
-| **p99** | **76 ns** | **2,962 ns** | **39× better** |
-| **p99.9** | **166 ns** | **11,525 ns** | **69× better** |
-| p99.99 | 1,542 ns | 63,940 ns | **41× better** |
-| p99.999 | 19.8 µs | 254 µs | **12.9× better** |
-| **Variance** | **659×** | **10,585×** | **16× more predictable** |
+| p50 | 41 ns | 23 ns | 0.56× (baseline trade-off) |
+| **p99** | **96 ns** | **1,113 ns** | **11.6× better** |
+| **p99.9** | **192 ns** | **2,335 ns** | **12.2× better** |
+| Free p99 | 216 ns | 62 ns | 0.29× (trade-off) |
 
-**Key insight:** A single malloc p99.9 outlier (11.5µs) costs 1,900× more than temporal-slab's entire median allocation (6ns overhead).
+**Key insight:** At p99, malloc enters microsecond territory (1.1µs stalls) while temporal-slab remains sub-100ns—an 11.6× difference that represents the core value proposition.
 
-**Value:** Eliminates 2-250µs allocator-induced tail spikes. Suitable for HFT, real-time systems, and latency-sensitive services where worst-case behavior matters more than average speed.
+**Value:** Eliminates 1-2µs allocator-induced tail spikes under pathological FIFO stress. Suitable for HFT, real-time systems, and latency-sensitive services where worst-case behavior matters more than average speed.
+
+**Environment caveat:** These numbers are from WSL2 and represent validated relative advantages. Absolute latencies will vary by platform (bare metal, cloud VMs, etc.). GitHub Actions validation in progress to establish reference baseline on ubuntu-latest.
 
 ---
 
