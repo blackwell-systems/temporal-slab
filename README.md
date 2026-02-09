@@ -584,6 +584,8 @@ It is designed to be predictable, conservative, and explicit—a specialized too
 
 ## Build and Test
 
+### Standard Build
+
 ```bash
 cd src/
 make                    # Build all tests
@@ -593,6 +595,37 @@ make                    # Build all tests
 ./test_malloc_wrapper  # malloc/free API tests
 ./benchmark_accurate   # Performance measurement
 ```
+
+### Compile-Time Flags
+
+**Production build (default):**
+```bash
+make  # Optimized for latency, diagnostic counters disabled
+```
+
+**Debug build with RSS diagnostics:**
+```bash
+make CFLAGS="-DENABLE_DIAGNOSTIC_COUNTERS=1 -I../include -DENABLE_RSS_RECLAMATION=1"
+```
+
+**Available flags:**
+
+| Flag | Default | Purpose | Overhead |
+|------|---------|---------|----------|
+| `ENABLE_RSS_RECLAMATION` | 1 | Empty slab reclamation via madvise() | ~5µs per slab reuse |
+| `ENABLE_DIAGNOSTIC_COUNTERS` | 0 | Track live_bytes/committed_bytes for RSS proof | ~1-2% latency |
+
+**When to enable diagnostic counters:**
+- Actively debugging RSS behavior
+- Proving bounded memory for certification
+- Running sustained stress tests (2000+ cycles)
+
+**When to disable (default):**
+- Production deployments prioritizing latency
+- Benchmarking p50/p99/p999 metrics
+- After RSS behavior has been validated
+
+See [docs/PRODUCTION_HARDENING.md](docs/PRODUCTION_HARDENING.md) for complete production deployment guide.
 
 ## Project Structure
 
