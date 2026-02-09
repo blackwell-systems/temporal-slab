@@ -35,10 +35,11 @@ It replaces spatial "hole-finding" with **temporal grouping**, ensuring objects 
 |--------|---------------|---------------|
 | Steady-state RSS growth (constant working set) | **0%** | **0%** |
 | Phase-boundary RSS growth (with epoch_close()) | **0%** | N/A (no epoch API) |
+| **Retention after cooldown (phase shifts)** | **-71.9%** | **-18.6%** |
 | Mixed-workload RSS growth (no epoch boundaries) | 1,033% | 1,111% (1.08× worse) |
 | Baseline RSS overhead | +37% | - |
 
-**Value:** Long-running services don't slowly consume memory or require periodic restarts. With `epoch_close()`, applications control exactly when memory is reclaimed at phase boundaries (0% growth validated). The +37% baseline RSS overhead is the explicit cost for eliminating unbounded drift.
+**Value:** Long-running services don't slowly consume memory or require periodic restarts. With `epoch_close()`, applications control exactly when memory is reclaimed at phase boundaries (0% growth validated). **Phase shift retention** demonstrates the "restart to reclaim" story: after traffic spikes and cooldown, temporal-slab returns 72% of peak footprint while system_malloc retains 81% (53.3 percentage point gap). The +37% baseline RSS overhead is the explicit cost for eliminating unbounded drift and enabling deep reclamation.
 
 ---
 
