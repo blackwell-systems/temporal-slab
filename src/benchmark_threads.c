@@ -231,10 +231,14 @@ static void run_scaling_test(int num_threads, FILE* csv_file) {
 int main(int argc, char** argv) {
   /* Parse arguments */
   const char* csv_path = NULL;
+  int single_thread_count = 0;
+  
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
       csv_path = argv[i + 1];
       i++;
+    } else if (argv[i][0] != '-') {
+      single_thread_count = atoi(argv[i]);
     }
   }
   
@@ -253,10 +257,14 @@ int main(int argc, char** argv) {
   printf("Object size: %d bytes\n", OBJECT_SIZE);
   printf("Ops per thread: %d\n", OPS_PER_THREAD);
   
-  /* Test thread counts: 1, 2, 4, 8, 16 */
-  int thread_counts[] = {1, 2, 4, 8, 16};
-  for (size_t i = 0; i < sizeof(thread_counts) / sizeof(thread_counts[0]); i++) {
-    run_scaling_test(thread_counts[i], csv_file);
+  /* Test thread counts: either single specified count or full sweep */
+  if (single_thread_count > 0) {
+    run_scaling_test(single_thread_count, csv_file);
+  } else {
+    int thread_counts[] = {1, 2, 4, 8, 16};
+    for (size_t i = 0; i < sizeof(thread_counts) / sizeof(thread_counts[0]); i++) {
+      run_scaling_test(thread_counts[i], csv_file);
+    }
   }
   
   if (csv_file) {
