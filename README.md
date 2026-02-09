@@ -48,6 +48,49 @@ In latency-sensitive systems, these outliers dominate SLA violations, frame drop
 
 ---
 
+## Ecosystem and Tooling
+
+temporal-slab provides multiple layers of tooling for development, observability, and validation:
+
+### Built-in Utilities (this repo)
+
+**`src/stats_dump`** - JSON metrics snapshot
+```bash
+./src/stats_dump --no-text  # Machine-readable JSON for automation
+./src/stats_dump            # Human-readable summary
+```
+
+**`tools/plot_bench.py`** - Visualization for benchmark CSV output
+```bash
+python3 tools/plot_bench.py  # Generate latency/fragmentation charts
+```
+
+### External Tools (separate repos)
+
+**[temporal-slab-tools](https://github.com/user/temporal-slab-tools)** - Production observability
+- **`tslab`** (Go CLI) - Live stats viewing, Prometheus export, top-like monitoring
+- **`tslabd`** (C daemon) - Embeds allocator for long-running metrics collection
+- **Prometheus + Grafana integration** - Production monitoring dashboards
+
+**[temporal-slab-allocator-bench](https://github.com/user/temporal-slab-allocator-bench)** - Comparative validation
+- Neutral harness testing temporal_slab vs system_malloc/jemalloc/tcmalloc
+- 100M allocation stress tests proving tail latency advantages
+- RSS stability and fragmentation efficiency benchmarks
+
+### Quick Decision Guide
+
+| Need | Tool | Where |
+|------|------|-------|
+| One-time stats check | `stats_dump` | This repo (`src/`) |
+| Live monitoring during dev | `tslab watch` | temporal-slab-tools |
+| Production metrics | `tslabd` + Prometheus | temporal-slab-tools |
+| Allocator comparison | Benchmark harness | temporal-slab-allocator-bench |
+| Visualization | `plot_bench.py` | This repo (`tools/`) |
+
+**Note:** The Go CLI (`tslab`) and C daemon (`tslabd`) are in a **separate repository** to maintain isolation—tool changes cannot affect allocator behavior.
+
+---
+
 ## What temporal-slab Guarantees
 
 * **Bounded tail latency with measured worst-case behavior**  
