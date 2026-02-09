@@ -74,6 +74,83 @@ This document builds the theoretical foundation for temporal-slab from first pri
 
 A page is the smallest unit of memory the operating system manages. On most modern systems (x86-64, ARM64), a page is 4096 bytes (4KB). When a program requests memory, the OS allocates entire pages. The program may request 80 bytes, but the OS grants at least one page. Pages are the fundamental currency of memory management—they can be mapped into a process's address space, unmapped to return them to the OS, or marked with protection attributes (read, write, execute).
 
+**Page protection attributes:**
+
+Every page in a process's address space has protection bits that control how the page can be accessed:
+
+- **PROT_READ:** Page can be read (load instructions allowed)
+- **PROT_WRITE:** Page can be written (store instructions allowed)
+- **PROT_EXEC:** Page can be executed (instruction fetch allowed)
+- **PROT_NONE:** Page cannot be accessed at all (any access triggers fault)
+
+These are enforced by the CPU's Memory Management Unit (MMU). If a program tries to access a page in a way that violates its protection bits, the CPU triggers a **page fault** and the kernel delivers a SIGSEGV signal (segmentation fault), typically terminating the process.
+
+**Common protection combinations:**
+
+```c
+// Typical data page (read/write, not executable)
+mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+// Code page (read/execute, not writable)
+mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+// Read-only data page (constants)
+mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+// Guard page (detect stack overflow)
+mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+```
+
+**Why protection matters for security:**
+
+Without page protection, any bug could corrupt any memory:
+
+```c
+char* stack_var = "hello";
+char* code_ptr = (char*)&main;  // Pointer to code
+
+// Without protection, this would work:
+code_ptr[0] = 0xC3;  // Overwrite first byte of main() with 'ret' instruction
+→ Program behavior completely corrupted
+
+// With PROT_EXEC (no write), this triggers SIGSEGV:
+code_ptr[0] = 0xC3;  // CRASH: Cannot write to executable page
+```
+
+Modern systems use **W^X (Write XOR Execute)** policy:
+- Pages are either writable OR executable, never both
+- Prevents code injection attacks (can't write shellcode then execute it)
+- Enforced by default on all modern operating systems
+
+**Protection in temporal-slab:**
+
+temporal-slab allocates all slabs with `PROT_READ | PROT_WRITE`:
+
+```c
+void* slab = mmap(NULL, 4096, 
+                  PROT_READ | PROT_WRITE,  // Data pages, not code
+                  MAP_PRIVATE | MAP_ANONYMOUS, 
+                  -1, 0);
+```
+
+Slabs store data (objects), not code, so they don't need `PROT_EXEC`. They need read/write for normal allocation/free operations. When a slab is madvised (`MADV_DONTNEED`), the protection bits remain unchanged—the page is still readable/writable, but the physical memory is released and the page is zeroed on next access.
+
+**Protection changes and TLB:**
+
+Changing protection bits requires a syscall:
+
+```c
+// Make page read-only
+mprotect(ptr, 4096, PROT_READ);  // Syscall, updates page table
+
+// Make page read/write again  
+mprotect(ptr, 4096, PROT_READ | PROT_WRITE);  // Another syscall
+```
+
+After changing protection, the TLB (Translation Lookaside Buffer) must be flushed for that page—otherwise the CPU might use cached protection bits and allow access that should be denied. This flush is automatic in `mprotect()` but costs ~100-200 cycles.
+
+temporal-slab never changes page protection after allocation—slabs remain `PROT_READ | PROT_WRITE` for their entire lifetime. This avoids syscall overhead and TLB flushes.
+
 ## Virtual Memory vs Physical Memory
 
 When a program requests memory, the OS grants virtual memory—address space the program can reference. Virtual addresses are not physical RAM addresses. They are references into a virtual address space managed by the OS. The mapping from virtual to physical addresses happens through page tables maintained by the CPU's memory management unit (MMU).
