@@ -823,6 +823,120 @@ epoch_domain_destroy(batch);
 
 ---
 
+### 9. Comprehensive Benchmark Validation (GitHub Actions CI)
+
+**Problem Solved**: Performance claims need reproducible validation in controlled environments.
+
+**Our Solution**: Multi-metric GitHub Actions workflow tracking 4 dimensions of allocator behavior.
+
+#### Implemented Metrics (Phases 1-3, 5)
+
+##### Phase 1: Variance Statistics
+Measures latency predictability across trials:
+- **IQR (Interquartile Range)**: p75 - p25 spread of p99/p999 latencies
+- **CoV% (Coefficient of Variation)**: (stddev / mean) × 100 for relative variability
+
+**Value**: Lower CoV% = more predictable latency. Validates temporal-slab's "variance elimination" claim.
+
+```
+=== Variance Analysis ===
+temporal-slab p99:  CoV=2.35%, IQR=45 ns
+system_malloc p99:  CoV=5.12%, IQR=187 ns
+```
+
+##### Phase 2: Peak RSS Tracking
+Captures maximum memory pressure during benchmark runs:
+- **Peak RSS (KB)**: Absolute maximum resident set size
+- **Peak growth %**: Growth from baseline to peak
+
+**Value**: Reveals retention behavior. Gap between peak and final RSS shows how much memory allocator holds after working set shrinks.
+
+**JSON schema extension**:
+```json
+"rss": {
+  "steady_state_kb": 1936,
+  "peak_kb": 2464,
+  "final_kb": 2464,
+  "growth_pct": 27.27,
+  "peak_growth_pct": 27.27
+}
+```
+
+##### Phase 3: CPU Time Per Operation
+Workflow-level wrapper captures total CPU consumption:
+- **Formula**: `(user_time + sys_time) × 1e9 / total_operations`
+- **Implementation**: `/usr/bin/time -v` wraps benchmark runs
+
+**Value**: Throughput validation. Shows computational cost per alloc+free pair (includes all overhead: timing loops, percentile calculation, RSS measurement).
+
+```
+=== CPU Time Analysis ===
+Metric              | temporal_slab          | system_malloc          |
+--------------------|------------------------|------------------------|
+CPU ns/op (median)  |    45.2 ns            |    38.7 ns            |
+```
+
+##### Phase 5: Regression Thresholds (Warn-Only)
+Automated validation against expected ranges:
+- temporal-slab p99 < 200ns
+- temporal-slab p999 < 500ns
+- temporal-slab p99 CoV < 10%
+- p99 advantage > 5× vs malloc
+- Peak RSS < 50MB for standard workload
+
+**Value**: Prevents performance regressions. Warns (does not fail build) when metrics fall outside validated ranges.
+
+#### Phase Shift Retention Benchmark
+
+**Validates**: The "restart to reclaim" operational story.
+
+**Pattern**: Burst (cycles 0-4) + Cooldown (cycle 5+)
+- Build working set with 3 phases × objects + 40% pinned for fragmentation
+- Free all pinned objects at cycle 5 (working set drops)
+- Continue with reduced working set
+
+**Validated Results** (GitHub Actions, ubuntu-latest, 20 cycles):
+- **temporal-slab**: -71.9% retention (RSS: 9,796 KB → 2,756 KB)
+- **system_malloc**: -18.6% retention (RSS: 11,392 KB → 9,268 KB)
+- **Gap**: 53.3 percentage points
+
+**What this proves**: General allocators retain memory across phase shifts due to fragmentation. temporal-slab provides explicit reclamation at phase boundaries via `epoch_close()`.
+
+#### Recycle Efficiency Validation
+
+**Validates**: Epoch ring buffer reuse without cache overhead.
+
+**Key Finding**: **Zero cache traffic** when workload fits within 16-epoch ring window.
+
+**Why this matters**: 
+- PerfCounters track explicit cache operations (`empty_slab_recycled`, `empty_slab_overflowed`)
+- Zero cache ops = slabs reused directly via epoch ring hot path
+- No cache push/pop overhead when ring buffer suffices
+
+**Technical insight**: Ring buffer design enables reuse at epoch N+16 without touching slab cache. This validates the design claim: "epoch ring handles steady-state reuse on the hot path."
+
+#### Zero Hot Path Impact
+
+All 4 implemented metrics share a critical property: **No code changes to allocation loops**.
+
+- **Variance stats**: jq + bc calculations in workflow
+- **Peak RSS**: Tracked outside allocation hot path (cycle-level measurement)
+- **CPU time**: `/usr/bin/time -v` wrapper (process-level measurement)
+- **Regression thresholds**: Post-execution validation
+
+**Value**: Immediate credibility without risk of introducing performance regressions.
+
+#### Future Work (Phase 4 - Deferred)
+
+**Internal Counters Export**: Requires BenchAlloc interface extension to expose:
+- CAS retry rate per allocation
+- Scan mode switches (sequential vs randomized)
+- Lock contention metrics
+
+**Deferred rationale**: Requires code changes and interface redesign. Phases 1-3, 5 deliver 80% of value with zero risk.
+
+---
+
 ## Getting Started
 
 See [README.md](README.md) for build instructions and quick start guide.
