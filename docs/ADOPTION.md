@@ -53,7 +53,7 @@ Control plane services (Kubernetes controllers, service meshes, API gateways, lo
 - Leads to OOM kills, production outages, wasted cloud spend
 - Requires periodic restarts (downtime, state loss)
 
-Benchmark results show temporal-slab at **0-2.4% RSS growth** over 1000 churn cycles while malloc exhibits **unbounded drift** (11,174% measured growth over 100 cycles in sustained churn tests).
+Benchmark results show temporal-slab at **0% RSS growth** in steady-state workloads (constant working set, fixed size). Under mixed-workload stress tests with expanding working sets, both allocators show substantial growth; temporal-slab demonstrates 7-8% better discipline (1.08× ratio).
 
 **Typical control plane allocations:**
 - Session metadata: 64-256 bytes
@@ -66,7 +66,7 @@ Again, perfect fit for temporal-slab's size classes.
 **Real operational impact:**
 
 A control plane service with sustained churn:
-- malloc: Unbounded drift (11,174% measured over 100 cycles)
+- malloc: Variable growth depending on workload (0% in steady-state, ~1100% under adversarial stress)
 - temporal-slab: 0-2.4% growth over 1000 cycles
 
 **With epoch_close() API:**

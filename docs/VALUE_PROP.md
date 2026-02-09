@@ -33,7 +33,7 @@ It replaces spatial "hole-finding" with **temporal grouping**, ensuring objects 
 
 | Metric | temporal-slab | system_malloc |
 |--------|---------------|---------------|
-| Steady-state RSS growth (100 cycles) | **0%** | 11,174% |
+| Steady-state RSS growth (constant working set) | **0%** | **0%** |
 | Long-term RSS growth (1000 cycles) | **0-2.4%** | Unbounded |
 | Baseline RSS overhead | +37% | - |
 
@@ -75,7 +75,7 @@ temporal-slab makes an explicit trade-off:
 **To eliminate:**
 - 2µs–250µs tail spikes (69× reduction at p99.9)
 - Allocator-driven instability (16× more predictable variance)
-- Unbounded RSS drift (0–2.4% growth vs 11,174% measured for malloc)
+- Predictable RSS under steady-state churn (0% growth, GitHub Actions validated)
 
 **This is not a performance optimization—it's tail-risk elimination.**
 
@@ -92,7 +92,7 @@ For latency-sensitive systems where worst-case behavior dominates SLA violations
 | p99 latency | 2,962 ns | **76 ns (39× better)** |
 | p99.9 latency | 11,525 ns | **166 ns (69× better)** |
 | Variance | 10,585× | **659× (16× more predictable)** |
-| RSS under churn | 11,174% growth | **0-2.4% growth** |
+| RSS under steady-state churn | Variable (0-1100%) | **0% growth** |
 | Stale frees | UB / crash | **Safe rejection** |
 | Runtime `munmap()` | Yes | **Never** |
 
