@@ -2,13 +2,17 @@
 
 This document outlines the target market, adoption barriers, and path to production use for temporal-slab.
 
+**What is temporal-slab?** A memory allocator that implements **structural determinism**—a third computational model for memory management beyond malloc (pointer-level tracking) and garbage collection (reachability tracing). Memory is reclaimed when application **phase boundaries** complete (request ends, frame presents, transaction commits), not when individual pointers become unreachable.
+
+For deeper conceptual understanding, see [LIFETIME_ALGEBRA.md](../LIFETIME_ALGEBRA.md).
+
 ## Target Market
 
 temporal-slab is designed for systems with three characteristics:
 
 1. **Small object allocations** (64-768 bytes)
 2. **High churn rate** (thousands of allocations/frees per second)
-3. **Predictable lifetimes** (objects created together tend to die together)
+3. **Observable phase boundaries** (requests, frames, transactions—moments when logical units of work complete)
 
 ### Primary Target: High-Frequency Trading (HFT)
 
@@ -20,9 +24,9 @@ HFT systems require deterministic allocation latency. A single 10µs spike can c
 - Occasional mmap/munmap syscalls (2-10µs)
 
 temporal-slab provides:
-- **76ns p99 latency** (39× better than malloc's 2,962ns)
-- **166ns p99.9 latency** (69× better than malloc's 11,525ns)
-- **16× more predictable variance** (659× vs malloc's 10,585×)
+- **120ns p99 latency** (12× better than malloc's 1,443ns, GitHub Actions validated)
+- **340ns p999 latency** (13× better than malloc's 4,409ns, GitHub Actions validated)
+- **Deterministic reclamation at phase boundaries** (request end, frame present, transaction commit)
 - **No compaction pauses** (objects never move)
 - **O(1) size class selection** (zero branch misprediction jitter)
 
@@ -322,8 +326,8 @@ Compare to malloc:
 **Success criteria:**
 - Zero crashes
 - 0-2.4% RSS growth (vs unbounded drift for baseline allocator)
-- p99 latency <100ns (vs 2-3µs for malloc)
-- 16× more predictable variance than malloc
+- p99 latency <150ns (validated at 120ns vs malloc's 1,443ns)
+- 12-13× better tail latency than malloc (GitHub Actions validated)
 - Publishable graphs
 
 **Deliverable:** Blog post with before/after graphs, lessons learned, operational experience.
@@ -522,9 +526,9 @@ MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000"
 
 **temporal-slab advantages:**
 - 0-2.4% RSS growth (jemalloc still drifts with aggressive tuning)
-- 76ns p99 (39× better than malloc, jemalloc similar to malloc)
-- 16× more predictable variance (659× vs 10,585×)
-- Application-controlled reclamation via epoch_close() (jemalloc uses heuristics)
+- 120ns p99 (12× better than malloc's 1,443ns, GitHub Actions validated)
+- Deterministic reclamation at phase boundaries via epoch_close() (jemalloc uses heuristics)
+- Structural determinism model (third way beyond malloc and GC)
 
 **Competitor 3: mimalloc**
 
@@ -532,9 +536,9 @@ mimalloc is a specialized allocator optimizing for performance:
 
 **temporal-slab advantages:**
 - Structural RSS bounds (0-2.4% vs mimalloc's heuristic reclamation)
-- Epoch-based temporal grouping (mimalloc uses free lists)
-- Application-controlled reclamation (mimalloc uses background threads)
-- 16× more predictable variance (structural determinism vs emergent behavior)
+- Epoch-based temporal grouping aligned with phase boundaries (mimalloc uses free lists)
+- Application-controlled reclamation at phase boundaries (mimalloc uses background threads)
+- 12-13× better tail latency (120ns p99, 340ns p999 validated on GitHub Actions)
 
 **Verdict:** temporal-slab wins on bounded RSS, tail latency predictability, and deterministic behavior. Loses on generality (fixed sizes, 768 byte limit).
 
