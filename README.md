@@ -20,31 +20,31 @@ In latency-sensitive systems, these outliers dominate SLA violations, frame drop
 ### The Exchange
 
 **You trade:**
-- +6ns median latency (+20% slower average case)
+- +18ns median latency (+44% slower average case)
 - +37% baseline RSS (epochs keep some slabs hot)
 
 **To eliminate:**
-- 2µs–250µs tail spikes (69× reduction at p99.9)
-- Allocator-driven instability (16× more predictable variance)
-- Unpredictable reclamation (0–2.4% RSS growth vs unbounded drift)
+- 1-2µs tail spikes (11.6-12.2× reduction at p99-p999)
+- Allocator-driven RSS drift (0% vs 11,174% growth)
+- Unpredictable reclamation behavior
 
 ---
 
 ## Measured Results (100M Allocations)
 
+Latest benchmarks (Feb 8 2026, race-free adaptive bitmap scanning):
+
 | Percentile | system_malloc | temporal-slab | Advantage |
 |------------|---------------|---------------|-----------|
-| p99 | 2,962 ns | 76 ns | **39× better** |
-| **p99.9** | **11,525 ns** | **166 ns** | **69× better** |
-| p99.99 | 63,940 ns | 1,542 ns | **41× better** |
-| p99.999 | 254,039 ns | 19,764 ns | **12.9× better** |
-| **Variance** | **10,585×** | **659×** | **16× more predictable** |
+| p50 | 23 ns | 41 ns | 0.56× (trade-off) |
+| **p99** | **1,113 ns** | **96 ns** | **11.6× better** |
+| **p999** | **2,335 ns** | **192 ns** | **12.2× better** |
 
 **RSS stability:**
-- temporal-slab: 0–2.4% growth over 1000 churn cycles
+- temporal-slab: 0% growth in steady-state (100 cycles)
 - system_malloc: 11,174% growth (unbounded drift)
 
-At the deepest observable tail (p99.999), malloc hits 254µs while temporal-slab stays at 19.8µs—a 12.9× reduction in worst-case latency.
+**Trade-off:** 44% slower median allocation (41ns vs 23ns) in exchange for elimination of malloc's microsecond-scale tail spikes.
 
 ---
 
@@ -76,8 +76,8 @@ temporal-slab provides multiple layers of tooling for development, observability
         │  • tcmalloc         │               │  tslabd (C daemon)      │
         │                     │               │  • Embeds allocator     │
         │  Proves:            │               │  • HTTP :8080/metrics   │
-        │  • 39× p99 better   │               │                         │
-        │  • 69× p999 better  │               │  Monitoring Stack       │
+        │  • 11.6× p99 better │               │                         │
+        │  • 12.2× p999 better│               │  Monitoring Stack       │
         │  • 0% RSS growth    │               │  • Prometheus :9090     │
         │  • Bounded memory   │               │  • Grafana :3000        │
         └─────────────────────┘               │  • Pushgateway :9091    │
@@ -132,7 +132,7 @@ python3 tools/plot_bench.py  # Generate latency/fragmentation charts
 ## What temporal-slab Guarantees
 
 * **Bounded tail latency with measured worst-case behavior**  
-  Lock-free allocation with **76ns p99** (39× better), **166ns p99.9** (69× better), **1.5µs p99.99** (41× better). Variance: 659× vs malloc's 10,585× (16× more predictable). No emergent pathological states.
+  Lock-free allocation with **96ns p99** (11.6× better), **192ns p999** (12.2× better) vs system_malloc under pathological stress. No emergent pathological states.
 
 * **Stable RSS under sustained churn**  
   **0–2.4% RSS growth** over 1000 churn cycles vs malloc's unbounded drift (11,174% measured). No surprise reclamation.
@@ -144,7 +144,7 @@ python3 tools/plot_bench.py  # Generate latency/fragmentation charts
   Invalid, stale, or double frees are safely rejected—never segfaults. No unsafe unmapping during runtime.
 
 * **Explicit risk exchange**  
-  +6ns median cost (+20%), +37% baseline RSS for **elimination of 2-250µs tail spikes**. You trade memory for reliability.
+  +18ns median cost (+44%), +37% baseline RSS for **elimination of 1-2µs tail spikes**. You trade memory for reliability.
 
 ---
 
@@ -320,20 +320,17 @@ make
 
 temporal-slab delivers three key properties for latency-sensitive workloads:
 
-1. **Eliminates tail latency spikes** - 39-69× better across p99-p99.9, 16× more predictable variance
-2. **Stable RSS under churn** - 0-2.4% growth over 1000 cycles (vs unbounded malloc drift)
-3. **Predictable trade-offs** - +37% baseline RSS for deterministic behavior
+1. **Eliminates tail latency spikes** - 11.6-12.2× better across p99-p999
+2. **Stable RSS under churn** - 0% growth in steady-state (vs 11,174% malloc drift)
+3. **Predictable trade-offs** - +37% baseline RSS, +44% median latency
 
-**Tail Latency Results (100M samples, 128-byte objects):**
+**Tail Latency Results (100M samples, 128-byte objects, Feb 8 2026):**
 
 | Percentile | temporal-slab | system_malloc | Advantage |
 |------------|---------------|---------------|----------|
-| p50 | 30ns | 24ns | 0.8× (baseline trade-off) |
-| p99 | 76ns | 2,962ns | **39× better** |
-| p99.9 | 166ns | 11,525ns | **69× better** |
-| p99.99 | 1,542ns | 63,940ns | **41× better** |
-| p99.999 | 19.8µs | 254µs | **12.9× better** |
-| Variance | 659× | 10,585× | **16× more predictable** |
+| p50 | 41ns | 23ns | 0.56× (trade-off) |
+| p99 | 96ns | 1,113ns | **11.6× better** |
+| p999 | 192ns | 2,335ns | **12.2× better** |
 
 **RSS & Efficiency:**
 
@@ -344,7 +341,7 @@ temporal-slab delivers three key properties for latency-sensitive workloads:
 | Baseline RSS overhead | +37% | - |
 | Space efficiency | 88.9% | ~85% |
 
-**Risk exchange:** +6ns median cost, +37% baseline RSS to eliminate 2-250µs tail spikes. This is not a performance trade-off—it's **tail-risk elimination**. A single malloc p99.9 outlier (11.5µs) costs 1,900× more than temporal-slab's entire median allocation (6ns overhead). For latency-sensitive systems, this exchange is decisive.
+**Risk exchange:** +18ns median cost (+44%), +37% baseline RSS to eliminate 1-2µs tail spikes. This is not a performance trade-off—it's **tail-risk elimination**. A single malloc p99 outlier (1,113ns) costs 27× more than temporal-slab's median allocation (41ns). For latency-sensitive systems, this exchange is decisive.
 
 **Full analysis:** See [docs/results.md](docs/results.md) for detailed benchmarks, charts, and interpretation guidelines.
 
