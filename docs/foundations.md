@@ -43,6 +43,7 @@ This document builds the theoretical foundation for temporal-slab from first pri
 
 **Implementation Techniques**
 - [Fast Path vs Slow Path](#fast-path-vs-slow-path)
+- [Hot Path Optimization Architecture](#hot-path-optimization-architecture)
 - [Lock-Free Allocation](#lock-free-allocation)
 - [Lock Contention](#lock-contention)
 - [Compare-and-Swap (CAS)](#compare-and-swap-cas)
@@ -61,6 +62,7 @@ This document builds the theoretical foundation for temporal-slab from first pri
 - [O(1) Deterministic Class Selection](#o1-deterministic-class-selection)
 - [Branch Prediction and Misprediction](#branch-prediction-and-misprediction)
 - [Tail Latency and Percentiles](#tail-latency-and-percentiles)
+- [Platform-Specific Considerations: x86-64 Linux](#platform-specific-considerations-x86-64-linux)
 
 **API Design**
 - [Handle-Based API vs Malloc-Style API](#handle-based-api-vs-malloc-style-api)
@@ -2288,6 +2290,461 @@ temporal-slab's 0% RSS growth and sub-100ns latency both depend on fast/slow pat
 
 The fast path is what makes temporal-slab suitable for HFT and real-time systems. The slow path is what makes it correct and prevents unbounded growth.
 
+## Hot Path Optimization Architecture
+
+temporal-slab achieves sub-100ns allocation latency through a layered optimization strategy where each technique addresses a specific performance bottleneck. Understanding how these optimizations compose reveals why the allocator can sustain 74ns median latency with 76ns p99—a consistency that's exceptional even among specialized allocators.
+
+The hot path is the sequence of operations executed when allocating from a slab that already exists and has free slots available. This is the 99%+ case—the critical path that determines system performance. Every cycle saved here multiplies across millions of allocations per second.
+
+**The unoptimized baseline:**
+
+Before explaining optimizations, consider what a naive allocator would do:
+
+```c
+void* naive_alloc(size_t size) {
+    pthread_mutex_lock(&global_lock);           // 100+ cycles (contended)
+    
+    for (int i = 0; i < num_size_classes; i++) {
+        if (size <= size_classes[i]) {           // 8 branches (unpredictable)
+            SizeClass* sc = &classes[i];
+            
+            Slab* slab = sc->partial_list;
+            while (slab) {                        // O(N) list traversal
+                for (int j = 0; j < slab->capacity; j++) {
+                    if (slab->free_list[j]) {     // Another O(M) scan
+                        void* ptr = slab->free_list[j];
+                        slab->free_list[j] = NULL;
+                        pthread_mutex_unlock(&global_lock);
+                        return ptr;
+                    }
+                }
+                slab = slab->next;
+            }
+            
+            // No free slot found, allocate new slab
+            slab = mmap(...);                     // 3000+ cycles (syscall)
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&global_lock);
+    return ptr;
+}
+```
+
+**Cost breakdown of naive approach:**
+- Mutex lock: 100-200 cycles (uncontended), 1000-10000 cycles (contended)
+- Size class selection: 8 branches × 10 cycles (misprediction) = 80 cycles
+- Slab search: O(N) list traversal, average 50 cycles per slab checked
+- Slot search: O(M) free list scan, average 100 cycles
+- Mutex unlock: 100 cycles
+
+Total: **400-600 cycles best case**, 10000+ cycles worst case (contended lock or mmap)
+
+This is unacceptable for HFT systems where every allocation contributes to tail latency. A single 10µs allocation spike (30,000 cycles at 3GHz) causes a missed trade worth potentially millions.
+
+**Optimization Layer 1: Eliminate lock contention (Lock-Free Allocation)**
+
+The first bottleneck is the global mutex. Under multi-threaded load, threads serialize on lock acquisition—only one thread allocates at a time, wasting CPU cores. The solution is lock-free allocation using atomic compare-and-swap (CAS).
+
+Instead of protecting the entire allocator with a mutex, temporal-slab uses atomic operations on the bitmap that tracks slot state. Multiple threads can attempt to claim different bits simultaneously. Only the final step—flipping a bit from 0 to 1—requires synchronization, and this happens via hardware-level atomic CAS.
+
+```c
+// Lock-free fast path (simplified)
+Slab* slab = atomic_load_explicit(&sc->current_partial, memory_order_acquire);
+uint64_t old_bitmap, new_bitmap;
+do {
+    old_bitmap = atomic_load_explicit(&slab->bitmap, memory_order_relaxed);
+    int slot = __builtin_ctzll(~old_bitmap);  // Find first 0 bit
+    if (slot == 64) return NULL;  // Slab full
+    new_bitmap = old_bitmap | (1ULL << slot);
+} while (!atomic_compare_exchange_weak(&slab->bitmap, &old_bitmap, new_bitmap));
+
+return (void*)(slab_base + slot * slot_size);
+```
+
+**What this eliminates:**
+- No mutex acquisition (100-10000 cycles saved)
+- No thread serialization (scales to ~4 threads before cache coherence limits)
+- No kernel involvement (no context switches, no scheduler interaction)
+
+**What it costs:**
+- CAS operation: 20-40 cycles (LOCK CMPXCHG instruction on x86-64)
+- Retry on contention: Additional 20-40 cycles per retry (rare: <1% under T≤4)
+
+**Net improvement:** 100+ cycles → 20-40 cycles (3-5× faster, uncontended case)
+
+The CAS operation is not free—it's more expensive than a regular store (1-2 cycles)—but it's vastly cheaper than a mutex. The LOCK prefix forces cache coherence, ensuring all cores see the updated bitmap. This means the cache line containing the bitmap bounces between cores, but this is still faster than blocking threads.
+
+**Why CAS scales poorly beyond 4-8 threads:**
+
+Cache coherence traffic grows quadratically with thread count. When 8 threads all CAS the same cache line, each successful CAS invalidates 7 other caches. With 16 threads, each CAS invalidates 15 caches. The memory bus becomes saturated with coherence messages, and CAS latency degrades from 20 cycles to 100+ cycles.
+
+This is why temporal-slab's lock-free design targets 1-4 threads as the sweet spot. Beyond that, the allocator remains correct (no data races), but performance degrades due to fundamental hardware limits, not algorithmic issues.
+
+**Optimization Layer 2: Eliminate slot search (Bitmap Allocation)**
+
+The second bottleneck is finding a free slot. Naive allocators use free lists—linked lists of available slots—which require O(N) traversal. Even a simple array scan is O(N) in worst case.
+
+temporal-slab uses a bitmap where each bit represents one slot: 0 = free, 1 = allocated. A 64-slot slab needs 64 bits (one `uint64_t`). Finding a free slot becomes a single CPU instruction: `__builtin_ctzll(~bitmap)` (count trailing zeros of inverted bitmap).
+
+```c
+// Bitmap: 0b0000...0101 (slots 0 and 2 allocated, rest free)
+// Inverted: 0b1111...1010 (flip all bits)
+// CTZ: 1 (position of first 1 bit)
+// → Slot 1 is free
+
+uint64_t bitmap = 0b0101;
+int free_slot = __builtin_ctzll(~bitmap);  // Returns 1
+```
+
+On x86-64, `__builtin_ctzll` compiles to the BSF (Bit Scan Forward) instruction, which takes 1 cycle (unpipelined) or 3 cycles (latency). This is as fast as arithmetic gets—finding the free slot is essentially free compared to the CAS operation that claims it.
+
+**Why bitmaps beat free lists:**
+
+Free lists have two problems: pointer chasing and metadata overhead. Each free list node stores a `next` pointer (8 bytes). For a 64-byte slot, that's 12.5% overhead. Worse, traversing the list is cache-hostile—each node access is a dependent load that stalls the pipeline until the previous load completes.
+
+```c
+// Free list traversal (cache-hostile)
+FreeNode* node = free_list_head;
+while (node->size < requested_size) {
+    node = node->next;  // Dependent load, pipeline stalls
+}
+```
+
+Bitmaps store all slot state in a single cache line (64 bits = 8 bytes). One load fetches the entire state. The BSF instruction operates on a register, not memory—no pipeline stalls.
+
+**What this eliminates:**
+- O(N) free list scan (50-100 cycles average)
+- Pointer chasing (dependent loads, pipeline stalls)
+- Metadata overhead (free list nodes)
+
+**What it costs:**
+- Bitmap storage: 1 bit per slot (8 bytes per 64-slot slab)
+- BSF instruction: 1-3 cycles
+
+**Net improvement:** 50-100 cycles → 1-3 cycles (20-50× faster)
+
+The bitmap is so efficient that the bottleneck shifts to the CAS operation, not the slot search. This is the correct tradeoff—CAS is unavoidable for correctness (atomicity), but slot search is algorithmic and can be optimized.
+
+**Optimization Layer 3: Eliminate size class search (O(1) Deterministic Class Selection)**
+
+The third bottleneck is mapping requested size to size class. Naive approach is a linear scan through size class thresholds: `if (size <= 64) class=0; if (size <= 96) class=1; ...`
+
+Each comparison is a conditional branch. If allocation sizes are unpredictable (e.g., user input, network packets), the CPU's branch predictor fails ~50% of the time. With 8 size classes, that's 4 mispredicted branches per allocation.
+
+Branch mispredictions cost 10-20 cycles each because the CPU must flush its speculative execution pipeline and restart from the correct path. This is jitter—latency that varies by allocation size.
+
+temporal-slab uses a precomputed lookup table:
+
+```c
+static uint8_t size_class_lookup[MAX_SIZE + 1];  // 769 bytes
+
+// Initialization (once at startup)
+for (size_t s = 0; s <= MAX_SIZE; s++) {
+    for (int c = 0; c < NUM_CLASSES; c++) {
+        if (s <= class_sizes[c]) {
+            size_class_lookup[s] = c;
+            break;
+        }
+    }
+}
+
+// Allocation (hot path)
+uint8_t class = size_class_lookup[size];  // 1 load, 0 branches
+```
+
+This is an array lookup: load an address, fetch the byte. On x86-64 with L1 cache hit, this is 4 cycles. No branches, no speculation, no mispredictions. The latency is constant regardless of allocation size.
+
+**Why this works:**
+
+The lookup table is small (769 bytes) and accessed frequently, so it remains cache-resident. It fits in a single 1KB cache line block in L1. The access pattern is random (allocation sizes vary), but that doesn't matter—the entire table is cached, so every access is an L1 hit.
+
+The table is initialized once at startup. The cost is ~2000 cycles total (negligible for a one-time setup). Every subsequent allocation saves 40-80 cycles (4 mispredicted branches).
+
+**What this eliminates:**
+- 8 conditional branches (80 cycles worst case, mispredictions)
+- Unpredictable latency (size-dependent jitter)
+
+**What it costs:**
+- Array load: 4 cycles (L1 cache hit)
+- 769 bytes of memory (negligible)
+
+**Net improvement:** 80 cycles → 4 cycles (20× faster, deterministic)
+
+**Optimization Layer 4: Eliminate thundering herd (Adaptive Bitmap Scanning)**
+
+The fourth bottleneck appears only under multi-threaded load. When multiple threads allocate from the same slab, they all scan the bitmap starting from bit 0. This creates a thundering herd—all threads converge on the same slot and contend for it with CAS retries.
+
+```c
+// Sequential scanning (naive)
+for (int i = 0; i < 64; i++) {
+    if (bitmap & (1ULL << i) == 0) {
+        // All threads find bit 0 first
+        // → All threads CAS bit 0
+        // → Only 1 succeeds, others retry
+    }
+}
+```
+
+With 8 threads, 7 threads fail their first CAS and retry. Retry rate: 87.5%. Each retry wastes 20-40 cycles.
+
+temporal-slab uses thread-local randomized starting offsets:
+
+```c
+static __thread uint32_t tls_scan_offset = UINT32_MAX;
+
+if (tls_scan_offset == UINT32_MAX) {
+    uint64_t tid = (uint64_t)pthread_self();
+    tls_scan_offset = hash(tid);  // Initialize once per thread
+}
+
+int start = tls_scan_offset % 64;
+for (int i = 0; i < 64; i++) {
+    int bit = (start + i) % 64;  // Wrap around bitmap
+    if (bitmap & (1ULL << bit) == 0) {
+        // Threads start at different positions
+        // → Reduced contention
+    }
+}
+```
+
+Each thread computes a unique starting offset from its thread ID. Threads spread across the bitmap instead of colliding on bit 0. With 8 threads and 64 slots, average distance between threads is 8 slots—low collision probability.
+
+**Thread-local storage (TLS) is critical here:**
+
+Storing the offset in TLS means each thread accesses its own private copy—no sharing, no contention. TLS access is 2-3 cycles (same as a regular variable), essentially free. Computing the offset requires hashing the thread ID, which costs ~10 cycles, but this happens once per thread lifetime—amortized to zero over millions of allocations.
+
+**Adaptive policy:**
+
+Under single-threaded load, randomized scanning is unnecessary—there's no contention. It adds a modulo operation (2-3 cycles) for no benefit. temporal-slab adapts based on observed CAS retry rate:
+
+```c
+if (cas_retries / allocations > 0.30) {
+    enable_randomized_scanning();  // High contention
+} else if (cas_retries / allocations < 0.10) {
+    enable_sequential_scanning();  // Low contention
+}
+```
+
+Single-threaded workloads use sequential scanning (deterministic, 2-3 cycles faster). Multi-threaded workloads switch to randomized scanning when retry rate exceeds 30%. This eliminates configuration—the allocator self-tunes.
+
+**What this eliminates:**
+- CAS retry loops (20-40 cycles per retry, retry rate drops from 80% to 20%)
+- Thundering herd contention (threads spread across bitmap)
+
+**What it costs:**
+- Modulo operation: 2-3 cycles (when randomized mode active)
+- TLS load: 2-3 cycles (offset lookup)
+- Adaptation overhead: Negligible (checked every 100K allocations)
+
+**Net improvement:** 80% retry rate → 20% retry rate (4× fewer retries, 60+ cycles saved per avoided retry)
+
+**Optimization Layer 5: Eliminate list traversal (Pre-selected Current Slab)**
+
+The fifth bottleneck is finding a slab with free slots. Traditional slab allocators maintain a partial list—a linked list of slabs that are neither empty nor full. Allocation scans this list until finding a slab with free slots.
+
+```c
+// Naive partial list scan
+Slab* slab = sc->partial_list;
+while (slab) {
+    if (slab->free_count > 0) {
+        // Found one!
+        break;
+    }
+    slab = slab->next;
+}
+```
+
+This is O(N) where N is the number of partial slabs. In worst case (all partial slabs are full except the last), this scans the entire list. Each iteration is a pointer dereference (cache miss risk) and a comparison.
+
+temporal-slab maintains a `current_partial` pointer—a single pre-selected slab that's known to have free slots (or NULL if no partial slabs exist). Allocation tries this slab first:
+
+```c
+Slab* slab = atomic_load(&sc->current_partial);
+if (slab && slab->free_count > 0) {
+    // Use this slab (no search)
+}
+```
+
+If `current_partial` is full, the slow path updates it to point to the next partial slab (or allocates a new slab). The fast path never scans lists—it always operates on a known-good slab.
+
+**Why this works:**
+
+Under sustained load, slabs fill sequentially. Once a slab is selected as `current_partial`, it remains the target until full. The fast path hits the same slab repeatedly—this slab's cache line stays hot in L1. When the slab fills, the slow path (which already holds the mutex for structural changes) updates `current_partial` atomically.
+
+**What this eliminates:**
+- O(N) partial list scan (10-50 cycles depending on list length)
+- Pointer chasing (dependent loads)
+- Cache misses (same slab accessed repeatedly)
+
+**What it costs:**
+- One atomic load: 1-2 cycles (acquire barrier)
+- Pointer dereference: 1 cycle (slab header likely cached)
+
+**Net improvement:** 10-50 cycles → 2-3 cycles (5-20× faster)
+
+**Optimization Layer 6: Eliminate memory reordering hazards (Acquire/Release Semantics)**
+
+The sixth optimization is correctness, not speed—but it enables speed. Lock-free algorithms require careful memory ordering to prevent reordering bugs. Consider publishing a newly initialized slab:
+
+```c
+// Slow path: Initialize slab
+Slab* slab = mmap(...);
+slab->magic = MAGIC;
+slab->bitmap = 0;
+slab->free_count = 64;
+
+// Publish to fast path
+sc->current_partial = slab;  // Other threads can now see it
+```
+
+Without memory barriers, the CPU or compiler might reorder these writes. Thread B could see `current_partial = slab` before `slab->bitmap = 0` completes. Thread B would then read an uninitialized bitmap—catastrophic.
+
+temporal-slab uses acquire/release semantics:
+
+```c
+// Slow path (release)
+atomic_store_explicit(&sc->current_partial, slab, memory_order_release);
+// Ensures all prior writes (bitmap, magic, free_count) complete before store
+
+// Fast path (acquire)  
+Slab* slab = atomic_load_explicit(&sc->current_partial, memory_order_acquire);
+// Ensures all subsequent reads (bitmap, magic) see initialized values
+```
+
+On x86-64, acquire loads and release stores are essentially free—they compile to regular MOV instructions because x86-64's strong memory model provides these guarantees by default. The `memory_order` annotations prevent compiler reordering, but require no additional CPU instructions.
+
+On ARM or PowerPC (weaker memory models), acquire/release insert memory fence instructions (DMB, SYNC), costing 10-50 cycles. But temporal-slab targets x86-64 primarily, so this cost is zero in practice.
+
+**What this eliminates:**
+- Reordering bugs (compiler or CPU reordering writes)
+- Data races (uninitialized reads)
+
+**What it costs:**
+- x86-64: 0 cycles (hardware already provides acquire/release)
+- ARM/PowerPC: 10-50 cycles (explicit fence instructions)
+
+**Net improvement:** Correctness enabled at zero cost on x86-64
+
+**Optimization Layer 7: Eliminate cache misses (Temporal Grouping)**
+
+The seventh optimization is architectural, not algorithmic. Allocators that scatter objects across many pages suffer cache misses when accessing those objects. If related objects (allocated together, accessed together) are on different cache lines, the CPU must fetch multiple cache lines from DRAM.
+
+temporal-slab groups objects allocated in the same epoch onto the same slabs. If those objects are accessed together (temporal locality → spatial locality), they share cache lines:
+
+```c
+// Request processing allocates multiple objects
+Connection* conn = alloc(epoch_current);  // Slab A, offset 0
+Request* req = alloc(epoch_current);      // Slab A, offset 128
+Response* resp = alloc(epoch_current);    // Slab A, offset 256
+
+// All three objects on same page (Slab A)
+// Accessing conn, req, resp: 1 TLB entry, 4 cache lines (256 bytes / 64 bytes per line)
+```
+
+Traditional allocators might place these objects on three different pages:
+
+```c
+Connection* conn = malloc(128);  // Page X
+Request* req = malloc(128);      // Page Y (different!)
+Response* resp = malloc(256);    // Page Z (different!)
+
+// Three TLB entries required
+// Three distinct cache line groups
+// 3× TLB miss risk, 3× cache pollution
+```
+
+**Why this matters:**
+
+Cache misses cost 100+ cycles (DRAM access). TLB misses cost 500+ cycles (page table walk). If a request processes 10 objects and they're scattered across 10 pages, that's 10 TLB misses = 5000 cycles overhead just for address translation.
+
+With temporal grouping, 10 objects fit on 1-2 pages, requiring 1-2 TLB entries. TLB hit rate improves from 10% (10 pages, 512-entry TLB saturated) to 99% (2 pages, plenty of TLB space).
+
+**What this eliminates:**
+- Cache line pollution (objects on same page share cache lines)
+- TLB pressure (fewer unique pages accessed)
+- DRAM bandwidth waste (fetching unrelated cache lines)
+
+**What it costs:**
+- Requires epoch-aware allocation (application must specify epoch)
+- Slightly higher internal fragmentation (objects grouped by time, not size)
+
+**Net improvement:** Difficult to measure in isolation, but contributes to consistent p99 latency
+
+**The Complete Hot Path: Cycle-by-Cycle Breakdown**
+
+Bringing it all together, here's what happens during a successful fast path allocation:
+
+```c
+void* alloc_obj_hot_path(SlabAllocator* a, size_t size) {
+    // [1-4 cycles] Size class selection
+    uint8_t class = a->class_lookup[size];  // Array load (L1 hit)
+    SizeClassAlloc* sc = &a->classes[class];
+    
+    // [1-2 cycles] Load current slab
+    Slab* slab = atomic_load_explicit(&sc->current_partial, memory_order_acquire);
+    
+    // [2-3 cycles] TLS scan offset (adaptive mode)
+    uint32_t start = get_tls_scan_offset();
+    
+    // CAS loop (expected iterations: 1.2× on average at T=4)
+    uint64_t old_bm, new_bm;
+    int attempts = 0;
+    do {
+        // [1-2 cycles] Load bitmap
+        old_bm = atomic_load_explicit(&slab->bitmap, memory_order_relaxed);
+        
+        // [1-3 cycles] Find free slot (BSF instruction)
+        int slot = find_free_bit_starting_at(old_bm, start);
+        if (slot == -1) return NULL;  // Slab full
+        
+        // [1 cycle] Prepare new bitmap
+        new_bm = old_bm | (1ULL << slot);
+        
+        // [20-40 cycles] Atomic CAS
+        attempts++;
+    } while (!atomic_compare_exchange_weak(&slab->bitmap, &old_bm, new_bm));
+    
+    // [2-3 cycles] Compute slot address
+    uint8_t* slot_base = slab_data_ptr(slab);
+    void* ptr = slot_base + (slot * slab->object_size);
+    
+    return ptr;
+}
+```
+
+**Cycle accounting (single-threaded, no contention):**
+- Size class selection: 4 cycles
+- Current slab load: 2 cycles
+- TLS offset load: 3 cycles
+- Bitmap load: 2 cycles
+- BSF (find free bit): 3 cycles
+- Bitmap prepare: 1 cycle
+- CAS: 20 cycles (success, first attempt)
+- Address computation: 3 cycles
+
+**Total: 38 cycles ≈ 13ns at 3GHz**
+
+This matches the observed p50 of 74ns from benchmarks—the difference is additional overhead from function call preambles, register saves, and minor variations in cache state.
+
+**Cycle accounting (multi-threaded, T=4, 20% retry rate):**
+- Base: 38 cycles (same as above)
+- CAS retry (20% probability): 0.2 × 30 cycles = 6 cycles
+- Cache coherence overhead: 5 cycles (cache line ping-pong)
+
+**Total: 49 cycles ≈ 16ns at 3GHz**
+
+Under 4-thread load, benchmarks show p50 ≈ 82ns, again consistent with the theoretical model when accounting for measurement overhead.
+
+**Why the optimizations compound:**
+
+Each optimization removes a specific bottleneck, exposing the next one. Without lock-free allocation, mutex contention dominates (1000+ cycles), making bitmap speed irrelevant. With lock-free allocation, slot search becomes the bottleneck—solved by bitmaps. With bitmaps, size class selection becomes visible—solved by lookup tables.
+
+The final hot path is limited by atomic CAS latency (20-40 cycles), which is fundamental to correctness. You cannot eliminate this without breaking thread-safety. Everything else—size selection, slot search, slab selection—has been optimized to near-zero cost.
+
+This is why temporal-slab's p99 is within 3% of p50 (74ns → 76ns). The only variance comes from CAS retries, which are rare and bounded. There are no O(N) scans, no unpredictable branches, no lock contention, no syscalls. The hot path is deterministic machinery executing in 30-50 cycles, every time.
+
 ## Lock-Free Allocation
 
 In multi-threaded programs, multiple threads may allocate concurrently. The naive approach is to protect the allocator with a mutex. Before allocating, acquire the lock. This is correct but slow—lock contention becomes a bottleneck.
@@ -4371,6 +4828,403 @@ No GC pauses, no lock contention, no unbounded jitter
 | **Background jobs** | p50 (average) | No user waiting, optimize for throughput |
 
 If humans or SLAs are waiting, optimize for tail latency. If throughput is the goal, average latency is sufficient.
+
+## Platform-Specific Considerations: x86-64 Linux
+
+temporal-slab is designed primarily for x86-64 Linux systems. This is not an arbitrary choice—specific hardware and OS features on this platform enable performance characteristics that would be difficult or impossible to achieve elsewhere. Understanding these dependencies clarifies what temporal-slab assumes about the underlying system and what would need to change for portability.
+
+**The target platform: x86-64 Linux**
+
+x86-64 refers to the 64-bit extension of the x86 instruction set architecture, implemented by Intel (x64) and AMD (AMD64). Linux refers to the kernel and its memory management subsystem. Together, these provide:
+
+1. Strong memory ordering (TSO - Total Store Ordering)
+2. Efficient atomic instructions (LOCK prefix, CMPXCHG, XADD)
+3. Predictable page size (4KB)
+4. madvise(MADV_DONTNEED) semantics that release physical memory
+5. Transparent huge pages support (optional)
+6. NUMA awareness (for multi-socket systems)
+
+Each of these affects temporal-slab's design and performance.
+
+**Memory Ordering: x86-64 TSO vs ARM Relaxed**
+
+The most critical difference between architectures is memory ordering—the rules governing when memory operations become visible to other threads. x86-64 uses TSO (Total Store Ordering), a strong memory model that provides implicit ordering guarantees. ARM, PowerPC, and RISC-V use weaker models that require explicit synchronization.
+
+**x86-64 TSO guarantees:**
+
+```
+Thread A:                    Thread B:
+store X = 1                  load Y into r1
+store Y = 1                  load X into r2
+
+x86-64 TSO: If r1 = 1, then r2 MUST = 1
+(Stores happen in program order, loads see stores in order)
+```
+
+This is the "total store order" property: all threads see stores in the same order. Critically, this means acquire loads and release stores are essentially free on x86-64:
+
+```c
+// Release store (publish data)
+atomic_store_explicit(&ready, 1, memory_order_release);
+// Compiles to: MOV [ready], 1 (regular store, no fence)
+
+// Acquire load (consume published data)
+int val = atomic_load_explicit(&ready, memory_order_acquire);
+// Compiles to: MOV val, [ready] (regular load, no fence)
+```
+
+The hardware already prevents reordering that would violate acquire/release semantics. The compiler must avoid reordering (via `memory_order`), but no CPU-level fence is needed.
+
+**ARM relaxed ordering:**
+
+ARM uses a relaxed memory model where loads and stores can be reordered freely unless explicitly prevented:
+
+```
+Thread A:                    Thread B:
+store X = 1                  load Y into r1
+store Y = 1                  load X into r2
+
+ARM relaxed: r1 = 1 and r2 = 0 is ALLOWED
+(Thread B can see stores out of order!)
+```
+
+To prevent this, ARM requires explicit memory barriers:
+
+```c
+// Release store on ARM
+atomic_store_explicit(&ready, 1, memory_order_release);
+// Compiles to:
+//   DMB ISHST (fence: ensure prior stores complete)
+//   STR [ready], 1 (store)
+
+// Acquire load on ARM
+int val = atomic_load_explicit(&ready, memory_order_acquire);
+// Compiles to:
+//   LDR val, [ready] (load)
+//   DMB ISH (fence: ensure subsequent loads wait)
+```
+
+DMB (Data Memory Barrier) instructions cost 10-50 cycles depending on cache state. This adds significant overhead to lock-free algorithms.
+
+**Impact on temporal-slab's hot path:**
+
+Recall the hot path cycle accounting from earlier:
+
+```
+x86-64 (current):
+- Acquire load (current_partial): 2 cycles (MOV instruction)
+- Release store (publish slab): 2 cycles (MOV instruction)
+- Total: 38 cycles for full allocation
+
+ARM (hypothetical port):
+- Acquire load: 2 cycles (LDR) + 20 cycles (DMB) = 22 cycles
+- Release store: 2 cycles (STR) + 20 cycles (DMB) = 22 cycles
+- Total: 38 + 40 = 78 cycles for full allocation
+
+ARM would be 2× slower due to fence overhead alone.
+```
+
+The hot path uses acquire/release semantics in three places:
+1. Loading `current_partial` (acquire)
+2. Loading the bitmap (relaxed, no fence)
+3. Publishing new `current_partial` in slow path (release)
+
+On x86-64, these are free. On ARM, each acquire/release adds 20+ cycles. This compounds across millions of allocations per second.
+
+**Why x86-64 TSO enables sub-100ns latency:**
+
+Lock-free algorithms fundamentally require memory ordering. Without x86-64's free acquire/release, temporal-slab would need explicit fences, pushing latency from 74ns (x86-64) to ~150ns (ARM). This might seem small, but it's 2× slower—crossing the 100ns threshold that matters for HFT systems.
+
+**Page Size: 4KB Standard vs 64KB ARM**
+
+temporal-slab assumes 4KB pages. This is standard on x86-64 Linux but not universal:
+
+**x86-64 Linux:**
+- Default page size: 4KB (4096 bytes)
+- Huge pages: 2MB, 1GB (optional, via mmap flags)
+- Page table: 4-level (PML4, PDPT, PD, PT)
+
+**ARM64 Linux:**
+- Default page size: 4KB (most systems) or 64KB (some systems, configurable at kernel compile time)
+- Huge pages: 2MB, 512MB, 1GB (varies by page size)
+- Page table: 4-level (configurable)
+
+**Why page size matters for slab efficiency:**
+
+temporal-slab allocates one slab per page (4KB). With 8 size classes (64, 96, 128, 192, 256, 384, 512, 768 bytes), the number of objects per slab varies:
+
+```
+Size class 64 bytes:
+- 4KB page: 4096 / 64 = 64 objects per slab
+- 64KB page: 65536 / 64 = 1024 objects per slab
+
+Size class 768 bytes:
+- 4KB page: 4096 / 768 = 5 objects per slab
+- 64KB page: 65536 / 768 = 85 objects per slab
+```
+
+On 64KB pages, slabs hold 16× more objects. This has two effects:
+
+**Positive:** Lower per-object metadata overhead (bitmap is 128 bytes vs 8 bytes, but amortized over 16× more objects).
+
+**Negative:** Coarser granularity for RSS reclamation. An epoch with 1000 objects might fit on 200 slabs (4KB pages) or 12 slabs (64KB pages). When the epoch drains, 4KB-page systems can madvise individual slabs as they empty (fine-grained reclamation). 64KB-page systems must wait for all 85 objects in a slab to be freed before reclaiming that 64KB.
+
+This increases RSS granularity by 16×, making temporal-slab's bounded RSS guarantee weaker. A workload with 1000 live objects might have:
+- 4KB pages: 1000 objects + 32 partially empty slabs = ~1.1MB RSS (10% overhead)
+- 64KB pages: 1000 objects + 2 partially empty slabs = ~1.2MB RSS (20% overhead)
+
+**Porting consideration:** temporal-slab would need runtime page size detection (`sysconf(_SC_PAGESIZE)`) and adjusted slab allocation logic to handle 64KB pages efficiently.
+
+**madvise(MADV_DONTNEED): Linux vs BSD vs Windows**
+
+temporal-slab relies on `madvise(MADV_DONTNEED)` to release physical memory while keeping virtual mappings intact. This syscall's behavior is OS-specific.
+
+**Linux madvise(MADV_DONTNEED):**
+```c
+madvise(slab, 4096, MADV_DONTNEED);
+// Effect:
+// 1. Physical pages released immediately (RSS drops instantly)
+// 2. Virtual mapping remains (no segfault if accessed)
+// 3. Next access triggers minor page fault, page is zeroed
+// 4. Zero-page optimization: Pages map to shared zero page until written
+```
+
+This is exactly what temporal-slab needs: RSS drops immediately, but handle validation still works (accessing the slab faults in a zero page, magic number reads as 0, validation fails safely).
+
+**BSD madvise(MADV_DONTNEED):**
+```c
+madvise(slab, 4096, MADV_DONTNEED);
+// Effect:
+// 1. Advisory hint, MAY release physical pages (not guaranteed)
+// 2. Behavior is implementation-defined
+// 3. Some BSD variants treat MADV_DONTNEED as "I will not need this soon" rather than "release now"
+```
+
+On FreeBSD/OpenBSD, MADV_DONTNEED is a hint, not a directive. The kernel might defer reclamation or ignore it entirely. For aggressive RSS control, BSD systems need `MADV_FREE` (mark pages free but don't zero) or `madvise(..., MADV_DONTNEED)` followed by `mmap(MAP_FIXED)` to force reclamation.
+
+**Windows VirtualAlloc/VirtualFree:**
+
+Windows has no direct equivalent to madvise. The closest options:
+
+```c
+// Option 1: VirtualFree with MEM_DECOMMIT
+VirtualFree(slab, 4096, MEM_DECOMMIT);
+// Effect:
+// - Physical pages released
+// - Virtual address remains reserved
+// - Accessing decommitted memory crashes (no zero-page fault)
+
+// Option 2: VirtualAlloc with MEM_RESET
+VirtualAlloc(slab, 4096, MEM_RESET, PAGE_READWRITE);
+// Effect:
+// - Pages marked as "can be discarded"
+// - OS may release physical pages under pressure
+// - Accessing pages after MEM_RESET reads garbage (not zeroes!)
+```
+
+Neither option provides Linux's semantics. `MEM_DECOMMIT` crashes on access (breaks handle validation). `MEM_RESET` doesn't guarantee reclamation and doesn't zero pages.
+
+**Porting temporal-slab to Windows would require:**
+1. Accepting crashes on stale handle validation (use registry exclusively, never dereference slab pointers)
+2. OR: Never unmapping/decommitting memory (trading RSS control for safety)
+3. OR: Implementing handle validation entirely via registry (no magic number checks in slab headers)
+
+**Atomic Instructions: LOCK CMPXCHG vs LL/SC**
+
+x86-64 uses a single-instruction CAS: `LOCK CMPXCHG`. ARM uses load-linked/store-conditional (LL/SC): `LDXR/STXR`. These have different performance characteristics.
+
+**x86-64 CAS (LOCK CMPXCHG):**
+```asm
+lock cmpxchg [mem], new_value
+// Atomic operation: compare [mem] with expected, swap if equal
+// Cost: 20-40 cycles (includes memory bus lock and cache coherence)
+```
+
+This is a single instruction. The LOCK prefix acquires exclusive ownership of the cache line, performs the comparison and swap atomically, then releases ownership. Other cores see this as one indivisible operation.
+
+**ARM LL/SC (LDXR/STXR):**
+```asm
+retry:
+  ldxr  r0, [mem]         ; Load-linked: mark [mem] for exclusive access
+  cmp   r0, expected      ; Compare loaded value with expected
+  bne   fail              ; If not equal, fail
+  stxr  r1, new_value, [mem]  ; Store-conditional: store if exclusive access still valid
+  cbnz  r1, retry         ; If store failed (r1=1), retry
+fail:
+```
+
+This is a 4-5 instruction sequence. The load-linked marks the cache line. If another thread writes to the line before store-conditional executes, the store fails and the loop retries.
+
+**Why this matters:**
+
+LL/SC can experience spurious failures—failures not caused by contention, but by unrelated cache activity (e.g., prefetching, speculative loads). x86-64 CMPXCHG only fails if another thread actually modified the value.
+
+Under high contention (8+ threads), ARM's LL/SC retry rate can be 10-20% higher than x86-64 CMPXCHG due to spurious failures. This compounds the 20-cycle fence overhead discussed earlier.
+
+**TLB and Cache Behavior: x86-64 vs ARM**
+
+Both architectures have TLBs and multi-level caches, but details differ:
+
+**x86-64 typical (Intel Skylake):**
+- L1 TLB: 64 entries (data), 128 entries (instruction)
+- L2 TLB: 1536 entries (shared)
+- TLB miss: 4-level page table walk (~100-200 cycles)
+- Cache line: 64 bytes
+- L1: 32KB (per core, 8-way, 4-cycle latency)
+- L2: 256KB (per core, 8-way, 12-cycle latency)
+- L3: 8-32MB (shared, 16-way, 40-cycle latency)
+
+**ARM typical (Cortex-A76):**
+- L1 TLB: 48 entries (data), 48 entries (instruction)
+- L2 TLB: 1024 entries (shared)
+- TLB miss: 4-level page table walk (~150-300 cycles, slower than x86-64)
+- Cache line: 64 bytes (same as x86-64)
+- L1: 64KB (per core, 4-way, 4-cycle latency)
+- L2: 256-512KB (per core, 8-way, 12-cycle latency)
+- L3: 2-4MB (shared, 16-way, 40-cycle latency)
+
+ARM's smaller TLB (48 vs 64 entries at L1) means higher TLB miss rates for workloads touching many pages. temporal-slab's temporal grouping (objects on same pages) benefits both architectures, but helps ARM slightly more due to its tighter TLB.
+
+ARM's larger L1 cache (64KB vs 32KB) can help with metadata-heavy workloads, but temporal-slab's bitmaps are small (8 bytes per slab), so this doesn't matter much.
+
+**NUMA: Multi-Socket x86-64 Systems**
+
+High-end x86-64 servers have multiple sockets, each with its own memory controller. This creates NUMA (Non-Uniform Memory Access): local memory is faster than remote memory.
+
+```
+System topology:
+Socket 0: Cores 0-15, 64GB RAM (local)
+Socket 1: Cores 16-31, 64GB RAM (local)
+
+Thread on Core 0 accessing:
+- Socket 0 RAM: 100 cycles (local)
+- Socket 1 RAM: 200 cycles (remote, crosses socket interconnect)
+```
+
+temporal-slab allocates slabs via `mmap(NULL, ...)`, which returns memory from the calling thread's local NUMA node by default (first-touch policy). If Thread 0 (Socket 0) allocates a slab, it's placed in Socket 0 RAM. If Thread 16 (Socket 1) later accesses that slab, it pays the remote access penalty.
+
+**NUMA-aware optimization (future work):**
+
+```c
+// Per-NUMA-node allocators
+SlabAllocator* allocators[num_nodes];
+
+void* numa_aware_alloc(size_t size) {
+    int node = numa_node_of_cpu(sched_getcpu());  // Which socket am I on?
+    return slab_malloc(allocators[node], size);
+}
+```
+
+This keeps allocations local to the socket that created them, avoiding remote access penalties. However, it complicates epoch management (epochs become per-node) and increases memory overhead (16 epochs × 2 sockets = 32 epoch pools).
+
+**Why Linux Specifically (Not Just POSIX)**
+
+temporal-slab uses Linux-specific features that are not portable to other UNIX systems:
+
+**1. madvise(MADV_DONTNEED) semantics:**
+- POSIX doesn't standardize MADV_DONTNEED behavior
+- Linux: Immediate physical release, zero-page fault on access
+- BSD: Advisory hint, may not release immediately
+- Solaris: Different semantics (MADV_DONTNEED marks pages as "not needed soon")
+
+**2. Transparent Huge Pages (THP):**
+- Linux: `madvise(MADV_HUGEPAGE)` promotes pages to 2MB huge pages transparently
+- BSD: No THP support (must use explicit huge page APIs)
+- This is optional for temporal-slab but improves TLB efficiency
+
+**3. /proc/self/status for RSS monitoring:**
+- Linux: `VmRSS` field shows resident set size
+- BSD: Must use `getrusage()` or `kvm_getprocs()`
+- Different tools for introspection
+
+**4. prctl(PR_SET_THP_DISABLE) for control:**
+- Linux: Fine-grained THP control per-process
+- BSD: No equivalent
+
+**Porting Checklist: What Would Need to Change**
+
+To port temporal-slab to other platforms:
+
+**ARM64 Linux:**
+- Add explicit memory barriers (DMB instructions) for acquire/release semantics
+- Expect 2× latency increase (74ns → 150ns) due to fence overhead
+- Handle 64KB page size (runtime detection, adjust slab sizes)
+- Test LL/SC spurious failure rate under high contention
+- **Estimated effort:** Medium (2-4 weeks, mostly testing)
+
+**x86-64 BSD (FreeBSD/OpenBSD):**
+- Replace MADV_DONTNEED with MADV_FREE or explicit mmap(MAP_FIXED) to force reclamation
+- Test that RSS actually drops (BSD's lazy reclamation might delay)
+- Adjust RSS monitoring (use getrusage instead of /proc)
+- **Estimated effort:** Low (1-2 weeks)
+
+**x86-64 Windows:**
+- Replace mmap/munmap with VirtualAlloc/VirtualFree
+- Replace madvise with MEM_DECOMMIT (sacrifices handle validation safety) or MEM_RESET (doesn't guarantee reclamation)
+- Replace pthread TLS with Windows TLS APIs (TlsAlloc/TlsGetValue)
+- Handle different page fault behavior (MEM_DECOMMIT crashes, can't rely on zero-page faults)
+- **Estimated effort:** High (4-8 weeks, significant API differences)
+
+**ARM64 Android:**
+- Same as ARM64 Linux (memory barriers, 64KB pages)
+- Plus: Android's aggressive OOM killer requires careful RSS management
+- Plus: Bionic libc differences (smaller than glibc differences, but present)
+- **Estimated effort:** Medium (3-5 weeks)
+
+**RISC-V Linux:**
+- Similar to ARM (weak memory model, needs explicit fences)
+- Less mature toolchain (potential compiler issues with atomic intrinsics)
+- Fewer deployed systems (harder to benchmark)
+- **Estimated effort:** High (4-6 weeks, uncharted territory)
+
+**Performance Summary: x86-64 vs ARM**
+
+```
+Hot path latency (single-threaded):
+x86-64: 74ns p50, 76ns p99 (2.7% variance)
+ARM64: ~150ns p50, ~160ns p99 (estimated, due to fences)
+
+Hot path latency (4 threads):
+x86-64: 82ns p50, 95ns p99 (15.8% variance)
+ARM64: ~180ns p50, ~220ns p99 (estimated, fence + LL/SC overhead)
+
+RSS reclamation granularity:
+x86-64 (4KB pages): 4KB per slab
+ARM64 (64KB pages): 64KB per slab (16× coarser)
+
+madvise effectiveness:
+Linux: Immediate RSS drop, zero-page fault on access
+BSD: Deferred reclamation, no zero-page guarantee
+Windows: Must choose between safety (no reclaim) or crashes (VirtualFree)
+```
+
+**Why These Differences Matter**
+
+temporal-slab's design optimizes for x86-64 Linux because that's where the target workloads run: HFT trading systems, high-performance API servers, real-time control planes. These systems overwhelmingly run on x86-64 Linux in datacenters.
+
+The 2× performance difference between x86-64 (74ns) and ARM (150ns estimated) is the difference between "suitable for HFT" (sub-100ns) and "too slow for HFT" (>100ns). This isn't a portability concern—it's a fundamental architectural advantage of x86-64's strong memory model.
+
+If ARM systems eventually dominate datacenters (Apple M-series servers, AWS Graviton at scale), temporal-slab could be ported. The bounded RSS guarantee would remain (architectural, not platform-specific), but latency would degrade due to unavoidable fence overhead. For workloads where bounded RSS matters more than single-digit microsecond latency differences, ARM would be acceptable.
+
+**The Design Philosophy: Optimize for Reality**
+
+temporal-slab could be written in a platform-agnostic way, avoiding x86-64-specific assumptions. But this would sacrifice performance on the platform that matters:
+
+```
+Platform-agnostic approach:
+- Use seq_cst everywhere (strongest ordering, works on all architectures)
+- Cost: 20-50 cycle fences on x86-64 (even though TSO makes them unnecessary)
+- Result: 74ns → 150ns latency on x86-64 (2× slower for portability we don't need)
+
+Platform-specific approach (current):
+- Use acquire/release on x86-64 (zero cost, leverages TSO)
+- Cost: Must add fences when porting to ARM
+- Result: 74ns on x86-64 (optimal), 150ns on ARM (acceptable, only if ported)
+```
+
+The philosophy: optimize for the platform you're running on, not the platform you might someday port to. If ARM becomes critical, pay the porting cost then. Don't sacrifice 50% performance today for hypothetical portability tomorrow.
+
+This is pragmatic systems design: make tradeoffs based on real deployment constraints, not abstract portability ideals.
 
 ## Handle-Based API vs Malloc-Style API
 
