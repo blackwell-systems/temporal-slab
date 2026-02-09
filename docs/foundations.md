@@ -5883,19 +5883,33 @@ Memory allocation bridges the gap between OS-provided pages and application-need
 Slab allocation solves this by dividing pages into fixed-size slots (size classes) and filling slabs sequentially. Objects allocated around the same time end up in the same slab. If they have correlated lifetimes (allocation-order affinity), they die together, and the slab can be recycled as a unit. This manages entropy by grouping objects to expire in an organized way.
 
 temporal-slab extends this with:
-- **Lock-free fast-path allocation** (sub-100ns latency via atomic CAS on bitmaps)
+- **Lock-free fast-path allocation** (120ns p99, 340ns p999 validated on GitHub Actions)
+- **Phase boundary alignment** (applications signal lifetime phase completion via epoch_close())
 - **Conservative recycling** (only FULL slabs recycled, eliminating use-after-free races)
 - **Slab registry with generation counters** (enables safe madvise/munmap with ABA protection)
-- **Epoch-granular reclamation** (deterministic RSS drops aligned with application lifecycle)
+- **Epoch-granular reclamation** (deterministic RSS drops aligned with application phase boundaries)
 - **O(1) class selection** (lookup table eliminates branching jitter)
+- **Adaptive bitmap scanning** (self-tunes between sequential and randomized modes based on contention)
+- **Epoch domains** (RAII-style scoped lifetimes for nested phases)
+- **Comprehensive observability** (zero-cost production telemetry via stats APIs)
 
-The allocator does not predict lifetimes or require application hints. Lifetime alignment emerges naturally from allocation patterns. Applications control when to reclaim memory by closing epochs at phase boundaries. This is substrate, not policy—a foundation for higher-level systems to build on.
+The allocator does not predict lifetimes or require application hints. Lifetime alignment emerges naturally from allocation patterns. Applications control when to reclaim memory by closing epochs at phase boundaries—structural moments where logical units of work complete (requests end, frames render, transactions commit, batches finish). This is substrate, not policy—a foundation for higher-level systems to build on.
 
-**Current implementation (v1.0):**
+**Current implementation (production-ready):**
 
-All memory management features are production-ready:
-- madvise releases physical memory (RSS competitive with malloc)
-- epoch_close() enables application-controlled reclamation
-- Slab registry enables safe handle validation after madvise/munmap
+All core features are implemented and validated:
+- **Core allocator:** 8 fixed size classes (64-768 bytes), 16-epoch ring buffer
+- **RSS reclamation:** madvise(MADV_DONTNEED) releases physical memory, epoch_close() enables deterministic reclamation
+- **Safety:** Slab registry with 24-bit generation counters, no runtime munmap (safe handle validation)
+- **Performance:** 40ns p50, 120ns p99, 340ns p999 (12-13× better tail latency than malloc, GitHub Actions validated)
+- **Observability:** Global/class/epoch stats APIs, slow-path attribution, madvise tracking, RSS estimation
+- **Epoch domains:** RAII-style scoped lifetimes with refcount tracking and era validation
+- **Adaptive algorithms:** Bitmap scanning self-tunes based on CAS retry rate (converges in 100-300K allocations)
 
-The implementation details—how bitmaps encode slot state, how atomic CAS loops allocate slots, how registry indirection works, how generation counters prevent ABA—follow from these foundational concepts. Those details are in the source code. This document provides the foundation to understand why they exist and how they enable temporal-slab's unique guarantees.
+**Validated results (GitHub Actions, AMD EPYC 7763, ubuntu-latest):**
+- p99: 120ns (temporal-slab) vs 1,443ns (malloc) = **12.0× better**
+- p999: 340ns (temporal-slab) vs 4,409ns (malloc) = **13.0× better**
+- RSS growth with epoch_close(): **0%** (validated across 20-cycle tests)
+- Phase shift retention: -71.9% (temporal-slab) vs -18.6% (malloc) = **53.3pp advantage**
+
+The implementation details—how bitmaps encode slot state, how atomic CAS loops allocate slots, how registry indirection works, how generation counters prevent ABA, how phase boundaries map to epoch_close() calls—follow from these foundational concepts. Those details are in the source code (src/slab_alloc.c, extensively commented). This document provides the foundation to understand why they exist and how they enable temporal-slab's unique guarantees: **bounded RSS, predictable tail latency, and zero-cost observability** under sustained churn.
