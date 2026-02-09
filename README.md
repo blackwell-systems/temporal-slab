@@ -25,7 +25,7 @@ In latency-sensitive systems, these outliers dominate SLA violations, frame drop
 
 **To eliminate:**
 - 1-4µs tail spikes (11-12× reduction at p99-p999, validated on GitHub Actions)
-- Allocator-driven RSS drift (0% vs 11,174% growth)
+- Allocator-driven RSS drift under steady-state churn (0% validated, GitHub Actions)
 - Unpredictable reclamation behavior
 
 ---
@@ -137,7 +137,7 @@ python3 tools/plot_bench.py  # Generate latency/fragmentation charts
   Lock-free allocation with **131ns p99** (11.2× better), **371ns p999** (11.9× better) vs system_malloc under sustained churn. No emergent pathological states. Validated on GitHub Actions ubuntu-latest (AMD EPYC 7763).
 
 * **Stable RSS under sustained churn**  
-  **0–2.4% RSS growth** over 1000 churn cycles vs malloc's unbounded drift (11,174% measured). No surprise reclamation.
+  **0% RSS growth** in steady-state workloads (constant working set, fixed size). Under mixed-workload stress with expanding working sets, both allocators grow substantially; temporal-slab shows 7-8% better discipline. No surprise reclamation.
 
 * **Application-controlled memory lifecycle**  
   `epoch_close()` API for deterministic reclamation at lifetime boundaries. Returns physical pages when *you* decide, not when allocator heuristics trigger.
@@ -324,7 +324,7 @@ make
 temporal-slab delivers three key properties for latency-sensitive workloads:
 
 1. **Eliminates tail latency spikes** - 11-12× better across p99-p999 (GitHub Actions validated)
-2. **Stable RSS under churn** - 0% growth in steady-state (vs 11,174% malloc drift)
+2. **Stable RSS under churn** - 0% growth in steady-state workloads (GitHub Actions validated)
 3. **Predictable trade-offs** - +37% baseline RSS, +29% median latency
 
 **Tail Latency Results (GitHub Actions, 100K obj × 1K cycles, 128-byte objects, 5 trials, Feb 9 2026):**
@@ -340,8 +340,8 @@ temporal-slab delivers three key properties for latency-sensitive workloads:
 
 | Metric | temporal-slab | system_malloc |
 |--------|---------------|---------------|
-| Steady-state RSS growth (100 cycles) | **0%** | 11,174% |
-| Long-term RSS growth (1000 cycles) | 2.4% | Unbounded |
+| Steady-state RSS growth (constant working set) | **0%** | **0%** |
+| Mixed-workload RSS growth (adversarial, 100 cycles) | 1,033% | 1,111% (1.08× worse) |
 | Baseline RSS overhead | +37% | - |
 | Space efficiency | 88.9% | ~85% |
 
