@@ -2,10 +2,10 @@
 
 **temporal-slab is a lifetime-aware slab allocator that treats memory reclamation as a structural property of program phases, not individual object lifetimes.**
 
-It provides predictable allocation latency, bounded RSS under sustained churn, and application-controlled memory reclamation using epoch-based lifetimes.
+It provides predictable allocation latency, bounded RSS under sustained churn, and application-controlled memory reclamation using epoch-based lifetimes — even under pathological workloads.
 
 **temporal-slab is not a general-purpose malloc replacement.**  
-It is designed for systems where worst-case behavior matters more than average speed.
+It is designed for systems where worst-case behavior matters more than average speed, and where allocator-induced latency spikes are unacceptable.
 
 ---
 

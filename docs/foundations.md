@@ -60,6 +60,7 @@ This document builds the theoretical foundation for temporal-slab from first pri
 - [Epoch-Granular Memory Reclamation](#epoch-granular-memory-reclamation)
 - [O(1) Deterministic Class Selection](#o1-deterministic-class-selection)
 - [Branch Prediction and Misprediction](#branch-prediction-and-misprediction)
+- [Tail Latency and Percentiles](#tail-latency-and-percentiles)
 
 **API Design**
 - [Handle-Based API vs Malloc-Style API](#handle-based-api-vs-malloc-style-api)
@@ -1258,7 +1259,29 @@ Epoch 15 (era 15): opened at T=75s, 500 allocations
 Epoch 0 (era 16):  opened at T=80s, 800 allocations  ← Same ID, different era!
 ```
 
-To disambiguate, temporal-slab maintains a monotonic **epoch era counter**:
+To disambiguate, temporal-slab maintains a **monotonic epoch era counter**.
+
+**What is monotonic?**
+
+A monotonic counter is one that always increases and never decreases or wraps around. In contrast to cyclic counters (like the 0-15 epoch ring), monotonic counters grow without bound:
+
+```
+Cyclic counter (ring buffer):
+0 → 1 → 2 → ... → 15 → 0 → 1 → ...  (wraps, repeats values)
+
+Monotonic counter (era):
+0 → 1 → 2 → ... → 15 → 16 → 17 → ... → 2^64-1  (never wraps, never repeats)
+```
+
+**Properties of monotonic counters:**
+- **Always increasing:** `era(t+1) > era(t)` for all time t
+- **Never decreases:** No value appears twice
+- **Never wraps:** With 64 bits, wrapping takes 584 billion years at 1 increment/nanosecond
+- **Total ordering:** Any two eras can be compared (`era_a < era_b` or `era_a > era_b`)
+
+This property is critical for disambiguation: if two events have different era values, you know which happened first and that they're distinct events—even if they have the same ring index.
+
+**Epoch era counter:**
 - Increments on every `epoch_advance()` call (never wraps, 64-bit)
 - Each epoch stores its era when activated
 - Observability tools can distinguish epoch 0 era 0 from epoch 0 era 16
@@ -4025,6 +4048,329 @@ uint8_t select_size_class(size_t size) {
 ```
 
 This is deterministic: always 1 L1 cache access (~4 cycles). No branches, no mispredictions, no jitter. For HFT systems where every nanosecond matters, eliminating branch jitter is critical.
+
+## Tail Latency and Percentiles
+
+Tail latency is the latency experienced by the slowest requests in a system. While average latency measures typical performance, tail latency measures worst-case performance—the requests that take unusually long to complete. For real-time and latency-sensitive systems, tail latency often matters more than average latency.
+
+**Why average latency is misleading:**
+
+```
+Web server processes 10,000 requests:
+- 9,990 requests: 50ns each
+- 10 requests: 10,000ns each (outliers)
+
+Average latency:
+(9,990 × 50ns + 10 × 10,000ns) / 10,000 = 59.95ns
+
+This looks great! But:
+- 99.9% of requests see 50ns (excellent)
+- 0.1% of requests see 10,000ns (catastrophic, 200× slower)
+
+For HFT: A single 10µs spike causes a missed trade worth millions
+For control plane: A single 10ms spike violates SLA, triggers alerts
+```
+
+Average latency hides outliers. A system with "60ns average" could have 50ns typical and 100ms worst-case.
+
+**Percentiles measure tail latency:**
+
+Percentiles describe the distribution of latencies:
+
+- **p50 (median):** 50% of requests complete faster than this
+- **p95:** 95% of requests complete faster than this
+- **p99:** 99% of requests complete faster than this (1 in 100 is slower)
+- **p99.9:** 99.9% of requests complete faster than this (1 in 1,000 is slower)
+- **p99.99:** 99.99% of requests complete faster than this (1 in 10,000 is slower)
+
+**Example distribution:**
+
+```
+Allocator latency measurements (1 million allocations):
+
+p50  = 74ns   ← Half of allocations take ≤74ns
+p95  = 76ns   ← 95% of allocations take ≤76ns
+p99  = 76ns   ← 99% of allocations take ≤76ns
+p99.9 = 166ns ← 99.9% of allocations take ≤166ns
+
+This tells us:
+- Typical case (p50): 74ns
+- Best 95%: Within 76ns (very consistent)
+- Best 99%: Within 76ns (extremely consistent)
+- Worst 0.1%: Up to 166ns (2.2× slower, but still fast)
+```
+
+**Why tail latency matters more than average:**
+
+**1. User experience is dominated by worst case:**
+
+```
+User loads webpage that makes 100 API calls:
+- 99 calls: 10ms each
+- 1 call: 1000ms (p99 tail latency spike)
+
+Page load time: max(all calls) = 1000ms
+User sees: Slow page (1 second delay)
+
+Average latency (19ms) is irrelevant—user experience determined by slowest call
+```
+
+**2. High-frequency systems amplify tail risk:**
+
+```
+HFT system: 10,000 trades per second
+p99.9 = 100µs means 10 trades/second hit 100µs latency
+
+If each spike causes missed trade worth $10K:
+10 spikes/second × $10K = $100K/second lost
+
+Average latency is irrelevant—business impact driven by tail
+```
+
+**3. SLA violations are tail events:**
+
+```
+API SLA: 99.9% of requests complete within 50ms
+
+If p99.9 = 60ms:
+→ SLA violated
+→ Customer refunds triggered
+→ Reputation damage
+
+Average latency could be 5ms (excellent), but p99.9 determines SLA compliance
+```
+
+**Sources of tail latency:**
+
+**1. Garbage collection pauses:**
+```
+Java/Go allocators trigger GC periodically:
+- Typical allocation: 50ns
+- During GC: 10ms pause (all allocations blocked)
+→ p99.9 spikes to 10ms
+```
+
+**2. Lock contention:**
+```
+Mutex-protected allocator:
+- Uncontended: 100ns
+- Contended (8 threads blocked): 5µs (50× slower)
+→ p99 includes contention spikes
+```
+
+**3. Page faults:**
+```
+Allocator mmaps new slab:
+- Cache hit: 50ns
+- Cache miss + mmap: 3µs (60× slower)
+→ p99.9 includes mmap syscall overhead
+```
+
+**4. Cache misses:**
+```
+Metadata scattered across memory:
+- L1 hit: 50ns
+- DRAM miss: 150ns (3× slower)
+→ p95-p99 degraded by cache misses
+```
+
+**5. CPU scheduling:**
+```
+Thread preempted mid-allocation:
+- Typical: 50ns
+- Preempted: 10µs (thread descheduled, rescheduled)
+→ p99.99 includes scheduler jitter
+```
+
+**Why temporal-slab optimizes for tail latency:**
+
+temporal-slab is designed for predictable p99.9 performance:
+
+**Measured tail latency (from benchmarks):**
+```
+100 million allocations, single-threaded:
+p50  = 74ns
+p99  = 76ns   (only 2ns worse than median!)
+p99.9 = 166ns (2.2× median, but still sub-200ns)
+
+This is exceptional consistency—p99 within 3% of p50
+```
+
+**How temporal-slab achieves low tail latency:**
+
+**1. Lock-free fast path (no contention spikes):**
+```
+No mutexes in fast path:
+- Every allocation: Atomic CAS (20-40 cycles)
+- No blocking, no waiting, no contention
+→ p99 and p50 converge (predictable)
+```
+
+**2. Slab cache (no mmap in fast path):**
+```
+Empty slabs cached (32 per size class):
+- Cache hit: 50ns (pop from cache)
+- Cache miss: 3µs (mmap syscall)
+- Cache hit rate: 99%+
+→ p99 avoids mmap overhead
+```
+
+**3. O(1) class selection (no branch misprediction jitter):**
+```
+Lookup table instead of branches:
+- Every allocation: 4 cycles (L1 cache hit)
+- No unpredictable branches
+→ No jitter from size variation
+```
+
+**4. Bounded metadata (cache-friendly):**
+```
+Bitmap per slab (8 bytes):
+- Fits in single cache line
+- No scattered metadata
+→ Consistent L1 hit rate
+```
+
+**Comparing allocators by tail latency:**
+
+| Allocator | p50 | p99 | p99.9 | Tail Behavior |
+|-----------|-----|-----|-------|---------------|
+| **malloc (glibc)** | 80ns | 200ns | 5µs | Lock contention spikes |
+| **tcmalloc** | 60ns | 150ns | 2µs | Thread cache misses |
+| **jemalloc** | 70ns | 180ns | 3µs | Arena lock contention |
+| **temporal-slab** | **74ns** | **76ns** | **166ns** | Consistent (lock-free) |
+
+temporal-slab's p99 is within 3% of p50—this is the definition of predictable latency.
+
+**Why HFT systems care about p99.99:**
+
+```
+HFT trading system:
+- 100,000 decisions per second
+- p99.99 = 1 decision per 10,000 = 10 events per second
+
+If p99.99 = 10µs (missed trading window):
+→ 10 missed trades per second
+→ At $1K per trade: $10K/second opportunity cost
+→ Daily: $864M potential loss
+
+For HFT: p99.99 matters more than average
+```
+
+**Why control planes care about p99.9:**
+
+```
+Kubernetes control plane:
+- 10,000 API requests per second
+- p99.9 = 10 requests per second
+
+If p99.9 > 100ms (SLO violation):
+→ 10 slow requests per second
+→ User perception: "Control plane is slow"
+→ Triggers alerts, investigation overhead
+
+For control plane: p99.9 determines user satisfaction
+```
+
+**Measuring tail latency correctly:**
+
+**Wrong approach (average of maximums):**
+```c
+for (int i = 0; i < 100; i++) {
+    uint64_t max_latency = 0;
+    for (int j = 0; j < 1000; j++) {
+        uint64_t latency = measure_allocation();
+        if (latency > max_latency) max_latency = latency;
+    }
+    printf("Max: %lu ns\n", max_latency);
+}
+// Averages the maximums (wrong!)
+```
+
+This measures the average of worst-case, not the distribution.
+
+**Right approach (percentiles from full distribution):**
+```c
+uint64_t latencies[100000000];  // 100M samples
+
+for (int i = 0; i < 100000000; i++) {
+    latencies[i] = measure_allocation();
+}
+
+sort(latencies);  // Sort ascending
+
+p50  = latencies[50000000];   // 50th percentile
+p99  = latencies[99000000];   // 99th percentile
+p999 = latencies[99900000];   // 99.9th percentile
+```
+
+This captures the true distribution, including all outliers.
+
+**Tail latency as a system property:**
+
+Tail latency is not just about individual components—it compounds:
+
+```
+Request flow:
+1. Load balancer: p99 = 1ms
+2. API gateway: p99 = 2ms
+3. Application: p99 = 5ms
+4. Database: p99 = 10ms
+5. Cache: p99 = 0.5ms
+
+Overall p99 ≥ max(1, 2, 5, 10, 0.5) = 10ms
+
+If components are independent:
+Overall p99 ≈ sum of p99s (worst case)
+         = 18.5ms
+
+1% of requests hit worst case in EVERY component
+```
+
+Reducing tail latency in any component improves overall system p99.
+
+**The tail latency tax:**
+
+In distributed systems, tail latency is amplified:
+
+```
+Fan-out query (1 request → 100 parallel backend calls):
+
+If each backend has p99 = 10ms:
+- Probability all 100 finish in <10ms: 0.99^100 = 36.6%
+- Probability at least one takes >10ms: 63.4%
+
+→ Overall p50 (median) is worse than backend p99!
+
+With 100 parallel calls, backend p99 becomes frontend p50
+```
+
+This is the "tail latency amplification" problem—systems with fan-out must optimize backend p99.9 to achieve acceptable frontend p50.
+
+**temporal-slab's tail latency guarantee:**
+
+```
+Under single-threaded load:
+p99 within 3% of p50 (74ns → 76ns)
+
+Under multi-threaded load (4 threads):
+p99 within 20% of p50 (82ns → 95ns)
+
+No GC pauses, no lock contention, no unbounded jitter
+→ Predictable tail behavior suitable for real-time systems
+```
+
+**When to optimize for tail latency:**
+
+| System Type | Metric Priority | Why |
+|-------------|----------------|-----|
+| **HFT trading** | p99.99 | Single spike = missed trade worth $$$$ |
+| **Real-time control** | p99.9 | Deadline miss = system failure |
+| **User-facing API** | p99 | Slow requests = poor UX |
+| **Batch processing** | p50 (average) | Total throughput matters, not outliers |
+| **Background jobs** | p50 (average) | No user waiting, optimize for throughput |
+
+If humans or SLAs are waiting, optimize for tail latency. If throughput is the goal, average latency is sufficient.
 
 ## Handle-Based API vs Malloc-Style API
 
