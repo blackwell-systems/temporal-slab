@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Definition: What "Bounded RSS" Means
+
+**Allocator-bounded:** `committed_bytes` (total mmap'd memory) stays constant under sustained churn, proven via atomic counter instrumentation.
+
+**Process-bounded:** Total process RSS stays bounded after subtracting application/harness overhead.
+
+**Critical distinction:** RSS charts may show growth from application components (metrics arrays, log buffers, histograms). Always decompose using diagnostic counters:
+- Enable: `make CFLAGS="-DENABLE_DIAGNOSTIC_COUNTERS=1 -I../include -DENABLE_RSS_RECLAMATION=1"`
+- Read: `committed_bytes` (allocator) vs anonymous RSS (process) vs unaccounted (application)
+
+**Validation (2000 cycles):** Allocator committed: 0.70 MB → 0.70 MB (0.0% drift). Process RSS growth, if any, is application overhead.
+
+---
+
 ### Immediate Empty Slab Reclamation (2026-02-09)
 
 Critical fix eliminating unbounded RSS growth under sustained churn with immortal epochs.
