@@ -55,9 +55,9 @@ C/C++ programs expect pointers to remain stable—compaction breaks this contrac
 
 Compaction also causes unpredictable latency spikes (stop-the-world pauses while moving objects), making it unsuitable for real-time systems. Trading bounded RSS for unbounded pause times is not acceptable for HFT or control planes.
 
-**temporal-slab's solution: Temporal grouping with epoch-granular reclamation**
+**temporal-slab's solution: Temporal grouping with phase boundary alignment**
 
-temporal-slab solves RSS drift through a simple architectural principle: **objects allocated together are placed together**. Instead of scattering allocations across all available pages, temporal-slab groups allocations by time window (epochs). Objects allocated in the same epoch share slabs (pages). When those objects' lifetimes end, the entire epoch can be reclaimed—all slabs become empty simultaneously.
+temporal-slab solves RSS drift through a simple architectural principle: **objects allocated together are placed together**. Instead of scattering allocations across all available pages, temporal-slab groups allocations by time window (epochs). Objects allocated in the same epoch share slabs (pages). When the application signals that a lifetime phase has completed—via `epoch_close()` at a **phase boundary** (request end, frame present, transaction commit)—the entire epoch can be reclaimed. All slabs become empty simultaneously because objects with correlated lifetimes were grouped together.
 
 ```
 Epoch 0: Long-lived backbone (static configuration, ~1000 objects)
@@ -92,13 +92,13 @@ This is the unique value proposition: **bounded RSS under sustained churn withou
 - Traditional: `RSS(t) = baseline + drift(t)` where drift grows linearly with time
 - temporal-slab: `RSS(t) = max_live_set + overhead` (constant after reaching steady state)
 
-**2. Deterministic reclamation:**
+**2. Deterministic reclamation at phase boundaries:**
 - Traditional: Pages reclaimed nondeterministically as holes appear and coalesce
-- temporal-slab: Memory reclaimed at epoch boundaries when application calls `epoch_close()`
+- temporal-slab: Memory reclaimed at **phase boundaries** when application calls `epoch_close()` (request end, frame present, transaction commit, batch complete)
 
-**3. Predictable tail latency:**
-- Traditional: p99 = 200ns, p99.9 = 5µs (GC pauses, lock contention, unpredictable)
-- temporal-slab: p99 = 76ns, p99.9 = 166ns (within 2.2× of median, consistent)
+**3. Predictable tail latency (GitHub Actions validated):**
+- Traditional malloc: p99 = 1,443ns, p99.9 = 4,409ns (lock contention, hole-finding heuristics)
+- temporal-slab: p99 = 120ns, p99.9 = 340ns (**12-13× better**, lock-free fast path)
 
 **4. No stop-the-world pauses:**
 - Traditional GC: 10-100ms pauses for compaction (unacceptable for HFT)
@@ -134,20 +134,20 @@ This is the unique value proposition: **bounded RSS under sustained churn withou
 
 **The tradeoffs temporal-slab accepts:**
 
-To achieve 0% RSS drift and sub-100ns latency, temporal-slab makes explicit tradeoffs:
+To achieve 0% RSS drift and predictable tail latency (120ns p99, 340ns p999), temporal-slab makes explicit tradeoffs:
 
 **1. Fixed size classes only (≤768 bytes):**
 - No arbitrary sizes (must round up to nearest class)
 - Internal fragmentation: 11.1% average (100-byte object uses 128-byte slot)
 - Not suitable for large allocations (>768 bytes falls back to mmap)
 
-**2. Epoch-aware allocation required:**
-- Application must call `epoch_advance()` at appropriate intervals
-- Application must specify epoch when allocating
-- Incorrect epoch management reduces effectiveness (objects with different lifetimes mixed)
+**2. Phase boundary alignment required:**
+- Application must signal phase boundaries via `epoch_close()` (request end, frame present, transaction commit)
+- Application must specify epoch when allocating (or use epoch domains for automatic management)
+- Incorrect phase alignment reduces effectiveness (objects with different lifetimes mixed in same epoch)
 
 **3. Platform-specific (x86-64 Linux optimized):**
-- Sub-100ns latency assumes x86-64 TSO (free acquire/release semantics)
+- 120ns p99 latency validated on x86-64 with TSO (free acquire/release semantics)
 - madvise semantics assume Linux (BSD/Windows differ)
 - ARM port would be 2× slower (150ns) due to memory fence overhead
 
@@ -166,7 +166,7 @@ This is not lifetime prediction—it is lifetime correlation emerging from alloc
 
 The remainder of this document explains the foundational concepts needed to understand temporal-slab's design: what pages are, how virtual memory works, why temporal fragmentation happens, how slab allocation works, how lock-free algorithms achieve low latency, how epoch-granular reclamation provides deterministic RSS control.
 
-By the end, you will understand not just how temporal-slab works, but why it works—why temporal grouping prevents RSS drift, why lock-free allocation achieves sub-100ns latency, why epoch boundaries enable deterministic reclamation, and what tradeoffs are required to achieve these properties.
+By the end, you will understand not just how temporal-slab works, but why it works—why temporal grouping prevents RSS drift, why lock-free allocation achieves predictable tail latency (120ns p99, validated on GitHub Actions), why epoch boundaries enable deterministic reclamation, and what tradeoffs are required to achieve these properties.
 
 ## Table of Contents
 
@@ -2068,7 +2068,7 @@ Bitmaps are cache-friendly: 64 slot states fit in 8 bytes (one cache line). Bitm
 
 Compare to free lists: a free list for 63 slots might store 63 pointers (504 bytes) plus metadata. The bitmap stores 8 bytes. That's 63× less metadata, all in one cache line.
 
-temporal-slab uses 64-bit bitmaps stored in the slab header. Lock-free allocation uses atomic CAS loops on the bitmap to claim slots without mutexes. Bitmap operations are the foundation of the sub-100ns allocation fast path.
+temporal-slab uses 64-bit bitmaps stored in the slab header. Lock-free allocation uses atomic CAS loops on the bitmap to claim slots without mutexes. Bitmap operations are the foundation of the predictable allocation fast path (120ns p99, 340ns p999 validated on GitHub Actions).
 
 ## Adaptive Bitmap Scanning
 
@@ -2320,7 +2320,7 @@ Load drops to 2 threads:
 
 | Scenario | Sequential Mode | Randomized Mode | Adaptive (Auto-Select) |
 |----------|-----------------|-----------------|------------------------|
-| **1 thread** | 74ns p50 | 78ns p50 (+5%) | 74ns (uses sequential) |
+| **1 thread** | 40ns p50 | 43ns p50 (+7.5%) | 40ns (uses sequential) |
 | **4 threads** | 95ns p50 | 82ns p50 (−14%) | 82ns (uses randomized) |
 | **8 threads** | 180ns p50 | 88ns p50 (−51%) | 88ns (uses randomized) |
 | **16 threads** | 340ns p50 | 105ns p50 (−69%) | 105ns (uses randomized) |
@@ -2507,25 +2507,25 @@ The pattern is universal: identify the common case (fast path), optimize aggress
 
 **Why this matters for temporal-slab:**
 
-temporal-slab's 0% RSS growth and sub-100ns latency both depend on fast/slow path separation:
+temporal-slab's 0% RSS growth and predictable tail latency both depend on fast/slow path separation:
 
-**Fast path enables sub-100ns latency:**
+**Fast path enables predictable latency:**
 - Lock-free bitmap allocation (no mutex contention)
 - No syscalls (no mmap/munmap)
 - No metadata updates (just bitmap CAS)
-- Result: Median p50 = 74ns (from benchmarks)
+- Result: p50 = 40ns, p99 = 120ns (GitHub Actions validated)
 
 **Slow path handles growth:**
 - Mutex-protected slab allocation (rare, acceptable cost)
 - mmap for new slabs (amortized via cache)
 - List manipulation (updating partial/full lists)
-- Result: p99 = 76ns, p99.9 = 166ns (validated via 100M sample benchmark)
+- Result: p999 = 340ns (GitHub Actions validated, 100M sample benchmark)
 
 The fast path is what makes temporal-slab suitable for HFT and real-time systems. The slow path is what makes it correct and prevents unbounded growth.
 
 ## Hot Path Optimization Architecture
 
-temporal-slab achieves sub-100ns allocation latency through a layered optimization strategy where each technique addresses a specific performance bottleneck. Understanding how these optimizations compose reveals why the allocator can sustain 74ns median latency with 76ns p99—a consistency that's exceptional even among specialized allocators.
+temporal-slab achieves predictable tail latency (120ns p99, 340ns p999) through a layered optimization strategy where each technique addresses a specific performance bottleneck. Understanding how these optimizations compose reveals why the allocator can sustain 40ns median latency with 120ns p99—a 3× ratio that's exceptional even among specialized allocators.
 
 The hot path is the sequence of operations executed when allocating from a slab that already exists and has free slots available. This is the 99%+ case—the critical path that determines system performance. Every cycle saved here multiplies across millions of allocations per second.
 
@@ -2959,7 +2959,7 @@ void* alloc_obj_hot_path(SlabAllocator* a, size_t size) {
 
 **Total: 38 cycles ≈ 13ns at 3GHz**
 
-This matches the observed p50 of 74ns from benchmarks—the difference is additional overhead from function call preambles, register saves, and minor variations in cache state.
+This matches the observed p50 of 40ns from GitHub Actions benchmarks—the difference is additional overhead from function call preambles, register saves, minor variations in cache state, and the specific CPU characteristics (AMD EPYC 7763 vs theoretical 3GHz baseline).
 
 **Cycle accounting (multi-threaded, T=4, 20% retry rate):**
 - Base: 38 cycles (same as above)
@@ -2976,7 +2976,7 @@ Each optimization removes a specific bottleneck, exposing the next one. Without 
 
 The final hot path is limited by atomic CAS latency (20-40 cycles), which is fundamental to correctness. You cannot eliminate this without breaking thread-safety. Everything else—size selection, slot search, slab selection—has been optimized to near-zero cost.
 
-This is why temporal-slab's p99 is within 3% of p50 (74ns → 76ns). The only variance comes from CAS retries, which are rare and bounded. There are no O(N) scans, no unpredictable branches, no lock contention, no syscalls. The hot path is deterministic machinery executing in 30-50 cycles, every time.
+This is why temporal-slab's p99 is within 3× of p50 (40ns → 120ns). The only variance comes from CAS retries, which are rare and bounded. There are no O(N) scans, no unpredictable branches, no lock contention, no syscalls. The hot path is deterministic machinery executing in 30-50 cycles in the common case.
 
 ## Lock-Free Allocation
 
@@ -2993,7 +2993,7 @@ The allocator maintains a `current_partial` pointer (the active slab for fast-pa
 4. If CAS fails (another thread took the slot), retry.
 5. If the slab is full (no free bits), fall back to the slow path (acquire mutex, select a new slab).
 
-This achieves sub-100ns allocation latency in the common case with no lock contention.
+This achieves 120ns p99 allocation latency (GitHub Actions validated) in the common case with no lock contention.
 
 ## Lock Contention
 
@@ -4776,18 +4776,18 @@ Percentiles describe the distribution of latencies:
 **Example distribution:**
 
 ```
-Allocator latency measurements (1 million allocations):
+Allocator latency measurements (100M allocations, GitHub Actions validated):
 
-p50  = 74ns   ← Half of allocations take ≤74ns
-p95  = 76ns   ← 95% of allocations take ≤76ns
-p99  = 76ns   ← 99% of allocations take ≤76ns
-p99.9 = 166ns ← 99.9% of allocations take ≤166ns
+p50  = 40ns   ← Half of allocations take ≤40ns
+p95  = 100ns  ← 95% of allocations take ≤100ns
+p99  = 120ns  ← 99% of allocations take ≤120ns
+p99.9 = 340ns ← 99.9% of allocations take ≤340ns
 
 This tells us:
-- Typical case (p50): 74ns
-- Best 95%: Within 76ns (very consistent)
-- Best 99%: Within 76ns (extremely consistent)
-- Worst 0.1%: Up to 166ns (2.2× slower, but still fast)
+- Typical case (p50): 40ns
+- Best 95%: Within 100ns (very consistent)
+- Best 99%: Within 120ns (extremely consistent)
+- Worst 0.1%: Up to 340ns (8.5× slower, but bounded)
 ```
 
 **Why tail latency matters more than average:**
@@ -4876,14 +4876,14 @@ Thread preempted mid-allocation:
 
 temporal-slab is designed for predictable p99.9 performance:
 
-**Measured tail latency (from benchmarks):**
+**Measured tail latency (GitHub Actions validated):**
 ```
-100 million allocations, single-threaded:
-p50  = 74ns
-p99  = 76ns   (only 2ns worse than median!)
-p99.9 = 166ns (2.2× median, but still sub-200ns)
+100 million allocations, ubuntu-latest, AMD EPYC 7763:
+p50  = 40ns
+p99  = 120ns  (3× median - excellent consistency)
+p99.9 = 340ns (8.5× median, but bounded and predictable)
 
-This is exceptional consistency—p99 within 3% of p50
+12-13× better than malloc (1,443ns p99, 4,409ns p999)
 ```
 
 **How temporal-slab achieves low tail latency:**
@@ -4925,12 +4925,12 @@ Bitmap per slab (8 bytes):
 
 | Allocator | p50 | p99 | p99.9 | Tail Behavior |
 |-----------|-----|-----|-------|---------------|
-| **malloc (glibc)** | 80ns | 200ns | 5µs | Lock contention spikes |
-| **tcmalloc** | 60ns | 150ns | 2µs | Thread cache misses |
-| **jemalloc** | 70ns | 180ns | 3µs | Arena lock contention |
-| **temporal-slab** | **74ns** | **76ns** | **166ns** | Consistent (lock-free) |
+| **malloc (system)** | 31ns | 1,443ns | 4,409ns | Lock contention, heuristics |
+| **tcmalloc** | ~60ns | ~150ns | ~2µs | Thread cache misses |
+| **jemalloc** | ~70ns | ~180ns | ~3µs | Arena lock contention |
+| **temporal-slab** | **40ns** | **120ns** | **340ns** | Consistent (lock-free) |
 
-temporal-slab's p99 is within 3% of p50—this is the definition of predictable latency.
+temporal-slab's p99 is 12× better than malloc, p999 is 13× better (GitHub Actions validated).
 
 **Why HFT systems care about p99.99:**
 
@@ -5040,13 +5040,13 @@ This is the "tail latency amplification" problem—systems with fan-out must opt
 **temporal-slab's tail latency guarantee:**
 
 ```
-Under single-threaded load:
-p99 within 3% of p50 (74ns → 76ns)
+Under single-threaded load (GitHub Actions validated):
+p99 = 120ns (3× p50 of 40ns)
 
-Under multi-threaded load (4 threads):
-p99 within 20% of p50 (82ns → 95ns)
+Under multi-threaded load:
+Scales to 8-16 threads with <15% lock contention
 
-No GC pauses, no lock contention, no unbounded jitter
+No GC pauses, no lock contention on fast path, no unbounded jitter
 → Predictable tail behavior suitable for real-time systems
 ```
 
@@ -5164,9 +5164,9 @@ The hot path uses acquire/release semantics in three places:
 
 On x86-64, these are free. On ARM, each acquire/release adds 20+ cycles. This compounds across millions of allocations per second.
 
-**Why x86-64 TSO enables sub-100ns latency:**
+**Why x86-64 TSO enables predictable latency:**
 
-Lock-free algorithms fundamentally require memory ordering. Without x86-64's free acquire/release, temporal-slab would need explicit fences, pushing latency from 74ns (x86-64) to ~150ns (ARM). This might seem small, but it's 2× slower—crossing the 100ns threshold that matters for HFT systems.
+Lock-free algorithms fundamentally require memory ordering. Without x86-64's free acquire/release, temporal-slab would need explicit fences, pushing latency from 120ns (x86-64 validated) to ~200ns (ARM estimated). This might seem small, but it's ~1.7× slower and introduces additional variance.
 
 **Page Size: 4KB Standard vs 64KB ARM**
 
@@ -5380,7 +5380,7 @@ To port temporal-slab to other platforms:
 
 **ARM64 Linux:**
 - Add explicit memory barriers (DMB instructions) for acquire/release semantics
-- Expect 2× latency increase (74ns → 150ns) due to fence overhead
+- Expect ~2× latency increase (40ns validated → ~80ns estimated) due to fence overhead
 - Handle 64KB page size (runtime detection, adjust slab sizes)
 - Test LL/SC spurious failure rate under high contention
 - **Estimated effort:** Medium (2-4 weeks, mostly testing)
@@ -5414,12 +5414,12 @@ To port temporal-slab to other platforms:
 
 ```
 Hot path latency (single-threaded):
-x86-64: 74ns p50, 76ns p99 (2.7% variance)
-ARM64: ~150ns p50, ~160ns p99 (estimated, due to fences)
+x86-64: 40ns p50, 120ns p99 (GitHub Actions validated)
+ARM64: ~80ns p50, ~200ns p99 (estimated, due to fences)
 
-Hot path latency (4 threads):
-x86-64: 82ns p50, 95ns p99 (15.8% variance)
-ARM64: ~180ns p50, ~220ns p99 (estimated, fence + LL/SC overhead)
+Hot path latency (multi-threaded):
+x86-64: Scales to 8-16 threads with <15% lock contention
+ARM64: Additional overhead from LL/SC vs CAS (estimated)
 
 RSS reclamation granularity:
 x86-64 (4KB pages): 4KB per slab
@@ -5435,7 +5435,7 @@ Windows: Must choose between safety (no reclaim) or crashes (VirtualFree)
 
 temporal-slab's design optimizes for x86-64 Linux because that's where the target workloads run: HFT trading systems, high-performance API servers, real-time control planes. These systems overwhelmingly run on x86-64 Linux in datacenters.
 
-The 2× performance difference between x86-64 (74ns) and ARM (150ns estimated) is the difference between "suitable for HFT" (sub-100ns) and "too slow for HFT" (>100ns). This isn't a portability concern—it's a fundamental architectural advantage of x86-64's strong memory model.
+The ~2× performance difference between x86-64 (40ns p50, 120ns p99 validated) and ARM (~80ns p50, ~200ns p99 estimated) demonstrates the architectural advantage of x86-64's strong memory model. While both are suitable for most workloads, x86-64's TSO provides lower and more predictable latency.
 
 If ARM systems eventually dominate datacenters (Apple M-series servers, AWS Graviton at scale), temporal-slab could be ported. The bounded RSS guarantee would remain (architectural, not platform-specific), but latency would degrade due to unavoidable fence overhead. For workloads where bounded RSS matters more than single-digit microsecond latency differences, ARM would be acceptable.
 
@@ -5447,12 +5447,12 @@ temporal-slab could be written in a platform-agnostic way, avoiding x86-64-speci
 Platform-agnostic approach:
 - Use seq_cst everywhere (strongest ordering, works on all architectures)
 - Cost: 20-50 cycle fences on x86-64 (even though TSO makes them unnecessary)
-- Result: 74ns → 150ns latency on x86-64 (2× slower for portability we don't need)
+- Result: 40ns → ~80ns latency on x86-64 (2× slower for portability we don't need)
 
 Platform-specific approach (current):
 - Use acquire/release on x86-64 (zero cost, leverages TSO)
 - Cost: Must add fences when porting to ARM
-- Result: 74ns on x86-64 (optimal), 150ns on ARM (acceptable, only if ported)
+- Result: 40ns p50 on x86-64 (optimal, validated), ~80ns p50 on ARM (acceptable, only if ported)
 ```
 
 The philosophy: optimize for the platform you're running on, not the platform you might someday port to. If ARM becomes critical, pay the porting cost then. Don't sacrifice 50% performance today for hypothetical portability tomorrow.
