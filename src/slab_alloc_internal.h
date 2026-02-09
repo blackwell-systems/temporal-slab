@@ -240,6 +240,11 @@ struct SizeClassAlloc {
   _Atomic uint64_t madvise_bytes;               /* Total bytes madvised */
   _Atomic uint64_t madvise_failures;            /* madvise() system call failures */
   
+  /* Diagnostic counters for RSS analysis (added for sustained_phase_shifts debugging) */
+  _Atomic uint64_t committed_bytes;             /* Total bytes mmap'd (slabs * SLAB_PAGE_SIZE) */
+  _Atomic uint64_t live_bytes;                  /* Bytes currently allocated to live objects */
+  _Atomic uint64_t empty_slabs;                 /* Number of slabs currently empty (all slots free) */
+  
   /* Phase 2.1: Epoch-close telemetry */
   _Atomic uint64_t epoch_close_calls;           /* How many times epoch_close() called */
   _Atomic uint64_t epoch_close_scanned_slabs;   /* Total slabs scanned for reclaimable */

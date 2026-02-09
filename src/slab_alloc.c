@@ -1452,64 +1452,53 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   uint32_t new_fc = prev_fc + 1;  /* New free_count after our free */
 
   /* Check if slab just became fully empty (all slots free).
-   * Empty slabs are recycled differently based on epoch state:
-   * - ACTIVE epochs: Keep empty slabs on partial list (fast reuse, stable RSS)
-   * - CLOSING epochs: Recycle to cache immediately (triggers madvise, RSS drops)
    * 
-   * This makes epoch_close() the explicit RSS reclamation boundary. */
+   * Option C fix: ALWAYS reclaim empty slabs immediately, regardless of epoch state.
+   * This eliminates the "immortal epoch prevents reclamation" pathology.
+   * 
+   * Safe because:
+   * - Each slab is independently mmap'd (one mmap per 4KB page)
+   * - madvise(MADV_DONTNEED) zeros pages but preserves mapping
+   * - Re-use is safe (just causes zero-fill fault on next access)
+   * - cache_push() handles madvise and updates RSS reclamation counters
+   */
   if (new_fc == s->object_count) {
     LOCK_WITH_PROBE(&sc->lock, sc);  /* Need mutex to mutate lists */
     
-    uint32_t epoch_state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_relaxed);
-    bool became_empty = (prev_fc == s->object_count - 1);  /* Transition: one-away → fully empty */
+    /* Remove from whichever list it's on (FULL or PARTIAL) */
+    if (s->list_id == SLAB_LIST_FULL) {
+      list_remove(&es->full, s);
+    } else if (s->list_id == SLAB_LIST_PARTIAL) {
+      list_remove(&es->partial, s);
+      /* Decrement empty counter since we're removing this empty slab */
+      atomic_fetch_sub_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
+    }
     
-    if (epoch_state == EPOCH_CLOSING) {
-      /* CLOSING epoch: aggressively recycle empty slabs.
-       * Remove from whichever list it's on (FULL or PARTIAL). */
-      if (s->list_id == SLAB_LIST_FULL) {
-        list_remove(&es->full, s);
-      } else if (s->list_id == SLAB_LIST_PARTIAL) {
-        list_remove(&es->partial, s);
-        /* Decrement empty counter since we're removing this empty slab */
-        atomic_fetch_sub_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
-      }
+    /* Ensure slab is not published to current_partial.
+     * Another thread might be loading it right now—nulling is best-effort. */
+    atomic_fetch_add_explicit(&sc->current_partial_cas_attempts, 1, memory_order_relaxed);
+    Slab* expected = s;
+    bool swapped = atomic_compare_exchange_strong_explicit(
+        &es->current_partial, &expected, NULL,
+        memory_order_release, memory_order_relaxed);
+    if (!swapped) {
+      atomic_fetch_add_explicit(&sc->current_partial_cas_failures, 1, memory_order_relaxed);
+    }
+    
+    /* Recycle slab to cache immediately. This triggers madvise(MADV_DONTNEED),
+     * returning physical pages to OS and dropping RSS.
+     * 
+     * Trade-off: Slight latency cost on slab reuse (~5µs zero-fill overhead).
+     * Benefit: RSS drops continuously instead of only at epoch_close() boundaries.
+     */
+    if (s->list_id != SLAB_LIST_NONE) {
+      s->list_id = SLAB_LIST_NONE;
+      sc->total_slabs--;
+      pthread_mutex_unlock(&sc->lock);
       
-      /* Ensure slab is not published to current_partial.
-       * Another thread might be loading it right now—nulling is best-effort. */
-      atomic_fetch_add_explicit(&sc->current_partial_cas_attempts, 1, memory_order_relaxed);
-      Slab* expected = s;
-      bool swapped = atomic_compare_exchange_strong_explicit(
-          &es->current_partial, &expected, NULL,
-          memory_order_release, memory_order_relaxed);
-      if (!swapped) {
-        atomic_fetch_add_explicit(&sc->current_partial_cas_failures, 1, memory_order_relaxed);
-      }
-      
-      /* Recycle slab to cache. This is safe because:
-       * 1. Slab is no longer on any list (removed above)
-       * 2. We nulled current_partial (best-effort)
-       * 3. Conservative recycling: we only recycle FULL slabs (but CLOSING overrides)
-       */
-      if (s->list_id != SLAB_LIST_NONE) {
-        s->list_id = SLAB_LIST_NONE;
-        sc->total_slabs--;
-        pthread_mutex_unlock(&sc->lock);
-        
-        /* Push to cache. cache_push() will madvise the slab,
-         * returning physical pages to OS and dropping RSS. */
-        cache_push(sc, s);
-        return true;
-      }
-    } else {
-      /* ACTIVE epoch: keep empty slabs hot for fast reuse.
-       * Don't recycle them—they'll likely be refilled soon under churn.
-       * This keeps RSS stable and latency low (no page faults on reuse). */
-      
-      if (became_empty && s->list_id == SLAB_LIST_PARTIAL) {
-        /* Slab just became empty but stays on partial list. Increment empty counter
-         * so stats can report how many empty slabs are available. */
-        atomic_fetch_add_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
-      }
+      /* Push to cache. cache_push() calls madvise(), updates madvise_* counters. */
+      cache_push(sc, s);
+      return true;
     }
     
     pthread_mutex_unlock(&sc->lock);
