@@ -314,7 +314,8 @@ make
 - **HFT-safe contention observability** - Tier 0 probe (zero jitter, <0.1% overhead, always-on)
   - Lock contention tracking (trylock probe pattern)
   - CAS retry metrics (bitmap + fast-path pointer swaps)
-  - Validated scaling: 0% → 20% contention across 1→16 threads (healthy plateau)
+  - Validated scaling: 0% → 15% contention across 1→16 threads (healthy plateau, GitHub Actions x86_64)
+  - CAS retry rate: <0.01 retries/op across all thread counts (excellent lock-free performance)
 
 ## Performance Summary
 

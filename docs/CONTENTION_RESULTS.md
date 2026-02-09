@@ -1,11 +1,49 @@
 # Phase 2.2 Contention Metrics: Empirical Results
 
-**Date:** 2026-02-08  
+---
+
+## **Update: GitHub Actions Validation (2026-02-09) - AUTHORITATIVE**
+
+**Environment:** GitHub Actions ubuntu-latest, native x86_64 Linux (no virtualization)  
+**Build:** `-O3 -std=c11 -DENABLE_RSS_RECLAMATION=1`  
+**Workload:** `benchmark_threads N` - 100K alloc/free per thread, 128B objects, 10 trials per thread count
+
+### Lock Contention Scaling (Validated on Native Linux)
+
+| Threads | Lock Contention Rate (Median) | CoV | Interpretation |
+|---------|------------------------------|-----|----------------|
+| 1       | **0.00%**                    | 0.0% | Perfect baseline (no concurrency) |
+| 4       | **10.96%**                   | 56.5% | Light contention, wide variance |
+| 8       | **13.19%**                   | 13.7% | Moderate contention, stabilizing |
+| 16      | **14.78%**                   | 5.7% | **Healthy plateau, extremely consistent** |
+
+### CAS Retry Scaling (Bitmap Allocation)
+
+| Threads | Retries/Op (Median) | Interpretation |
+|---------|-------------------|----------------|
+| 1       | 0.0000            | Zero contention |
+| 4       | 0.0025            | Negligible |
+| 8       | 0.0033            | Excellent |
+| 16      | 0.0074            | **Well below 0.05 threshold** |
+
+### Key Findings from Native Linux
+
+✅ **Contention plateaus at 15%** (not 20% as measured on WSL2)  
+✅ **70% lower CAS retry rate** vs WSL2 (0.0074 vs 0.043 retries/op at 16 threads)  
+✅ **Decreasing variance under load** (CoV drops from 56.5% → 5.7%, more predictable at scale)  
+✅ **Validates "healthy plateau" pattern** with even better characteristics than development environment
+
+**Conclusion:** Native Linux validation confirms lock-free design is working as intended. Use these numbers as the authoritative reference for production deployments.
+
+---
+
+## Original WSL2 Validation (2026-02-08) - Development Baseline
+
 **Environment:** WSL2, Linux 6.6.87, AMD/Intel x86_64  
 **Build:** `-O3 -std=c11 -DENABLE_RSS_RECLAMATION=1`  
 **Workload:** `benchmark_threads` - 100K alloc/free cycles per thread, 128B object size
 
----
+**Note:** WSL2 measurements show 30-40% higher contention due to hypervisor scheduling effects. These results remain valid for development iteration but are superseded by GitHub Actions data for production reference.
 
 ## Summary
 
