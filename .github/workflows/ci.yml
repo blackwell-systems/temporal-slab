@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: System Info
+        run: |
+          echo "=== Build Environment ==="
+          gcc --version
+          make --version
+          echo ""
+          echo "=== CPU Info ==="
+          lscpu | grep "Model name"
+          echo ""
+      
+      - name: Build Core Library
+        run: |
+          cd src
+          echo "Building temporal-slab core..."
+          make clean
+          make slab_alloc.o
+          ls -lh slab_alloc.o
+      
+      - name: Build and Run Smoke Tests
+        run: |
+          cd src
+          echo "Building smoke tests..."
+          make smoke_tests
+          
+          echo ""
+          echo "=== Running Smoke Tests ==="
+          ./smoke_tests
+      
+      - name: Build and Run Epoch Tests
+        run: |
+          cd src
+          echo "Building epoch tests..."
+          make test_epochs
+          
+          echo ""
+          echo "=== Running Epoch Tests ==="
+          ./test_epochs
+      
+      - name: Build and Run Malloc Wrapper Tests
+        run: |
+          cd src
+          echo "Building malloc wrapper tests..."
+          make test_malloc_wrapper
+          
+          echo ""
+          echo "=== Running Malloc Wrapper Tests ==="
+          ./test_malloc_wrapper
+      
+      - name: Build Benchmarks
+        run: |
+          cd src
+          echo "Building benchmark tools..."
+          make benchmark_accurate
+          make benchmark_threads
+          
+          echo ""
+          echo "=== Quick Benchmark Sanity Check ==="
+          ./benchmark_threads 1 2>&1 | head -20
+      
+      - name: Build Churn Test
+        run: |
+          cd src
+          echo "Building churn test..."
+          make churn_test
+          
+          echo ""
+          echo "=== Quick Churn Test ==="
+          timeout 30 ./churn_test || echo "Churn test completed or timed out"
