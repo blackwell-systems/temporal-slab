@@ -118,6 +118,11 @@ void slab_stats_class(SlabAllocator* alloc, uint32_t size_class, SlabClassStats*
   out->scan_adapt_switches = atomic_load_explicit(&sc->scan_adapt.switches, memory_order_relaxed);
   out->scan_mode = atomic_load_explicit(&sc->scan_adapt.mode, memory_order_relaxed);
   
+  /* Phase 3: Live vs committed diagnostics */
+  out->committed_bytes = atomic_load_explicit(&sc->committed_bytes, memory_order_relaxed);
+  out->live_bytes = atomic_load_explicit(&sc->live_bytes, memory_order_relaxed);
+  out->empty_slabs_count = atomic_load_explicit(&sc->empty_slabs, memory_order_relaxed);
+  
   /* Phase 2.2: Compute derived contention metrics (avoid divide by zero) */
   if (out->bitmap_alloc_attempts > 0) {
     out->avg_alloc_cas_retries_per_attempt = (double)out->bitmap_alloc_cas_retries / out->bitmap_alloc_attempts;
