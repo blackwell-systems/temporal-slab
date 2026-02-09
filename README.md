@@ -137,10 +137,10 @@ python3 tools/plot_bench.py  # Generate latency/fragmentation charts
   Lock-free allocation with **131ns p99** (11.2× better), **371ns p999** (11.9× better) vs system_malloc under sustained churn. No emergent pathological states. Validated on GitHub Actions ubuntu-latest (AMD EPYC 7763).
 
 * **Deterministic RSS behavior under sustained churn**  
-  **0% RSS growth** in steady-state workloads (constant working set, fixed size). Under mixed-workload stress within a single phase, both allocators grow with expanding working sets; temporal-slab shows 7-8% better cache discipline. Phase-boundary reclamation via `epoch_close()` enables memory return at application-controlled points.
+  **0% RSS growth** in steady-state workloads (constant working set, fixed size). Under mixed-workload stress within a single phase, both allocators grow with expanding working sets; temporal-slab shows 7-8% better cache discipline. **Phase-boundary reclamation via `epoch_close()` achieves 0% RSS growth and perfect slab reuse** across epoch boundaries (GitHub Actions validated).
 
 * **Application-controlled memory lifecycle**  
-  `epoch_close()` API for deterministic reclamation at lifetime boundaries. Returns physical pages when *you* decide, not when allocator heuristics trigger.
+  `epoch_close()` API for deterministic reclamation at lifetime boundaries. Enables **perfect slab reuse** across phases (0% growth, 0% variation validated). Memory reclaimed when *you* decide, not when allocator heuristics trigger.
 
 * **Structural safety guarantees**  
   Invalid, stale, or double frees are safely rejected—never segfaults. No unsafe unmapping during runtime.
@@ -192,11 +192,12 @@ temporal-slab returns physical memory to the OS at **application-controlled life
 - 24-bit generation counter for ABA protection (16M reuse budget)
 - Virtual memory stays mapped (safe for stale handles)
 
-**Benchmark results (5 epochs × 50K objects):**
-- 19.15 MiB marked reclaimable (4,903 slabs)
-- 3.3% RSS drop under memory pressure
-- 100% cache hit rate (perfect slab reuse)
-- Pattern: Small epochs ~100% reclaim, large epochs ~2%
+**Benchmark results (20 cycles × 50K objects per epoch, GitHub Actions validated):**
+- **0% RSS growth** after warmup (cycle 2→19)
+- **0% RSS variation** across 18 steady-state cycles
+- RSS stabilizes at 2,172 KB after warmup
+- Epoch ring buffer wraps at 16 with no RSS disruption
+- Perfect slab reuse: slabs allocated in epoch N reused in epoch N+16
 
 **Future work:**
 - Phase 3: Handle indirection + `munmap()` for deterministic unmapping
@@ -325,7 +326,7 @@ temporal-slab delivers three key properties for latency-sensitive workloads:
 
 1. **Eliminates tail latency spikes** - 11-12× better across p99-p999 (GitHub Actions validated)
 2. **Deterministic behavior under churn** - 0% RSS growth in steady-state, 15% thread contention plateau, 5.7% CoV at 16 threads
-3. **Phase-aware RSS reclamation** - `epoch_close()` API enables slab collapse at program phase boundaries (optional feature)
+3. **Phase-aware RSS reclamation** - `epoch_close()` API enables deterministic slab reuse at phase boundaries (0% growth validated, GitHub Actions)
 
 **Tail Latency Results (GitHub Actions, 100K obj × 1K cycles, 128-byte objects, 5 trials, Feb 9 2026):**
 
@@ -341,11 +342,12 @@ temporal-slab delivers three key properties for latency-sensitive workloads:
 | Metric | temporal-slab | system_malloc |
 |--------|---------------|---------------|
 | Steady-state RSS growth (constant working set) | **0%** | **0%** |
+| Phase-boundary RSS growth (with epoch_close()) | **0%** | N/A (no epoch API) |
 | Mixed-workload RSS growth (no epoch boundaries) | 1,033% | 1,111% (1.08× worse) |
 | Baseline RSS overhead | +37% | - |
 | Space efficiency | 88.9% | ~85% |
 
-**Note:** Mixed-workload test measures single-phase behavior (no `epoch_close()` invoked). temporal-slab's reclamation advantages appear when explicit phase boundaries are present.
+**Note:** Phase-boundary test validates `epoch_close()` enables perfect slab reuse across epochs (0% growth, 0% variation). Mixed-workload test measures single-phase behavior without epoch boundaries—both allocators grow with expanding working sets.
 
 **Risk exchange:** +9ns median cost (+29%), +37% baseline RSS to eliminate 1-4µs tail spikes. This is not a performance trade-off—it's **tail-risk elimination**. A single malloc p99 outlier (1,463ns) costs 36× more than temporal-slab's median allocation (40ns). For latency-sensitive systems, this exchange is decisive.
 

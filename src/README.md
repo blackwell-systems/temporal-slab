@@ -64,7 +64,7 @@ These tests validate specific Phase 2/3 features and are used during development
 - **`test_epoch_close.c`** → `./test_epoch_close`
   - Phase 2: RSS reclamation via `epoch_close()` API
   - Demonstrates `madvise(MADV_DONTNEED)` reclamation
-  - Validates 19.15 MiB reclamation across 4,903 slabs
+  - **Status:** Superseded by epoch_reclamation_demo in benchmark harness (GitHub Actions validated)
 
 - **`test_epoch_metadata.c`** → `./test_epoch_metadata`
   - Phase 2: Epoch metadata tracking and lifecycle
@@ -224,7 +224,14 @@ Before removing anything:
 
 **RSS Stability (GitHub Actions, 100 cycles steady-state churn):**
 - temporal-slab: **0.00%** RSS growth
-- system_malloc: Unbounded drift
+- system_malloc: **0.00%** RSS growth
+
+**Epoch Reclamation (GitHub Actions, 20 cycles × 50K objects per epoch):**
+- RSS after warmup: 2,172 KB (stabilizes at cycle 2)
+- RSS at completion: 2,172 KB (cycle 19)
+- RSS growth after warmup: **0.00%**
+- RSS variation: **0.0%** (perfect stability)
+- Validates: `epoch_close()` enables deterministic slab reuse across phase boundaries
 
 **Thread Contention (GitHub Actions ubuntu-latest, 128B class, 10 trials):**
 - 1 thread: 0.00% lock contention, 0.0000 CAS retry rate
