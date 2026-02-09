@@ -6,6 +6,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Bounded RSS Proof Mode (2026-02-09)
+
+Added statistical analysis mode to `sustained_phase_shifts` benchmark for validating bounded RSS behavior under sustained allocation churn.
+
+#### Added
+- **Proof mode output** - Triggered for tests with ≥20 cooldowns
+  - Computes min/max/range statistics across cooldown measurements
+  - Tail slope analysis (last 20 cooldowns) detects growth trends
+  - Thresholds: `committed_bytes` <1.0%, anonymous RSS <5.0%
+- **Conditional compilation** - Proof mode guarded by `#ifdef ENABLE_DIAGNOSTIC_COUNTERS`
+  - Zero overhead when diagnostic counters disabled
+
+#### Changed
+- **Build system** - Link `slab_stats.o` when diagnostic counters enabled
+- **Documentation** - Updated INVARIANTS.md with bounded RSS definitions
+
+#### Validation
+- 200-cycle test: committed 0.70 MB stable, anon RSS 0.36→0.39 MB
+- Both metrics stay within thresholds
+
+---
+
 ### Definition: What "Bounded RSS" Means
 
 **Allocator-bounded:** `committed_bytes` (total mmap'd memory) stays constant under sustained churn, proven via atomic counter instrumentation.
