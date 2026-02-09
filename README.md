@@ -44,7 +44,7 @@ In latency-sensitive systems, these outliers dominate SLA violations, frame drop
 - temporal-slab: 0–2.4% growth over 1000 churn cycles
 - system_malloc: 11,174% growth (unbounded drift)
 
-**Key insight:** malloc can hit 254µs at p99.999. temporal-slab stays in nanoseconds until the deepest tail.
+At the deepest observable tail (p99.999), malloc hits 254µs while temporal-slab stays at 19.8µs—a 12.9× reduction in worst-case latency.
 
 ---
 
@@ -76,8 +76,8 @@ temporal-slab provides multiple layers of tooling for development, observability
         │  • tcmalloc         │               │  tslabd (C daemon)      │
         │                     │               │  • Embeds allocator     │
         │  Proves:            │               │  • HTTP :8080/metrics   │
-        │  • 11.6× p99 better │               │                         │
-        │  • 12.2× p999 better│               │  Monitoring Stack       │
+        │  • 39× p99 better   │               │                         │
+        │  • 69× p999 better  │               │  Monitoring Stack       │
         │  • 0% RSS growth    │               │  • Prometheus :9090     │
         │  • Bounded memory   │               │  • Grafana :3000        │
         └─────────────────────┘               │  • Pushgateway :9091    │
@@ -177,28 +177,6 @@ Typical use cases:
 - Batch or pipeline stages with clear lifetime boundaries
 
 Epoch Domains are optional; applications may manage epochs manually when finer control is required.
-
----
-
-## Why temporal-slab Exists
-
-### malloc injects latency risk into otherwise fast systems
-
-General-purpose allocators use **heuristic-based memory management**:
-- Hole-finding algorithms with emergent worst-case behavior
-- Global state transitions causing unpredictable stalls
-- Metadata contention and cache-line bouncing
-- Surprise reclamation at uncontrolled times
-
-These aren't bugs—they're inherent to spatial allocation strategies.
-
-temporal-slab uses **algorithmic guarantees** instead:
-- No hole-finding: objects allocated sequentially within slabs
-- No compaction: lifetimes aligned by design, not relocated by policy
-- No global phase changes: per-epoch state isolated from other epochs
-- No emergent pathology: bounded behavior proven by 100M+ sample testing
-
-**The result:** malloc's 254µs p99.999 outliers become 19.8µs—a 12.9× reduction at the deepest observable tail. This is **structural predictability**, not performance tuning.
 
 ---
 
@@ -447,7 +425,7 @@ void* slab_malloc_epoch(SlabAllocator* alloc, size_t size, EpochId epoch);
 void slab_free(SlabAllocator* alloc, void* ptr);
 ```
 - 8-byte header overhead per allocation
-- Max size: 504 bytes (512 - 8 byte header)
+- Max size: 760 bytes (768 - 8 byte header)
 - NULL-safe: `slab_free(a, NULL)` is no-op
 - Epoch parameter for temporal grouping
 
