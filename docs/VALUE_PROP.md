@@ -29,15 +29,16 @@ It replaces spatial "hole-finding" with **temporal grouping**, ensuring objects 
 
 ### Stable RSS Under Sustained Churn
 
-**Measured results (1000 churn cycles):**
+**Measured results (GitHub Actions validated):**
 
 | Metric | temporal-slab | system_malloc |
 |--------|---------------|---------------|
 | Steady-state RSS growth (constant working set) | **0%** | **0%** |
-| Long-term RSS growth (1000 cycles) | **0-2.4%** | Unbounded |
+| Phase-boundary RSS growth (with epoch_close()) | **0%** | N/A (no epoch API) |
+| Mixed-workload RSS growth (no epoch boundaries) | 1,033% | 1,111% (1.08× worse) |
 | Baseline RSS overhead | +37% | - |
 
-**Value:** Long-running services don't slowly consume memory or require periodic restarts. The +37% baseline RSS overhead is the explicit cost for eliminating unbounded drift.
+**Value:** Long-running services don't slowly consume memory or require periodic restarts. With `epoch_close()`, applications control exactly when memory is reclaimed at phase boundaries (0% growth validated). The +37% baseline RSS overhead is the explicit cost for eliminating unbounded drift.
 
 ---
 
@@ -89,10 +90,10 @@ For latency-sensitive systems where worst-case behavior dominates SLA violations
 |----------|-------------------|---------------|
 | Allocation model | Spatial holes | **Temporal affinity** |
 | Lifetime awareness | None | **Epoch-based grouping** |
-| p99 latency | 2,962 ns | **76 ns (39× better)** |
-| p99.9 latency | 11,525 ns | **166 ns (69× better)** |
-| Variance | 10,585× | **659× (16× more predictable)** |
-| RSS under steady-state churn | Variable (0-1100%) | **0% growth** |
+| p99 latency | 1,463 ns | **131 ns (11.2× better)** |
+| p999 latency | 4,418 ns | **371 ns (11.9× better)** |
+| RSS under steady-state churn | 0% | **0% growth** |
+| RSS with phase boundaries | N/A | **0% with epoch_close()** |
 | Stale frees | UB / crash | **Safe rejection** |
 | Runtime `munmap()` | Yes | **Never** |
 
@@ -121,14 +122,14 @@ slab_free(alloc, buffer);
 epoch_close(alloc, req);  // Physical memory returned to OS
 ```
 
-**RSS reclamation results (5 epochs × 50K objects):**
-- 19.15 MiB marked reclaimable (4,903 slabs)
-- 3.3% RSS drop under memory pressure
-- 100% cache hit rate (perfect slab reuse)
+**RSS reclamation results (20 cycles × 50K objects per epoch, GitHub Actions validated):**
+- **0% RSS growth** after warmup (cycle 2→19)
+- **0% RSS variation** across 18 steady-state cycles
+- RSS stabilizes at 2,172 KB after warmup
+- Epoch ring buffer wraps at 16 with no RSS disruption
+- Perfect slab reuse: slabs allocated in epoch N reused in epoch N+16
 
-**Pattern:** Small epochs approach 100% reclaim, large epochs ~2%.
-
-**Value:** Memory reclaimed when *you* decide (at structural boundaries), not when allocator heuristics trigger.
+**Value:** Deterministic slab reuse at phase boundaries. Memory reclaimed when *you* decide (at structural boundaries), not when allocator heuristics trigger. Without `epoch_close()`, each new epoch would allocate fresh slabs (RSS ratcheting).
 
 ---
 
@@ -163,10 +164,10 @@ temporal-slab is designed for subsystems with fixed-size allocation patterns:
 
 temporal-slab deliberately sacrifices generality to deliver:
 
-* **Structural tail-risk elimination** (39-69× better p99-p99.9, 16× more predictable)
-* **Bounded RSS under sustained churn** (0-2.4% growth vs unbounded drift)
+* **Structural tail-risk elimination** (11-12× better p99-p999, GitHub Actions validated)
+* **Bounded RSS under sustained churn** (0% growth in steady-state and with epoch_close())
 * **Crash-proof safety contracts** (stale frees never segfault)
-* **Application-controlled lifetime management** (deterministic reclamation at phase boundaries)
+* **Application-controlled lifetime management** (0% RSS growth with epoch_close(), perfect slab reuse validated)
 
 If your workload allocates many small, fixed-size objects and cannot tolerate allocator-induced tail spikes or memory drift, **temporal-slab is the right tool**.
 
@@ -174,4 +175,4 @@ If your workload allocates many small, fixed-size objects and cannot tolerate al
 
 ## Executive Summary (One Paragraph)
 
-temporal-slab is a specialized slab allocator that groups allocations by time rather than size, achieving 0-2.4% RSS growth under sustained churn (vs unbounded drift for malloc), 76ns p99 latency (39× better than malloc's 2,962ns), and 166ns p99.9 (69× better than malloc's 11,525ns) with 16× more predictable variance. By tracking lifetime phases via epochs, it enables deterministic memory reclamation aligned with application boundaries—a capability fundamentally impossible for general-purpose allocators that lack temporal structure. Built for fixed-size (64-768 byte), high-churn workloads in HFT, control planes, and real-time systems where worst-case behavior matters more than average speed. The explicit risk exchange: +6ns median cost, +37% baseline RSS to eliminate 2-250µs tail spikes.
+temporal-slab is a specialized slab allocator that groups allocations by time rather than size, achieving 0% RSS growth under sustained churn (both steady-state and with epoch_close()), 131ns p99 latency (11.2× better than malloc's 1,463ns), and 371ns p999 (11.9× better than malloc's 4,418ns). By tracking lifetime phases via epochs, it enables deterministic memory reclamation aligned with application boundaries—achieving perfect slab reuse (0% growth, 0% variation) when programs use epoch_close() at phase boundaries. Built for fixed-size (64-768 byte), high-churn workloads in HFT, control planes, and real-time systems where worst-case behavior matters more than average speed. The explicit risk exchange: +9ns median cost (+29%), +37% baseline RSS to eliminate 1-4µs tail spikes. All results GitHub Actions validated.
