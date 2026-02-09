@@ -10,20 +10,20 @@ It replaces spatial "hole-finding" with **temporal grouping**, ensuring objects 
 
 ### Eliminates Tail Latency Spikes
 
-**Measured results (100M allocations, 128-byte objects, WSL2 environment):**
+**GitHub Actions validated results (100M allocations, 128-byte objects, ubuntu-latest, AMD EPYC 7763):**
 
 | Percentile | temporal-slab | system_malloc | Advantage |
 |------------|---------------|---------------|-----------|
-| p50 | 41 ns | 23 ns | 0.56× (baseline trade-off) |
-| **p99** | **96 ns** | **1,113 ns** | **11.6× better** |
-| **p99.9** | **192 ns** | **2,335 ns** | **12.2× better** |
-| Free p99 | 216 ns | 62 ns | 0.29× (trade-off) |
+| p50 | 40 ns | 31 ns | 1.29× (baseline trade-off) |
+| **p99** | **120 ns** | **1,443 ns** | **12.0× better** |
+| **p99.9** | **340 ns** | **4,409 ns** | **13.0× better** |
+| p9999 | 2,535 ns | 6,432 ns | 2.5× better |
 
-**Key insight:** At p99, malloc enters microsecond territory (1.1µs stalls) while temporal-slab remains sub-100ns—an 11.6× difference that represents the core value proposition.
+**Key insight:** At p99, malloc enters microsecond territory (1.4µs stalls) while temporal-slab remains sub-150ns—a 12× difference that represents the core value proposition. At p999, the advantage grows to 13× (340ns vs 4.4µs).
 
-**Value:** Eliminates 1-2µs allocator-induced tail spikes under pathological FIFO stress. Suitable for HFT, real-time systems, and latency-sensitive services where worst-case behavior matters more than average speed.
+**Value:** Eliminates 1-4µs allocator-induced tail spikes under pathological FIFO stress. Suitable for HFT, real-time systems, and latency-sensitive services where worst-case behavior matters more than average speed.
 
-**Environment caveat:** These numbers are from WSL2 and represent validated relative advantages. Absolute latencies will vary by platform (bare metal, cloud VMs, etc.). GitHub Actions validation in progress to establish reference baseline on ubuntu-latest.
+**Validation:** Results from [temporal-slab-allocator-bench](https://github.com/blackwell-systems/temporal-slab-allocator-bench) neutral harness running on GitHub Actions (ubuntu-latest). Multi-trial validation with variance analysis (CoV%, IQR) and regression thresholds. Reproducible via workflow dispatch.
 
 ---
 

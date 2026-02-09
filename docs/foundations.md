@@ -195,6 +195,7 @@ By the end, you will understand not just how temporal-slab works, but why it wor
 **Slab Allocation Model**
 - [Slab Allocator](#slab-allocator)
 - [Lifetime Affinity](#lifetime-affinity)
+- [Phase Boundary](#phase-boundary)
 - [Epoch](#epoch)
 - [Epoch Advancement](#epoch-advancement)
 - [Epoch Ring Buffer Architecture](#epoch-ring-buffer-architecture)
@@ -1233,6 +1234,72 @@ The problem is that the allocator does not know object lifetimes in advance. A s
 The solution is allocation-order affinity: group allocations that occur close together in time. Programs exhibit temporal locality—allocations that occur around the same time are often causally related and thus have correlated lifetimes. A web server handling a request allocates a request object, a response object, a buffer, and a session token. These are allocated in quick succession. They are causally related—created for the same request. When the request completes, they are all freed. If they are in the same page, that page becomes empty.
 
 Allocation-order affinity does not require the allocator to predict lifetimes. It requires the allocator to allocate sequentially within pages, so objects allocated in the same epoch end up in the same page. Lifetime correlation emerges naturally from allocation patterns, not from explicit hints.
+
+## Phase Boundary
+
+A phase boundary is the moment when a logical unit of work completes in the application. It marks the transition between distinct lifetime phases. Examples:
+
+**Web server:**
+- Phase: Processing a single HTTP request
+- Boundary: Sending the response, closing the connection
+- Objects freed: Request metadata, parsed headers, response buffers, session tokens
+
+**Game engine:**
+- Phase: Rendering a single frame
+- Boundary: Presenting the frame to the display, advancing to next frame
+- Objects freed: Render commands, particle state, temporary geometry buffers
+
+**Database transaction:**
+- Phase: Executing a transaction (BEGIN → COMMIT/ROLLBACK)
+- Boundary: Transaction commit or rollback
+- Objects freed: Query plan cache, intermediate result sets, lock metadata
+
+**Batch processor:**
+- Phase: Processing a batch of records
+- Boundary: Writing results to storage, acknowledging completion
+- Objects freed: Parsed records, aggregation state, output buffers
+
+**Control plane reconciliation:**
+- Phase: Processing a watch event or reconciliation loop iteration
+- Boundary: Completing the reconciliation, updating status
+- Objects freed: Event metadata, diff structures, API call results
+
+**Why phase boundaries matter for temporal-slab:**
+
+General-purpose allocators (malloc, jemalloc, tcmalloc) have no concept of phase boundaries. They see individual `malloc()` and `free()` calls but cannot distinguish between "allocations from the same request" and "allocations from different requests that happened to interleave." This leads to temporal fragmentation: pages contain a mix of objects from different phases with different lifetimes.
+
+temporal-slab provides explicit phase boundary signaling via `epoch_close()`:
+
+```c
+// Application signals phase boundary
+epoch_id_t request_epoch = epoch_current(alloc);
+
+// ... allocate objects for this request ...
+void* buffer = slab_malloc_epoch(alloc, 256, request_epoch);
+void* session = slab_malloc_epoch(alloc, 128, request_epoch);
+
+// Phase boundary: Request complete
+epoch_close(alloc, request_epoch);
+// → All empty slabs from this epoch immediately reclaimed
+```
+
+By aligning memory reclamation with application phase boundaries, temporal-slab achieves deterministic RSS control. The allocator doesn't guess when a "phase" ends—the application explicitly signals it.
+
+**Structural determinism:**
+
+Phase boundaries transform memory management from a pointer-chasing problem ("which objects are still reachable?") to a structural problem ("which phases have completed?"). This is the foundation of temporal-slab's **structural determinism** model:
+
+- **malloc/free model:** Memory reclaimed when individual pointers become unreachable (pointer-level tracking)
+- **GC model:** Memory reclaimed when objects become unreachable from roots (reachability graph traversal)
+- **temporal-slab model:** Memory reclaimed when structural phases end (phase-level tracking)
+
+Phase boundaries are the structural anchors that enable deterministic reclamation. They are observable, explicit, and aligned with application semantics—not inferred from pointer lifetimes.
+
+**Relationship to epochs:**
+
+An epoch is the allocator's implementation of a phase. When the application starts a new logical phase, it advances to a new epoch. When the phase ends (phase boundary), it closes the epoch. The epoch groups all allocations from that phase onto dedicated slabs, ensuring they can be reclaimed together when the phase boundary is reached.
+
+Phase boundaries are the **application-level concept** ("this request is done"). Epochs are the **allocator-level mechanism** that implements phase tracking. The `epoch_close()` API is the bridge between the two.
 
 ## Epoch
 
