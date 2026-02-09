@@ -225,9 +225,11 @@ Before removing anything:
 - temporal-slab: **0.00%** RSS growth
 - system_malloc: Unbounded drift
 
-**Thread Contention (GitHub Actions, 128B class):**
-- 1 thread: 0% lock contention, 0.0000 CAS retry rate
-- 16 threads: ~15-20% lock contention, <0.1 CAS retry rate
-- Healthy scaling: No pathological contention
+**Thread Contention (GitHub Actions ubuntu-latest, 128B class, 10 trials):**
+- 1 thread: 0.00% lock contention, 0.0000 CAS retry rate
+- 4 threads: 10.96% lock contention (median), 0.0025 CAS retry rate
+- 8 threads: 13.19% lock contention (median), 0.0033 CAS retry rate
+- 16 threads: 14.78% lock contention (median), 0.0074 CAS retry rate
+- Healthy scaling: Contention plateaus at 15%, no pathological growth
 
 See [../docs/results.md](../docs/results.md) for full benchmark analysis.
