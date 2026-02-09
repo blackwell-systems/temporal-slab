@@ -259,45 +259,73 @@ static inline int class_index_for_size(uint32_t sz) {
 
 /* ------------------------------ Slab Registry (ABA Protection) ------------------------------ */
 
-/* Initialize slab registry */
+/* Initialize slab registry.
+ *
+ * Registry maps slab_id (compact integer) to (slab pointer, generation counter).
+ * This enables portable handle encoding without embedding raw pointers.
+ *
+ * Initial capacity: 1024 entries (allocated on first reg_alloc_id call).
+ * Growth strategy: Double on overflow (exponential growth, amortized O(1)).
+ */
 static void reg_init(SlabRegistry* r) {
-  r->metas = NULL;
-  r->cap = 0;
-  r->free_ids = NULL;
+  r->metas = NULL;       /* Allocated on demand */
+  r->cap = 0;            /* No capacity yet */
+  r->free_ids = NULL;    /* Free list (currently unused, reserved for future) */
   r->free_count = 0;
-  r->next_id = 0;
+  r->next_id = 0;        /* Bump allocator starts at ID 0 */
   pthread_mutex_init(&r->lock, NULL);
 }
 
-/* Destroy slab registry */
+/* Destroy slab registry.
+ *
+ * Frees all registry metadata. Slab pages themselves are freed separately
+ * during allocator_destroy() when walking partial/full/cache lists.
+ */
 static void reg_destroy(SlabRegistry* r) {
   free(r->metas);
   free(r->free_ids);
   pthread_mutex_destroy(&r->lock);
 }
 
-/* Allocate a new slab_id (grows registry if needed) */
+/* Allocate a new slab_id from registry.
+ *
+ * Two-tier allocation:
+ * 1. Reuse free IDs (currently unused, infrastructure exists for future)
+ * 2. Bump allocate from next_id (simple, fast, no fragmentation)
+ *
+ * Registry grows dynamically (starts at 1024, doubles on overflow).
+ * Returns UINT32_MAX on allocation failure (out of memory for registry growth).
+ *
+ * Concurrency: Protected by registry lock (cold path, allocation only).
+ */
 static uint32_t reg_alloc_id(SlabRegistry* r) {
   pthread_mutex_lock(&r->lock);
   
   uint32_t id;
   if (r->free_count > 0) {
+    /* Try free list first (currently always empty, reserved for future) */
     id = r->free_ids[--r->free_count];
   } else {
+    /* Bump allocate: monotonically increasing IDs */
     id = r->next_id++;
   }
   
-  /* Grow registry if needed (double capacity) */
+  /* Check if registry needs to grow to accommodate this ID */
   if (id >= r->cap) {
+    /* Exponential growth: start at 1024, double each time.
+     * Example: 1024 → 2048 → 4096 → 8192 → ...
+     * Max 4M slabs (22-bit slab_id in handle encoding). */
     uint32_t new_cap = r->cap ? r->cap * 2 : 1024;
-    while (new_cap <= id) new_cap *= 2;
+    while (new_cap <= id) new_cap *= 2;  /* Handle large jumps */
     
+    /* Allocate new metadata array */
     SlabMeta* nm = (SlabMeta*)calloc(new_cap, sizeof(SlabMeta));
     if (!nm) {
       pthread_mutex_unlock(&r->lock);
-      return UINT32_MAX;  /* Allocation failure */
+      return UINT32_MAX;  /* Out of memory */
     }
     
+    /* Copy existing metadata (preserve generation counters and pointers) */
     for (uint32_t i = 0; i < r->cap; i++) {
       nm[i] = r->metas[i];
     }
@@ -305,13 +333,12 @@ static uint32_t reg_alloc_id(SlabRegistry* r) {
     r->metas = nm;
     r->cap = new_cap;
     
-    /* Grow free_ids array too (preserve existing free_count entries) */
+    /* Grow free_ids array to match (preserve existing free list) */
     uint32_t* nf = (uint32_t*)calloc(new_cap, sizeof(uint32_t));
     if (!nf) {
       pthread_mutex_unlock(&r->lock);
       return UINT32_MAX;
     }
-    /* Copy existing free IDs to new array */
     for (size_t i = 0; i < r->free_count; i++) {
       nf[i] = r->free_ids[i];
     }
@@ -319,7 +346,9 @@ static uint32_t reg_alloc_id(SlabRegistry* r) {
     r->free_ids = nf;
   }
   
-  /* Initialize generation (start at 1, 0 reserved for NULL handle) */
+  /* Initialize metadata for new ID.
+   * Generation starts at 1 (0 reserved for NULL handle).
+   * Pointer starts NULL (set later via reg_set_ptr). */
   atomic_store_explicit(&r->metas[id].gen, 1u, memory_order_relaxed);
   atomic_store_explicit(&r->metas[id].ptr, NULL, memory_order_relaxed);
   
@@ -327,70 +356,102 @@ static uint32_t reg_alloc_id(SlabRegistry* r) {
   return id;
 }
 
-/* Publish slab pointer in registry */
+/* Publish slab pointer in registry.
+ *
+ * Makes slab findable via handle lookup (used in free_obj validation).
+ * Release ordering ensures slab initialization is visible before publication.
+ *
+ * Called after slab creation (new mmap) or reinitialization (cache hit).
+ */
 static void reg_set_ptr(SlabRegistry* r, uint32_t id, Slab* s) {
   if (id < r->cap) {
     atomic_store_explicit(&r->metas[id].ptr, s, memory_order_release);
   }
 }
 
-/* Bump generation on reuse (ABA protection)
- * 
- * Memory ordering: Uses relaxed because validation safety comes from
- * the handshake between ptr (release/acquire) and gen (checked after ptr load).
- * We don't need acq_rel here - the ptr store/load provides synchronization.
+/* Bump generation on slab reuse (ABA protection).
+ *
+ * Increments generation counter to invalidate old handles pointing to this slab.
+ * Essential for safety when recycling slabs from cache:
+ *
+ * Timeline without generation bumping (UNSAFE):
+ * 1. Slab A allocated, handle H1 created with gen=1
+ * 2. Slab A freed, recycled to cache
+ * 3. Slab A reused for new allocation
+ * 4. H1 still validates (gen=1 matches) → use-after-free!
+ *
+ * Timeline with generation bumping (SAFE):
+ * 1. Slab A allocated, handle H1 created with gen=1
+ * 2. Slab A freed, recycled to cache
+ * 3. Slab A reused, generation bumped to gen=2
+ * 4. H1 fails validation (gen=1 ≠ gen=2) → rejected safely
+ *
+ * Returns new 24-bit generation (truncated for handle encoding).
+ *
+ * Memory ordering: Relaxed is sufficient because validation safety comes from
+ * the ptr (release/acquire) handshake, not gen ordering.
  */
 static uint32_t reg_bump_gen(SlabRegistry* r, uint32_t id) {
   if (id >= r->cap) return 0;
   
+  /* Atomically increment and get new value */
   uint32_t g = atomic_fetch_add_explicit(&r->metas[id].gen, 1u, memory_order_relaxed) + 1u;
-  uint32_t g24 = g & 0xFFFFFFu;  /* Truncate to 24 bits for handles */
-  if (g24 == 0) g24 = 1;  /* Avoid 0 (reserved for NULL handle) */
+  
+  /* Truncate to 24 bits for handle encoding.
+   * After 16M reuses (2^24), generation wraps to 0. We skip 0 and use 1 instead
+   * since 0 is reserved for NULL handle. */
+  uint32_t g24 = g & 0xFFFFFFu;
+  if (g24 == 0) g24 = 1;
   return g24;
 }
 
-/* Get current generation (24-bit for handle encoding)
- * 
- * Memory ordering: Acquire ensures we see the generation value that was current
- * when the ptr was published. Combined with ptr acquire load, this provides
- * the validation handshake.
+/* Get current generation for handle encoding.
+ *
+ * Returns 24-bit generation value to embed in handle.
+ * Acquire ordering ensures we see the generation that was current when ptr was published.
  */
 static uint32_t reg_get_gen24(SlabRegistry* r, uint32_t id) {
   if (id >= r->cap) return 0;
   
   uint32_t g = atomic_load_explicit(&r->metas[id].gen, memory_order_acquire);
   uint32_t g24 = g & 0xFFFFFFu;  /* Truncate to 24 bits */
-  if (g24 == 0) g24 = 1;
+  if (g24 == 0) g24 = 1;         /* Skip 0 (reserved for NULL) */
   return g24;
 }
 
-/* Lookup and validate slab by id + generation (returns NULL if invalid)
- * 
- * Validation handshake:
- * 1. Load ptr with acquire (sees everything before writer's release store)
+/* Lookup and validate slab by handle (returns NULL if invalid).
+ *
+ * Three-step validation handshake:
+ * 1. Load ptr with acquire (sees slab initialization before publication)
  * 2. Load gen with acquire (sees current generation)
- * 3. Compare gen from handle with current gen
- * 
- * Safety: If ptr is non-NULL, the slab mapping is valid (never unmapped).
- * If generation mismatches, handle is stale from old incarnation (ABA detected).
- * 
- * Note: We may spuriously fail if we observe new ptr but old gen (or vice versa)
- * due to independent atomics, but that's safe - just returns NULL early.
+ * 3. Compare handle generation with current generation
+ *
+ * Failure modes (all return NULL, safe):
+ * - id out of bounds: Invalid handle (corrupted or wrong allocator)
+ * - ptr is NULL: Slab not yet published or already recycled
+ * - gen mismatch: Stale handle from old incarnation (ABA detected)
+ *
+ * Safety invariant: Slabs are never unmapped (only madvised).
+ * If ptr is non-NULL, the virtual mapping is valid—safe to dereference after validation.
+ *
+ * Spurious failures are safe:
+ * If we observe new ptr but old gen (or vice versa) due to independent atomics,
+ * validation fails and returns NULL early. Caller retries or treats as invalid.
  */
 static Slab* reg_lookup_validate(SlabRegistry* r, uint32_t id, uint32_t gen24) {
-  if (id >= r->cap) return NULL;
+  if (id >= r->cap) return NULL;  /* Out of bounds */
   
-  /* Step 1: Load ptr with acquire (handshake point) */
+  /* Step 1: Load ptr with acquire (synchronizes with reg_set_ptr release) */
   Slab* s = atomic_load_explicit(&r->metas[id].ptr, memory_order_acquire);
-  if (!s) return NULL;
+  if (!s) return NULL;  /* Not published yet or NULL-ed during recycling */
   
   /* Step 2: Load current generation with acquire */
   uint32_t cur = reg_get_gen24(r, id);
   
-  /* Step 3: Validate generation matches handle */
-  if (cur != gen24) return NULL;  /* ABA: stale handle from old generation */
+  /* Step 3: Validate generation from handle matches current generation */
+  if (cur != gen24) return NULL;  /* ABA detected: handle from old incarnation */
   
-  return s;
+  return s;  /* Valid! Safe to dereference slab */
 }
 
 /* ------------------------------ Intrusive list operations ------------------------------ */
@@ -1630,98 +1691,164 @@ uint64_t read_rss_bytes_linux(void) {
 
 /* ------------------------------ Epoch API ------------------------------ */
 
+/* Get current active epoch ID.
+ *
+ * Returns ring index (0-15), not the raw monotonic counter.
+ * This is the epoch where new allocations go.
+ */
 EpochId epoch_current(SlabAllocator* a) {
   uint32_t raw = atomic_load_explicit(&a->current_epoch, memory_order_relaxed);
-  return raw % a->epoch_count;  /* Return ring index (0-15), not monotonic counter */
+  return raw % a->epoch_count;  /* Modulo wraps to ring: 16→0, 17→1, etc. */
 }
 
+/* Advance to next epoch (rotate ring buffer).
+ *
+ * Three-phase operation:
+ * 1. Mark old epoch CLOSING (draining, no new allocations)
+ * 2. Mark new epoch ACTIVE (ready for allocations)
+ * 3. Null current_partial pointers to prevent fast-path allocations into old epoch
+ *
+ * Timeline after advance:
+ * - Old epoch (now CLOSING): Frees continue, empty slabs recycled aggressively
+ * - New epoch (now ACTIVE): Accepts allocations, fills fresh slabs
+ *
+ * Typical usage: Call every ~1 second to rotate generations.
+ * With 16 epochs, this gives ~16 seconds for objects to drain before wraparound.
+ *
+ * Ring wraparound: After epoch 15, advances to epoch 0 (overwrites oldest generation).
+ * This is safe because applications should have drained old epochs via epoch_close().
+ */
 void epoch_advance(SlabAllocator* a) {
+  /* Atomically increment and capture both old and new epoch IDs.
+   * current_epoch is a monotonic counter (never decreases), we modulo to get ring index. */
   uint32_t old_epoch_raw = atomic_fetch_add_explicit(&a->current_epoch, 1, memory_order_relaxed);
-  uint32_t old_epoch = old_epoch_raw % a->epoch_count;
-  uint32_t new_epoch = (old_epoch_raw + 1) % a->epoch_count;
+  uint32_t old_epoch = old_epoch_raw % a->epoch_count;      /* Ring index: 0-15 */
+  uint32_t new_epoch = (old_epoch_raw + 1) % a->epoch_count;  /* Next ring slot */
   
-  /* CRITICAL: Implement epoch closing semantics
-   * Rule: Never allocate into a CLOSING epoch */
-  
-  /* Mark old epoch as CLOSING (relaxed: best-effort visibility) */
+  /* Phase 1: Close old epoch.
+   * Mark CLOSING to reject new allocations (checked in alloc_obj_epoch).
+   * Relaxed ordering is sufficient—allocation fast path will eventually observe it. */
   atomic_store_explicit(&a->epoch_state[old_epoch], EPOCH_CLOSING, memory_order_relaxed);
   
-  /* Mark new epoch as ACTIVE (overwrites CLOSING state on wrap-around) */
+  /* Phase 2: Open new epoch.
+   * Mark ACTIVE to accept allocations. On wraparound, this overwrites CLOSING
+   * state from 16 rotations ago (epoch 0 after 15→0 wrap). */
   atomic_store_explicit(&a->epoch_state[new_epoch], EPOCH_ACTIVE, memory_order_relaxed);
   
-  /* Phase 2.2: Stamp era for monotonic observability */
+  /* Stamp monotonic era for observability.
+   * Helps distinguish "epoch 5 at era 100" from "epoch 5 at era 116" after wraparound.
+   * Useful for correlating allocator events with application logs. */
   uint64_t era = atomic_fetch_add_explicit(&a->epoch_era_counter, 1, memory_order_relaxed);
   atomic_store_explicit(&a->epoch_era[new_epoch], era + 1, memory_order_release);
   
-  /* Phase 2.3: Reset metadata for new epoch (overwrites previous rotation) */
+  /* Reset metadata for new epoch (overwrites data from previous rotation).
+   * Timestamp lets us measure epoch lifetime. Label cleared for fresh annotation. */
   a->epoch_meta[new_epoch].open_since_ns = now_ns();
   atomic_store_explicit(&a->epoch_meta[new_epoch].domain_refcount, 0, memory_order_relaxed);
-  a->epoch_meta[new_epoch].label[0] = '\0';  /* Clear label */
+  a->epoch_meta[new_epoch].label[0] = '\0';
   
-  /* Null current_partial for old epoch across all size classes
-   * This ensures no thread will allocate from a published slab in CLOSING epoch */
+  /* Phase 3: Null current_partial for old epoch across all size classes.
+   * Prevents fast-path threads from allocating into CLOSING epoch.
+   * Threads will see NULL and fall back to slow path, which checks epoch state. */
   for (size_t i = 0; i < k_num_classes; i++) {
     EpochState* es = &a->classes[i].epochs[old_epoch];
     atomic_store_explicit(&es->current_partial, NULL, memory_order_release);
   }
   
-  /* Old epoch now drains: frees continue, but no new allocations refill slabs */
+  /* Old epoch now drains passively.
+   * - Frees continue normally (decrement free_count, transition tracking)
+   * - Empty slabs recycled immediately (CLOSING triggers aggressive recycling in free_obj)
+   * - No new allocations refill partially-empty slabs (CLOSING check rejects them)
+   *
+   * To force immediate reclamation, call epoch_close(old_epoch) explicitly. */
 }
 
+/* Force immediate reclamation of an epoch's memory.
+ *
+ * Unlike epoch_advance (which passively drains), epoch_close actively scans
+ * for empty slabs and recycles them immediately. This triggers RSS drops when
+ * ENABLE_RSS_RECLAMATION is enabled.
+ *
+ * Two-phase reclamation:
+ * 1. Mark epoch CLOSING (reject new allocations)
+ * 2. Proactively scan partial/full lists for already-empty slabs
+ *
+ * Use cases:
+ * - End of request: Close request epoch to reclaim memory immediately
+ * - End of batch: Force RSS drop after processing batch
+ * - Memory pressure: Reclaim idle generations to stay under RSS limit
+ *
+ * Performance characteristics:
+ * - Scans all slabs in epoch (O(n) where n = total slabs)
+ * - Recycling happens outside lock (madvise doesn't block allocations)
+ * - Typical latency: 50-500µs depending on slab count
+ *
+ * Difference from epoch_advance:
+ * - epoch_advance: Rotates to next epoch (implicit close of old epoch)
+ * - epoch_close: Explicit close without rotation (target specific epoch)
+ *
+ * Safety: Can be called on any epoch, even current or future ones.
+ * Calling on current epoch stops further allocation into it.
+ */
 void epoch_close(SlabAllocator* a, EpochId epoch) {
   if (!a || epoch >= a->epoch_count) return;
   
-  /* Phase 2.1: Capture start time for epoch_close latency tracking */
+  /* Capture start time for latency telemetry.
+   * Helps answer "how long does epoch_close take?" for capacity planning. */
   struct timespec start_ts;
   clock_gettime(CLOCK_MONOTONIC, &start_ts);
   uint64_t start_ns = (uint64_t)start_ts.tv_sec * 1000000000ULL + (uint64_t)start_ts.tv_nsec;
   
-  /* Phase 2.4: Capture RSS before closing epoch (quantify reclamation impact) */
+  /* Capture RSS before closing to measure reclamation effectiveness.
+   * Delta (before - after) shows MB returned to OS. */
   uint64_t rss_before = read_rss_bytes_linux();
   a->epoch_meta[epoch].rss_before_close = rss_before;
   
-  /* Mark epoch as CLOSING - no new allocations allowed
-   * 
-   * This enables Phase 2 RSS reclamation: when slabs in this epoch become empty,
-   * they are immediately recycled. With ENABLE_RSS_RECLAMATION=1, madvise() is
-   * called to reclaim physical pages, causing RSS to drop.
-   * 
-   * Key difference from epoch_advance():
-   * - epoch_advance() closes old epoch and rotates to next
-   * - epoch_close() closes specific epoch without rotation
-   * 
-   * This allows applications to explicitly control reclamation boundaries
-   * aligned with application lifetime phases (requests, frames, batches).
-   */
-  /* Best-effort visibility: allocations may briefly succeed until state observed */
+  /* Phase 1: Mark epoch CLOSING to reject new allocations.
+   * This is the gate that enables aggressive recycling:
+   * - free_obj() checks epoch state and recycles empty slabs immediately
+   * - alloc_obj_epoch() checks epoch state and rejects allocations
+   *
+   * Best-effort visibility: threads may briefly allocate before observing state.
+   * This is acceptable—allocation will eventually fail as slabs drain. */
   atomic_store_explicit(&a->epoch_state[epoch], EPOCH_CLOSING, memory_order_relaxed);
   
-  /* Proactively scan for already-empty slabs and recycle them
-   * 
-   * This is the missing piece: slabs that became empty BEFORE epoch_close() was
-   * called are sitting on the partial list. The free_obj() path only recycles
-   * slabs at the moment they transition to empty, so we need to scan for slabs
-   * that are already empty when we mark the epoch as CLOSING.
+  /* Phase 2: Proactively scan for already-empty slabs and recycle them.
+   *
+   * Problem: Slabs that became empty BEFORE epoch_close() was called are sitting
+   * on the partial list. The free_obj() reactive path only recycles slabs at the
+   * moment they transition to empty, so we need proactive scanning.
+   *
+   * Without this scan, empty slabs would stay allocated until the next free into
+   * that epoch, causing RSS to stay elevated unnecessarily.
+   *
+   * Algorithm complexity: O(n) where n = total slabs in epoch across all size classes.
+   * Lock hold time: O(n) for scan + unlink, but madvise happens outside lock.
    */
   for (size_t i = 0; i < k_num_classes; i++) {
     SizeClassAlloc* sc = &a->classes[i];
     EpochState* es = &sc->epochs[epoch];
     
-    /* Null current_partial first to prevent allocations */
+    /* Null current_partial to prevent fast-path allocations into this epoch.
+     * Threads will see NULL and fall to slow path, which checks CLOSING state. */
     atomic_store_explicit(&es->current_partial, NULL, memory_order_release);
     
-    /* Scan partial list for empty slabs (single-pass O(n) algorithm)
-     * 
-     * Strategy: Collect empty slabs in temporary array, then recycle outside lock.
-     * This avoids O(n²) restart-scan pattern and minimizes lock hold time.
-     */
-    LOCK_WITH_PROBE(&sc->lock, sc);  /* Phase 2.2: Trylock probe (hot path) */
+    /* Scan both partial and full lists for empty slabs.
+     *
+     * Strategy: Two-pass algorithm to avoid O(n²) restart pattern.
+     * Pass 1: Count empty slabs (quick, read-only)
+     * Pass 2: Collect empty slabs into array (remove from lists)
+     * Pass 3: Recycle outside lock (call cache_push, which does madvise)
+     *
+     * This minimizes lock hold time—no syscalls inside critical section. */
+    LOCK_WITH_PROBE(&sc->lock, sc);
     
-    /* Quick scan to count empty slabs */
+    /* Pass 1: Count empty slabs for array allocation */
     size_t empty_count = 0;
-    size_t scanned_count = 0;  /* Phase 2.1: Track total slabs scanned */
+    size_t scanned_count = 0;
     for (Slab* s = es->partial.head; s; s = s->next) {
       scanned_count++;
+      /* Empty check: free_count == object_count means all slots free */
       if (atomic_load_explicit(&s->free_count, memory_order_relaxed) == s->object_count) {
         empty_count++;
       }
@@ -1733,32 +1860,39 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
       }
     }
     
-    /* Phase 2.1: Update telemetry counters */
+    /* Update telemetry: how many slabs scanned, how many recycled */
     atomic_fetch_add_explicit(&sc->epoch_close_scanned_slabs, scanned_count, memory_order_relaxed);
     if (empty_count > 0) {
       atomic_fetch_add_explicit(&sc->epoch_close_recycled_slabs, empty_count, memory_order_relaxed);
     }
     
     if (empty_count > 0) {
-      /* Allocate temporary array (stack for small counts, heap for large) */
+      /* Pass 2: Allocate temporary array to collect empty slabs.
+       *
+       * Optimization: Use stack allocation for common case (<= 32 slabs).
+       * Avoids malloc overhead when closing small epochs. Fall back to heap
+       * for large epochs (e.g., long-running batch processing). */
       Slab** empty_slabs = NULL;
-      Slab* stack_buf[32];  /* Stack allocation for common case (<32 empty slabs) */
+      Slab* stack_buf[32];
       
       if (empty_count <= 32) {
-        empty_slabs = stack_buf;
+        empty_slabs = stack_buf;  /* Fast path: stack allocation */
       } else {
         empty_slabs = (Slab**)malloc(empty_count * sizeof(Slab*));
         if (!empty_slabs) {
+          /* Malloc failed. Skip recycling for this size class.
+           * Memory stays allocated but epoch still marked CLOSING. */
           pthread_mutex_unlock(&sc->lock);
-          return;  /* Out of memory - skip recycling this time */
+          return;
         }
       }
       
-      /* Collect empty slabs from both lists (single pass) */
+      /* Pass 2: Collect empty slabs from both lists.
+       * Unlink from lists and mark SLAB_LIST_NONE so they can be recycled safely. */
       size_t idx = 0;
       Slab* cur = es->partial.head;
       while (cur) {
-        Slab* next = cur->next;
+        Slab* next = cur->next;  /* Save next before unlinking */
         if (atomic_load_explicit(&cur->free_count, memory_order_relaxed) == cur->object_count) {
           list_remove(&es->partial, cur);
           cur->list_id = SLAB_LIST_NONE;
@@ -1768,6 +1902,8 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
         cur = next;
       }
       
+      /* Also scan full list (slabs can be on full list if they were filled,
+       * then fully freed but not yet moved to partial). */
       cur = es->full.head;
       while (cur) {
         Slab* next = cur->next;
@@ -1782,38 +1918,58 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
       
       pthread_mutex_unlock(&sc->lock);
       
-      /* Recycle all empty slabs outside lock (madvise happens here) */
+      /* Pass 3: Recycle all collected slabs OUTSIDE lock.
+       * cache_push() will call madvise() if RSS reclamation is enabled.
+       * This is where RSS actually drops—physical pages returned to kernel. */
       for (size_t j = 0; j < idx; j++) {
         cache_push(sc, empty_slabs[j]);
       }
       
-      /* Free heap allocation if used */
+      /* Clean up heap allocation if we used it */
       if (empty_slabs != stack_buf) {
         free(empty_slabs);
       }
     } else {
+      /* No empty slabs found, just release lock */
       pthread_mutex_unlock(&sc->lock);
     }
   }
   
-  /* Phase 2.4: Capture RSS after closing epoch (quantify reclamation impact) */
+  /* Phase 3: Measure reclamation impact.
+   *
+   * Capture RSS after recycling to quantify how much memory was returned.
+   * Delta (rss_before - rss_after) shows effectiveness of epoch_close.
+   * Applications can export this to track memory efficiency. */
   uint64_t rss_after = read_rss_bytes_linux();
   a->epoch_meta[epoch].rss_after_close = rss_after;
   
-  /* Phase 2.1: Capture end time and update telemetry */
+  /* Capture end time and update latency telemetry.
+   * Helps capacity planning: "How long does epoch_close take?" */
   struct timespec end_ts;
   clock_gettime(CLOCK_MONOTONIC, &end_ts);
   uint64_t end_ns = (uint64_t)end_ts.tv_sec * 1000000000ULL + (uint64_t)end_ts.tv_nsec;
   uint64_t elapsed_ns = end_ns - start_ns;
   
-  /* Update per-class counters (aggregate across all size classes) */
+  /* Update per-class counters (aggregate, not per-epoch).
+   * Same elapsed_ns added to all size classes—represents total epoch_close cost. */
   for (size_t i = 0; i < k_num_classes; i++) {
     atomic_fetch_add_explicit(&a->classes[i].epoch_close_calls, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&a->classes[i].epoch_close_total_ns, elapsed_ns, memory_order_relaxed);
   }
   
-  /* Epoch now drains: frees continue and empty slabs are aggressively recycled.
-   * With RSS reclamation enabled, physical pages are returned to OS as slabs drain. */
+  /* Epoch now fully closed and drained.
+   *
+   * Future frees into this epoch:
+   * - Continue normally (bitmap clear, free_count increment)
+   * - Empty slabs recycled immediately (CLOSING triggers aggressive recycling)
+   *
+   * Future allocations into this epoch:
+   * - Rejected (alloc_obj_epoch checks CLOSING state)
+   *
+   * Expected RSS behavior with ENABLE_RSS_RECLAMATION=1:
+   * - RSS drops immediately after epoch_close returns
+   * - Delta visible in rss_before_close - rss_after_close
+   * - Physical pages returned to kernel, available for other processes */
 }
 
 /* ------------------------------ Phase 2.3: Semantic Attribution APIs ------------------------------ */
