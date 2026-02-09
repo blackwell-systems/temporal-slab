@@ -129,6 +129,11 @@ typedef struct SlabClassStats {
   uint32_t scan_adapt_switches;              /* Total mode switches (0<->1) */
   uint32_t scan_mode;                        /* Current mode (0=sequential, 1=randomized) */
   
+  /* Phase 3: Live vs committed diagnostics (fragmentation detection) */
+  uint64_t committed_bytes;                  /* Total bytes mmap'd for slabs */
+  uint64_t live_bytes;                       /* Bytes currently allocated to live objects */
+  uint64_t empty_slabs_count;                /* Number of slabs currently empty */
+  
   /* Phase 2.2: Derived contention metrics */
   double avg_alloc_cas_retries_per_attempt;  /* retries / alloc_attempts */
   double avg_free_cas_retries_per_attempt;   /* retries / free_attempts */
