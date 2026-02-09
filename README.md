@@ -40,6 +40,8 @@ Latest benchmarks (Feb 8 2026, race-free adaptive bitmap scanning):
 | **p99** | **1,113 ns** | **96 ns** | **11.6× better** |
 | **p999** | **2,335 ns** | **192 ns** | **12.2× better** |
 
+**Environment:** Windows WSL2 (Intel Core Ultra 7 165H). Subsequent runs show 4-5× variance in tail latency. See [temporal-slab-allocator-bench/BENCHMARK_METHODOLOGY.md](https://github.com/user/temporal-slab-allocator-bench/blob/main/BENCHMARK_METHODOLOGY.md) for variance analysis and plans for bare-metal validation.
+
 **RSS stability:**
 - temporal-slab: 0% growth in steady-state (100 cycles)
 - system_malloc: 11,174% growth (unbounded drift)
