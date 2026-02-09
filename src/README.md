@@ -216,10 +216,11 @@ Before removing anything:
 
 ## Performance Results
 
-**Latency (GitHub Actions, ubuntu-latest, 128-byte objects):**
-- Allocation: **41ns** p50, **96ns** p99, **192ns** p999
-- 11.6× better p99 vs system_malloc
-- 12.2× better p999 vs system_malloc
+**Latency (GitHub Actions ubuntu-latest, AMD EPYC 7763, 128-byte objects, 5 trials):**
+- Allocation: **40ns** p50, **131ns** p99, **371ns** p999, **3,246ns** p9999
+- 11.2× better p99 vs system_malloc (131ns vs 1,463ns)
+- 11.9× better p999 vs system_malloc (371ns vs 4,418ns)
+- 2.4× better p9999 vs system_malloc (3,246ns vs 7,935ns)
 
 **RSS Stability (GitHub Actions, 100 cycles steady-state churn):**
 - temporal-slab: **0.00%** RSS growth

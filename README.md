@@ -20,11 +20,11 @@ In latency-sensitive systems, these outliers dominate SLA violations, frame drop
 ### The Exchange
 
 **You trade:**
-- +18ns median latency (+44% slower average case)
+- +9ns median latency (+29% slower average case, GitHub Actions validated)
 - +37% baseline RSS (epochs keep some slabs hot)
 
 **To eliminate:**
-- 1-2µs tail spikes (11.6-12.2× reduction at p99-p999)
+- 1-4µs tail spikes (11-12× reduction at p99-p999, validated on GitHub Actions)
 - Allocator-driven RSS drift (0% vs 11,174% growth)
 - Unpredictable reclamation behavior
 
@@ -134,7 +134,7 @@ python3 tools/plot_bench.py  # Generate latency/fragmentation charts
 ## What temporal-slab Guarantees
 
 * **Bounded tail latency with measured worst-case behavior**  
-  Lock-free allocation with **96ns p99** (11.6× better), **192ns p999** (12.2× better) vs system_malloc under pathological stress. No emergent pathological states.
+  Lock-free allocation with **131ns p99** (11.2× better), **371ns p999** (11.9× better) vs system_malloc under sustained churn. No emergent pathological states. Validated on GitHub Actions ubuntu-latest (AMD EPYC 7763).
 
 * **Stable RSS under sustained churn**  
   **0–2.4% RSS growth** over 1000 churn cycles vs malloc's unbounded drift (11,174% measured). No surprise reclamation.
@@ -323,17 +323,18 @@ make
 
 temporal-slab delivers three key properties for latency-sensitive workloads:
 
-1. **Eliminates tail latency spikes** - 11.6-12.2× better across p99-p999
+1. **Eliminates tail latency spikes** - 11-12× better across p99-p999 (GitHub Actions validated)
 2. **Stable RSS under churn** - 0% growth in steady-state (vs 11,174% malloc drift)
-3. **Predictable trade-offs** - +37% baseline RSS, +44% median latency
+3. **Predictable trade-offs** - +37% baseline RSS, +29% median latency
 
-**Tail Latency Results (100M samples, 128-byte objects, Feb 8 2026):**
+**Tail Latency Results (GitHub Actions, 100K obj × 1K cycles, 128-byte objects, 5 trials, Feb 9 2026):**
 
 | Percentile | temporal-slab | system_malloc | Advantage |
 |------------|---------------|---------------|----------|
-| p50 | 41ns | 23ns | 0.56× (trade-off) |
-| p99 | 96ns | 1,113ns | **11.6× better** |
-| p999 | 192ns | 2,335ns | **12.2× better** |
+| p50 | 40ns | 31ns | 1.29× slower (trade-off) |
+| p99 | 131ns | 1,463ns | **11.2× better** |
+| p999 | 371ns | 4,418ns | **11.9× better** |
+| p9999 | 3,246ns | 7,935ns | **2.4× better** |
 
 **RSS & Efficiency:**
 
@@ -344,7 +345,7 @@ temporal-slab delivers three key properties for latency-sensitive workloads:
 | Baseline RSS overhead | +37% | - |
 | Space efficiency | 88.9% | ~85% |
 
-**Risk exchange:** +18ns median cost (+44%), +37% baseline RSS to eliminate 1-2µs tail spikes. This is not a performance trade-off—it's **tail-risk elimination**. A single malloc p99 outlier (1,113ns) costs 27× more than temporal-slab's median allocation (41ns). For latency-sensitive systems, this exchange is decisive.
+**Risk exchange:** +9ns median cost (+29%), +37% baseline RSS to eliminate 1-4µs tail spikes. This is not a performance trade-off—it's **tail-risk elimination**. A single malloc p99 outlier (1,463ns) costs 36× more than temporal-slab's median allocation (40ns). For latency-sensitive systems, this exchange is decisive.
 
 **Full analysis:** See [docs/results.md](docs/results.md) for detailed benchmarks, charts, and interpretation guidelines.
 
