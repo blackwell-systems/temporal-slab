@@ -52,6 +52,40 @@ In latency-sensitive systems, these outliers dominate SLA violations, frame drop
 
 temporal-slab provides multiple layers of tooling for development, observability, and validation:
 
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           ZNS-Slab (this repo)                           │
+│                       Core allocator implementation                      │
+├──────────────────────────────────────────────────────────────────────────┤
+│  • src/slab_alloc.c      Epoch-based slab allocator (C library)         │
+│  • src/stats_dump        JSON metrics snapshot (CLI utility)            │
+│  • tools/plot_bench.py   Visualization for benchmark CSV                │
+└────────────────┬─────────────────────────────────────┬───────────────────┘
+                 │                                     │
+                 │ libslab_alloc.a                     │ stats JSON
+                 │                                     │
+        ┌────────▼────────────┐               ┌───────▼─────────────────┐
+        │  temporal-slab-     │               │  temporal-slab-tools    │
+        │  allocator-bench    │               │  (separate repo)        │
+        │  (separate repo)    │               ├─────────────────────────┤
+        ├─────────────────────┤               │  tslab (Go CLI)         │
+        │  Comparative        │               │  • watch - live stats   │
+        │  validation vs:     │               │  • export prometheus    │
+        │  • system_malloc    │               │  • top - ranking        │
+        │  • jemalloc         │               │                         │
+        │  • tcmalloc         │               │  tslabd (C daemon)      │
+        │                     │               │  • Embeds allocator     │
+        │  Proves:            │               │  • HTTP :8080/metrics   │
+        │  • 11.6× p99 better │               │                         │
+        │  • 12.2× p999 better│               │  Monitoring Stack       │
+        │  • 0% RSS growth    │               │  • Prometheus :9090     │
+        │  • Bounded memory   │               │  • Grafana :3000        │
+        └─────────────────────┘               │  • Pushgateway :9091    │
+                                              │  • 50+ metrics          │
+                                              │  • 18 panels, 6 alerts  │
+                                              └─────────────────────────┘
+```
+
 ### Built-in Utilities (this repo)
 
 **`src/stats_dump`** - JSON metrics snapshot
