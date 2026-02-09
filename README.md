@@ -70,7 +70,11 @@ python3 tools/plot_bench.py  # Generate latency/fragmentation charts
 **[temporal-slab-tools](https://github.com/user/temporal-slab-tools)** - Production observability
 - **`tslab`** (Go CLI) - Live stats viewing, Prometheus export, top-like monitoring
 - **`tslabd`** (C daemon) - Embeds allocator for long-running metrics collection
-- **Prometheus + Grafana integration** - Production monitoring dashboards
+- **Complete monitoring stack** - Docker Compose setup with Prometheus + Grafana + Pushgateway
+  - 50+ metrics: RSS, epoch age, slow-path rate, madvise bytes, contention counters
+  - Pre-built Grafana dashboards with 18 panels across 5 rows
+  - Alerting rules: epoch leaks, memory leaks, slow-path spikes
+  - One-command setup: `./run-observability.sh` (see [OBSERVABILITY_QUICKSTART.md](https://github.com/user/temporal-slab-tools/blob/main/OBSERVABILITY_QUICKSTART.md))
 
 **[temporal-slab-allocator-bench](https://github.com/user/temporal-slab-allocator-bench)** - Comparative validation
 - Neutral harness testing temporal_slab vs system_malloc/jemalloc/tcmalloc
