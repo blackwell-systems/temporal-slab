@@ -19,16 +19,15 @@ echo ""
 for T in "${THREADS[@]}"; do
   echo "=== Testing with $T threads ==="
   
-  # Run benchmark (captures perf in benchmark itself)
-  ./benchmark_threads $T 2>&1 | grep -E "(Thread|p50|p95|p99|Aggregate)" || true
+  # Run benchmark and capture full output (metrics are printed inline)
+  OUTPUT=$(timeout 30 ./benchmark_threads $T 2>&1)
   
-  # Extract contention metrics from stats_dump
-  echo "Contention metrics (size class 128B):"
-  ./stats_dump --no-text 2>/dev/null | jq -r --arg size "128" '
-    .classes[] | 
-    select(.object_size == 128) | 
-    "  CAS alloc retries/attempt: \(.avg_alloc_cas_retries_per_attempt | . * 100 | floor / 100)\n  CAS free retries/attempt: \(.avg_free_cas_retries_per_attempt | . * 100 | floor / 100)\n  current_partial CAS failure rate: \(.current_partial_cas_failure_rate | . * 100 | floor / 100)%\n  Lock contention rate: \(.lock_contention_rate | . * 100 | floor / 100)%\n  Lock fast acquire: \(.lock_fast_acquire)\n  Lock contended: \(.lock_contended)"
-  '
+  # Extract latency metrics
+  echo "$OUTPUT" | grep -E "(Avg p50|Avg p95|Avg p99|Throughput)" || true
+  
+  # Extract contention metrics directly from benchmark output (not stats_dump)
+  echo "Contention metrics:"
+  echo "$OUTPUT" | grep -A4 "Contention Metrics" | grep -E "(Bitmap|current_partial|Lock)" || echo "  (metrics not found in output)"
   
   echo ""
 done
