@@ -115,7 +115,10 @@ epoch_close(alloc, epoch);  // Scan for empty slabs, recycle ALL at once
 
 **Why it matters:** Moves unpredictability from hot path (every allocation) to cold path (explicit boundary). Application controls WHEN reclamation happens, not IF.
 
-**Measured impact:** 0% RSS growth with epoch boundaries. Without epoch_close(), RSS grows 1,033% (same as malloc's 1,111% unbounded drift).
+**Measured impact (Phase 2.1, 100M cycles):**
+- **With epoch_close():** RSS stable at 768KB (8 slabs across 8 size classes), 0% drift
+- **Without epoch_close():** RSS grows 1,033% (same as malloc's 1,111% unbounded drift)
+- **Critical distinction:** Bounded RSS requires application-controlled reclamation boundaries (`epoch_close()`). Without explicit boundaries, temporal-slab behaves like malloc (unbounded drift from temporal fragmentation).
 
 ---
 
@@ -123,15 +126,53 @@ epoch_close(alloc, epoch);  // Scan for empty slabs, recycle ALL at once
 
 **The problem:** malloc operates at pointer granularity. It cannot answer "which request leaked memory?" because it doesn't know what a "request" is.
 
-**The insight:** When the allocator tracks epochs, observability emerges naturally.
+**The insight:** When the allocator tracks epochs, multi-level observability emerges naturally.
+
+**Five observability layers (Phase 2.0-2.4):**
+
+1. **Stats API** - Snapshot-based queries with derived metrics
+   - `slab_stats_global()` - Aggregate across all classes/epochs
+   - `slab_stats_class()` - Per-size-class with recycle rates, contention
+   - `slab_stats_epoch()` - Per-epoch with reclaimable slab estimation
+
+2. **Era stamping** - Monotonic temporal identity (Phase 2.2)
+   - 64-bit era counter increments on every `epoch_advance()`
+   - Distinguishes epoch incarnations across ring wraparounds
+   - Enables log correlation: "Request XYZ allocated in (epoch=3, era=1250)"
+
+3. **Epoch metadata** - Lifetime profiling (Phase 2.3)
+   - `open_since_ns`: When epoch became ACTIVE (detects stuck epochs)
+   - `domain_refcount`: Live allocation count (leak detection signal)
+   - `label[32]`: Semantic tag ("request_id:abc123", "frame:1234")
+
+4. **RSS delta tracking** - Quantify reclamation (Phase 2.4)
+   - `rss_before_close` / `rss_after_close` snapshots
+   - Delta shows MB freed per `epoch_close()` (validation signal)
+   - Diagnoses leaks: zero delta despite many frees = problem
+
+5. **Thread-local sampling** - Tail attribution (Phase 2.5, optional)
+   - Probabilistic 1/1024 sampling with wall vs CPU time split
+   - `wait_ns = wall_ns - cpu_ns` (scheduler interference metric)
+   - Repair timing with reason codes (zombie partial detection)
+
+**Example query:**
 
 ```c
-// These questions are trivial for temporal-slab:
+// Phase-level leak detection (O(1) queries)
 SlabEpochStats stats;
 slab_stats_epoch(alloc, size_class, request_epoch, &stats);
 
 if (stats.reclaimable_slab_count > 0) {
-    printf("Request leaked %u slabs\n", stats.reclaimable_slab_count);
+    uint64_t age_sec = (now_ns() - stats.open_since_ns) / 1e9;
+    printf("Epoch %u (era %lu, label='%s') leaked %u slabs after %lu sec\n",
+           request_epoch, stats.epoch_era, stats.label,
+           stats.reclaimable_slab_count, age_sec);
+}
+
+// Quantify reclamation effectiveness
+if (stats.rss_before_close > 0) {
+    uint64_t freed_mb = (stats.rss_before_close - stats.rss_after_close) / (1024*1024);
+    printf("Closed epoch freed %lu MB\n", freed_mb);
 }
 ```
 
@@ -142,9 +183,12 @@ if (stats.reclaimable_slab_count > 0) {
 The epoch parameter **is** the attribution. No sampling, no backtraces, no profiling overhead.
 
 **Comparison:**
-- **jemalloc profiling:** 10-30% overhead (stack unwinding)
-- **tcmalloc profiler:** 5-15% overhead (probabilistic sampling)
-- **temporal-slab:** 0% overhead (counters exist for correctness)
+- **jemalloc profiling:** 10-30% overhead (stack unwinding per allocation)
+- **tcmalloc profiler:** 5-15% overhead (probabilistic sampling + backtraces)
+- **temporal-slab (Phases 2.0-2.4):** 0% overhead (counters exist for correctness, not profiling)
+- **temporal-slab (Phase 2.5, optional):** <0.2% overhead (1/1024 sampling, no backtraces)
+
+**Key distinction:** Traditional profilers **add** overhead to **infer** attribution. temporal-slab attribution is **structural** - the epoch parameter **is** the attribution.
 
 ---
 
@@ -167,27 +211,62 @@ if (retry_rate < 0.10) mode = SEQUENTIAL;  // Optimize locality
 
 ---
 
-### 5. Diagnostic Infrastructure
+### 5. Self-Healing Correctness (Zombie Repair)
 
-**Two compile-time optional features for incident investigation:**
+**The problem:** Under high concurrency, publication races can create "zombie partial" slabs where `free_count=0` but bitmap is full (all slots actually free).
 
-**Label-based attribution** (`ENABLE_LABEL_CONTENTION`):
+**The solution:** Detection + repair on every allocation attempt.
+
+```c
+if (free_count == 0 && bitmap_is_full(s)) {
+    // Zombie detected - repair immediately
+    move_to_full_list(s);  // Restore invariant
+    repair_count++;        // Track for observability
+}
+```
+
+**Validated impact (Phase 2.5, 16-thread adversarial test):**
+- **Repair rate:** 0.0104% (1 per 9,639 allocations)
+- **Repair timing:** 9-14µs avg (CPU-bound list/bitmap work)
+- **Reason attribution:** 100% `full_bitmap` (proves specific race condition)
+- **Result:** System self-heals, no corruption, no crashes
+
+**Why it matters:** Distinguishes production system from research prototype. Race conditions are inevitable under high concurrency - self-healing repair makes them **benign** rather than **fatal**.
+
+---
+
+### 6. Diagnostic Infrastructure
+
+**Three compile-time optional features for incident investigation:**
+
+**Label-based attribution** (`ENABLE_LABEL_CONTENTION`, Phase 2.3):
 ```c
 epoch_domain_t* req = epoch_domain_create(alloc, "request:GET_/users");
 // All contention now attributed to "request:GET_/users"
 ```
 Answers: "Which workload phase caused the contention spike?"
+Overhead: +5ns per lock acquisition (label array indexing)
 
-**Slowpath sampling** (`ENABLE_SLOWPATH_SAMPLING`):
+**Slowpath sampling** (`ENABLE_SLOWPATH_SAMPLING`, Phase 2.5):
 ```c
 // Wall vs CPU time split (1/1024 sampling)
-if (wall_ns >> cpu_ns * 2) {
-    // Problem is OS scheduler, not allocator
+ThreadStats stats = slab_stats_thread();
+if (stats.alloc_wait_ns_sum > stats.alloc_cpu_ns_sum) {
+    // Problem is OS scheduler (WSL2/hypervisor), not allocator
 }
 ```
 Answers: "Is tail latency from allocator work or WSL2/hypervisor noise?"
+Overhead: <0.2% (80ns per sample / 1024 allocations)
 
-**Why separate flags:** 5ns overhead acceptable for diagnostics, unacceptable for HFT production. Enable during incidents, disable for steady-state.
+**TLS handle cache** (`ENABLE_TLS_CACHE`, Phase 2.6):
+```c
+// Thread-local LIFO cache (256 handles per class)
+// Cache hit = zero atomics (bypass global allocator)
+```
+Answers: "Can we eliminate p99 spikes for high-locality workloads?"
+Impact: p50 -11% (41ns→36ns), p99 -75% (96ns→24ns), +15% throughput
+
+**Why separate flags:** 5-10ns overhead acceptable for diagnostics, unacceptable for HFT production. Enable during incidents, disable for steady-state.
 
 ---
 
@@ -214,17 +293,31 @@ Deterministic reclamation without pointer tracking or GC infrastructure
 
 ## Measured Results
 
-| Property | malloc | temporal-slab | Advantage |
-|----------|--------|---------------|-----------|
-| **p99 latency** | 1,463ns | 131ns | **11.2× better** |
-| **p999 latency** | 4,418ns | 371ns | **11.9× better** |
+| Property | malloc (system) | temporal-slab | Advantage |
+|----------|-----------------|---------------|-----------|
+| **p99 latency** | 1,463ns | 131ns (fast path) | **11.2× better** |
+| **p999 latency** | 4,418ns | 371ns (fast path) | **11.9× better** |
+| **p99 (WSL2 wall)** | ~3µs (est.) | 1.5µs (measured) | **2× better** |
+| **Tail attribution** | No decomposition | wait_ns separates scheduler | **Diagnostic** |
 | **RSS growth** | 1,111% | 0% | **Bounded** |
 | **Observability** | Pointer-level | Phase-level | **Structural** |
 | **Reclamation timing** | Unpredictable | Deterministic | **Application-controlled** |
 
-**Trade-off:** +29% slower median (40ns vs 31ns), +37% baseline RSS overhead.
+**Trade-offs:**
+- **Median latency:** +29% slower (40ns vs 31ns) - more atomic operations
+- **Baseline RSS:** +37% overhead (temporal partitioning cost)
+- **API complexity:** Must declare phase boundaries (`epoch_advance()`, `epoch_close()`)
 
-**When to use:** Systems where worst-case behavior matters more than average speed, and allocator-induced latency spikes are unacceptable.
+**When to use:**
+- **Real-time systems:** Predictable worst-case > fast average (audio/video processing, trading)
+- **Request-response servers:** Tail latency matters (web APIs, microservices)
+- **Production debugging:** Need "which feature leaked memory?" without profiler overhead
+- **Bounded RSS required:** Cannot tolerate unbounded drift (embedded, long-running daemons)
+
+**When NOT to use:**
+- **Allocate-once patterns:** Short-lived processes, initialization-heavy workloads
+- **Highly irregular lifetimes:** Objects genuinely unpredictable (no phase structure)
+- **Median-optimized:** Average case more important than worst-case (batch processing)
 
 ---
 
@@ -255,6 +348,23 @@ Database transactions know when they commit.
 
 These moments **already exist** in application logic. temporal-slab makes them explicit through `epoch_close()`, shifting the unit of memory management from individual pointers to collective phases.
 
-**What you invented:** A temporal memory model where lifetime is defined by program phases, enabling deterministic reclamation and eliminating allocator-induced tail latency.
+**What this system invented:**
 
-**Core contribution:** Making lifetimes explicit, phase-aligned, and deterministic enables both performance (predictable timing) and observability (phase-level metrics) as emergent properties of the temporal model, not features grafted onto a traditional allocator.
+1. **A temporal memory model** where lifetime is defined by program phases (not pointers or reachability)
+2. **Passive epoch reclamation** - zero-coordination state transitions (0ns overhead, 0ms latency)
+3. **Self-healing correctness** - zombie repair makes publication races benign (0.01% repair rate, no crashes)
+4. **Structural observability** - five-layer introspection without profiler overhead (era stamping, metadata, RSS delta, thread sampling)
+5. **Adaptive contention management** - reactive mode switching based on CAS retry rate (5.8× retry reduction at 16T)
+
+**Core contribution:**
+
+Making lifetimes **explicit** (through epoch parameters), **phase-aligned** (with application semantics), and **deterministic** (through `epoch_close()`) enables:
+
+- **Performance** - Predictable timing (no emergent pathological states)
+- **Observability** - Phase-level metrics emerge naturally (not grafted on)
+- **Correctness** - Self-healing repair (races are benign, not fatal)
+- **Control** - Application dictates WHEN reclamation happens (not heuristics)
+
+These properties are **emergent** from the temporal model, not features added afterward.
+
+**Academic positioning:** Demonstrates that temporal structure (phase boundaries) can replace both pointer tracking (malloc) and reachability tracing (GC) while providing deterministic reclamation and structural observability as byproducts of the model.

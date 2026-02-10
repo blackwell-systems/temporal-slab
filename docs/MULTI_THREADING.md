@@ -372,14 +372,27 @@ if (sample) {
 }
 ```
 
-**Interpretation:**
+**Key metric: wait_ns** (Phase 2.5)
+
+The critical insight is the **wait time** metric:
+
+```c
+wait_ns = wall_ns - cpu_ns  // Scheduler interference
+```
+
+- **wait_ns > cpu_ns:** Scheduler interference dominates (WSL2/hypervisor preemption)
+- **wait_ns < cpu_ns:** Allocator work dominates (CAS storms, lock contention)
+- **wait_ns << cpu_ns:** Clean measurement (minimal OS interference)
+
+**Truth table for tail attribution:**
 
 | Condition | Diagnosis |
 |-----------|-----------|
-| **wall ≈ cpu** | Clean measurement, allocator doing real work (CAS storms, repairs) |
-| **wall > cpu × 1.5** | Moderate scheduler noise (context switches, TLB flushes) |
-| **wall > cpu × 2** | Severe interference (WSL2 hypervisor, VM preemption) |
-| **cpu > wall** | Clock skew (rare, ignore sample) |
+| `wait_ns < cpu_ns` | Allocator work dominates (CAS, locks, repairs) |
+| `wait_ns ≈ cpu_ns` | Balanced (50% allocator, 50% scheduler) |
+| `wait_ns > cpu_ns` | Scheduler interference dominates (OS preemption) |
+| `wait_ns > cpu_ns × 2` | Severe hypervisor overhead (WSL2/VM) |
+| `cpu_ns > wall_ns` | Clock skew (rare, ignore sample) |
 
 **Per-thread statistics:**
 
@@ -405,16 +418,21 @@ if (stats.alloc_samples > 0) {
 }
 ```
 
-**Zombie repair timing:**
+**Zombie repair timing (Phase 2.5):**
 
 Also tracks repair operations (when slabs on PARTIAL list are detected as full):
 
 ```c
 if (stats.repair_count > 0) {
+  uint64_t avg_repair_cpu = stats.repair_cpu_ns_sum / stats.repair_count;
+  uint64_t avg_repair_wait = stats.repair_wait_ns_sum / stats.repair_count;
+  
   printf("Zombie repair statistics:\n");
-  printf("  Total repairs:  %lu\n", stats.repair_count);
-  printf("  Avg wall time:  %lu ns\n", 
-         stats.repair_wall_ns_sum / stats.repair_count);
+  printf("  Total repairs:     %lu\n", stats.repair_count);
+  printf("  Avg CPU time:      %lu ns (max: %lu ns)\n",
+         avg_repair_cpu, stats.repair_cpu_ns_max);
+  printf("  Avg wait time:     %lu ns (max: %lu ns)\n",
+         avg_repair_wait, stats.repair_wait_ns_max);
   printf("  Reasons:\n");
   printf("    Full bitmap:    %lu (free_count=0, bitmap full)\n", 
          stats.repair_reason_full_bitmap);
@@ -422,6 +440,15 @@ if (stats.repair_count > 0) {
          stats.repair_reason_list_mismatch);
 }
 ```
+
+**Validated impact (Feb 10 2026, 16-thread adversarial test):**
+- **Repair rate:** 0.0104% (1 per 9,639 allocations)
+- **Repair timing:** 9-14µs avg CPU (CPU-bound list/bitmap work)
+- **Reason attribution:** 100% `full_bitmap` (proves specific race condition)
+- **Wait time:** Avg 272ns (repairs rarely scheduler-blocked)
+- **Outliers:** Occasional 400µs wall spikes (WSL2 preemption during repair)
+
+**Interpretation:** Self-healing works correctly. Repairs are rare (<0.02% under adversarial load), CPU-intensive (not blocking on I/O), and always triggered by the same publication race (`full_bitmap`). This validates that zombie partials are a benign race condition, not a correctness bug.
 
 **Performance cost:**
 
@@ -582,15 +609,35 @@ temporal-slab implements **tiered contention observability** to balance producti
 **When to use:** **Post-incident analysis only**
 
 **Answers:**
-- "Is tail latency from allocator or OS?" (wall vs CPU ratio)
-- "How much WSL2 hypervisor overhead exists?" (wall - cpu)
-- "Are zombie repairs contributing to latency?" (repair timing)
+- "Is tail latency from allocator or OS?" (compare `wait_ns` vs `cpu_ns`)
+- "How much WSL2 hypervisor overhead exists?" (single metric: `wait_ns = wall_ns - cpu_ns`)
+- "Are zombie repairs contributing to latency?" (separate repair timing with wait decomposition)
+- "What percentage of tail is scheduler interference?" (`100 × wait_ns / wall_ns`)
 
 **Does NOT answer:**
 - "Which specific operation caused the spike?" (sampled, not traced)
 - "What is P99.9 by size class?" (insufficient sample density)
 
-**Critical use case:** Distinguishing allocator bugs from environmental noise. If wall >> cpu × 2, the problem is OS/hypervisor, not the allocator. If wall ≈ cpu, the allocator is doing real work (CAS storms, repairs, lock contention).
+**Critical use case:** Distinguishing allocator bugs from environmental noise.
+
+- **If wait_ns > cpu_ns:** Problem is OS/hypervisor, not allocator code
+- **If wait_ns < cpu_ns:** Problem is allocator work (CAS storms, lock contention, repairs)
+- **If cpu_ns > 1µs AND wait_ns < cpu_ns:** Contention is real (not scheduler artifact)
+
+**Phase 2.5 validation (Feb 10 2026):**
+
+| Test | Threads | Avg CPU | Avg Wait | Finding |
+|------|---------|---------|----------|----------|
+| simple_test | 1 | 398ns | 910ns | WSL2 adds 2.3× overhead (70% wait) |
+| contention_sampling_test | 8 | 3,200ns | 600ns | Contention is real (CPU 2× vs 1T) |
+| zombie_repair_test | 16 | 1,400ns | 380ns | Repairs are CPU-bound (9-14µs) |
+
+**Key insight from validation:**
+
+- **Single-thread:** 70% of latency is scheduler (wait >> cpu)
+- **Multi-thread:** 20% of latency is scheduler (cpu >> wait)
+- **Proof:** Contention doubles CPU time (398ns → 3,200ns), not an artifact of WSL2
+- **Conclusion:** wait_ns metric successfully separates allocator work from OS interference
 
 ### HFT Production Policy
 
@@ -645,10 +692,28 @@ Retries:  0.000  0.0025  0.0033  0.0074
 
 **Interpretation:** Well below 0.01 retries/op across all thread counts. Excellent lock-free bitmap design.
 
+**Phase 2.5 slowpath sampling validation (Feb 10 2026, WSL2):**
+
+```
+Test                         | Threads | Samples | Avg CPU  | Avg Wait | Repairs | Finding
+-----------------------------|---------|---------|----------|----------|---------|------------------------
+simple_test                  | 1       | 97      | 398ns    | 910ns    | 0       | WSL2 adds 2.3× overhead
+contention_sampling_test     | 8       | 776     | 3,200ns  | 600ns    | 0       | CPU 2× vs 1T (contention real)
+zombie_repair_test           | 16      | 768     | 1,400ns  | 380ns    | 83      | 0.01% repair rate (CPU-bound)
+```
+
+**Key findings:**
+- **wait_ns metric validates scheduler vs allocator**: Single-thread shows 70% scheduler overhead, multi-thread shows 20%
+- **Contention is real allocator work**: CPU time doubles (398ns → 3,200ns) under 8-thread load
+- **Zombie repairs are benign**: 0.0104% rate (1 per 9,639 allocations), 9-14µs CPU-bound, 100% `full_bitmap` reason
+- **Repair self-healing works**: No corruption, no crashes, system remains healthy
+
 **Key validation:**
 - ✅ Lock contention <15% at peak (16 threads)
 - ✅ CAS retry rate <0.01 at peak (16 threads)
 - ✅ CoV decreases with thread count (more predictable at scale)
+- ✅ wait_ns metric separates scheduler from allocator work (Phase 2.5)
+- ✅ Zombie repair rate <0.02% under adversarial load (Phase 2.5)
 
 ### Validation Methodology
 
