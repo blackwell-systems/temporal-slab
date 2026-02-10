@@ -330,8 +330,6 @@ make
 
 ## Performance Summary
 
-![Performance Overview](docs/images/summary.png)
-
 temporal-slab delivers three key properties for latency-sensitive workloads:
 
 1. **Eliminates tail latency spikes** - 11-12× better across p99-p999 (GitHub Actions validated)

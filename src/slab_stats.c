@@ -2,6 +2,12 @@
 #include "slab_alloc_internal.h"
 #include <string.h>
 
+/* Phase 2.5: TLS storage for slowpath sampling */
+#ifdef ENABLE_SLOWPATH_SAMPLING
+__thread ThreadStats tls_stats = {0};
+__thread uint64_t tls_sample_ctr = 0;
+#endif
+
 void slab_stats_global(SlabAllocator* alloc, SlabGlobalStats* out) {
   memset(out, 0, sizeof(*out));
   
@@ -245,3 +251,10 @@ void slab_stats_epoch(SlabAllocator* alloc, uint32_t size_class, EpochId epoch, 
   out->estimated_rss_bytes = (uint64_t)(out->partial_slab_count + out->full_slab_count) * SLAB_PAGE_SIZE;
   out->reclaimable_bytes = (uint64_t)out->reclaimable_slab_count * SLAB_PAGE_SIZE;
 }
+
+/* Phase 2.5: Thread-local sampling statistics */
+#ifdef ENABLE_SLOWPATH_SAMPLING
+ThreadStats slab_stats_thread(void) {
+  return tls_stats;
+}
+#endif

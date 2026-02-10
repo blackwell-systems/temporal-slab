@@ -10,6 +10,7 @@
 
 #define _GNU_SOURCE
 #include "slab_alloc_internal.h"
+#include "slab_stats.h"     /* Phase 2.5: For slowpath sampling */
 #include "epoch_domain.h"  /* Phase 2.3: For TLS label attribution */
 #include <errno.h>
 #include <inttypes.h>
@@ -1326,12 +1327,40 @@ static inline SlabHandle encode_handle(Slab* slab, SlabRegistry* reg, uint32_t s
  * If out is non-NULL, writes a portable handle encoding (slab_id, generation, slot, class).
  */
 void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle* out) {
+#ifdef ENABLE_SLOWPATH_SAMPLING
+  /* Phase 2.5: Probabilistic end-to-end sampling (1/1024)
+   * Wall vs CPU time split detects WSL2/virtualization interference */
+  bool sample = ((++tls_sample_ctr & SAMPLE_RATE_MASK) == 0);
+  struct timespec wall0, cpu0, wall1, cpu1;
+  if (sample) {
+    clock_gettime(CLOCK_MONOTONIC, &wall0);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0);
+  }
+  
+  /* Helper macro to record sample before return */
+  #define RECORD_SAMPLE() do { \
+    if (sample) { \
+      clock_gettime(CLOCK_MONOTONIC, &wall1); \
+      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1); \
+      uint64_t wall_ns = ns_from_ts(&wall1) - ns_from_ts(&wall0); \
+      uint64_t cpu_ns = ns_from_ts(&cpu1) - ns_from_ts(&cpu0); \
+      tls_stats.alloc_samples++; \
+      tls_stats.alloc_wall_ns_sum += wall_ns; \
+      tls_stats.alloc_cpu_ns_sum += cpu_ns; \
+      if (wall_ns > tls_stats.alloc_wall_ns_max) tls_stats.alloc_wall_ns_max = wall_ns; \
+      if (cpu_ns > tls_stats.alloc_cpu_ns_max) tls_stats.alloc_cpu_ns_max = cpu_ns; \
+    } \
+  } while (0)
+#else
+  #define RECORD_SAMPLE() do { } while (0)
+#endif
+  
   /* Map requested size to nearest size class (64, 96, 128, ..., 768).
    * Uses O(1) lookup table: k_class_lookup[size] → class index. */
   int ci = class_index_for_size(size);
-  if (ci < 0) return NULL;  /* Size too large or zero */
+  if (ci < 0) { RECORD_SAMPLE(); return NULL; }  /* Size too large or zero */
   
-  if (epoch >= a->epoch_count) return NULL;  /* Invalid epoch ID */
+  if (epoch >= a->epoch_count) { RECORD_SAMPLE(); return NULL; }  /* Invalid epoch ID */
   
   SizeClassAlloc* sc = &a->classes[(size_t)ci];
   
@@ -1345,6 +1374,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
   uint32_t state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_acquire);
   if (state != EPOCH_ACTIVE) {
     atomic_fetch_add_explicit(&sc->slow_path_epoch_closed, 1, memory_order_relaxed);
+    RECORD_SAMPLE();
     return NULL;
   }
   
@@ -1459,6 +1489,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       atomic_fetch_add_explicit(&sc->live_bytes, sc->object_size, memory_order_relaxed);
 #endif
       
+      RECORD_SAMPLE();
       return p;  /* Fast path success! */
     }
     
@@ -1543,6 +1574,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     /* Re-check epoch state (might have closed while we waited for lock) */
     state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_relaxed);
     if (state != EPOCH_ACTIVE) {
+      RECORD_SAMPLE();
       return NULL;  /* Epoch closed, refuse allocation */
     }
     
@@ -1618,6 +1650,17 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       /* Bitmap is stably full - move to FULL list.
        * DO NOT mutate free_count here: if there's divergence, the bug is in
        * allocation/free paths. Forcing free_count=0 under contention makes it worse. */
+#ifdef ENABLE_SLOWPATH_SAMPLING
+      struct timespec repair_wall0, repair_cpu0, repair_wall1, repair_cpu1;
+      clock_gettime(CLOCK_MONOTONIC, &repair_wall0);
+      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &repair_cpu0);
+      
+      uint32_t repair_reason = REPAIR_REASON_FULL_BITMAP;
+      if (s->list_id != SLAB_LIST_PARTIAL) {
+        repair_reason |= REPAIR_REASON_LIST_MISMATCH;
+      }
+#endif
+      
       fprintf(stderr, "\n*** REPAIRING zombie partial slab %p (free_count=%u, bitmap full) ***\n", 
               (void*)s, fc);
       fflush(stderr);
@@ -1626,6 +1669,24 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       s->list_id = SLAB_LIST_FULL;
       list_push_back(&es->full, s);
       atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
+      
+#ifdef ENABLE_SLOWPATH_SAMPLING
+      clock_gettime(CLOCK_MONOTONIC, &repair_wall1);
+      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &repair_cpu1);
+      
+      uint64_t repair_wall_ns = ns_from_ts(&repair_wall1) - ns_from_ts(&repair_wall0);
+      uint64_t repair_cpu_ns = ns_from_ts(&repair_cpu1) - ns_from_ts(&repair_cpu0);
+      
+      tls_stats.repair_count++;
+      tls_stats.repair_wall_ns_sum += repair_wall_ns;
+      tls_stats.repair_cpu_ns_sum += repair_cpu_ns;
+      if (repair_wall_ns > tls_stats.repair_wall_ns_max) tls_stats.repair_wall_ns_max = repair_wall_ns;
+      if (repair_cpu_ns > tls_stats.repair_cpu_ns_max) tls_stats.repair_cpu_ns_max = repair_cpu_ns;
+      
+      if (repair_reason & REPAIR_REASON_FULL_BITMAP) tls_stats.repair_reason_full_bitmap++;
+      if (repair_reason & REPAIR_REASON_LIST_MISMATCH) tls_stats.repair_reason_list_mismatch++;
+      if (repair_reason == 0) tls_stats.repair_reason_other++;
+#endif
       
       s = es->partial.head;  /* Try next partial slab */
     }
@@ -1638,6 +1699,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       
       new_s = new_slab(a, sc, epoch);  /* Cache hit or mmap + setup */
       if (!new_s) {
+        RECORD_SAMPLE();
         return NULL;  /* Out of memory */
       }
       
@@ -1745,8 +1807,10 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     atomic_fetch_add_explicit(&sc->live_bytes, sc->object_size, memory_order_relaxed);
 #endif
     
+    RECORD_SAMPLE();
     return p;
   }
+  #undef RECORD_SAMPLE
 }
 
 /* Free an object using its handle.
