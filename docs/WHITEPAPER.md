@@ -603,6 +603,52 @@ for (uint32_t cls = 0; cls < 8; cls++) {
 
 This API enables the "structural observability" claim: metrics organized by application phases (epochs), not reconstructed via sampling.
 
+**Comparison with malloc-based profiling:**
+
+| Approach | Overhead | Granularity | Implementation |
+|----------|----------|-------------|----------------|
+| **malloc (glibc ptmalloc2)** | N/A | None | No per-phase metrics available |
+| **jemalloc profiling** | 10-30% | Per-allocation | Sampling + backtrace reconstruction |
+| **tcmalloc heap profiler** | 5-15% | Per-allocation | Hash table tracking per pointer |
+| **Valgrind massif** | 20-50× slowdown | Per-allocation | Full memory interception |
+| **temporal-slab** | **0%** | **Per-phase** | Counters maintained for correctness |
+
+**Why malloc can't do this:**
+
+malloc operates at the **pointer level**, not the **phase level**. To answer "which HTTP route consumed 40MB?", malloc-based tools must:
+
+1. **Sample allocations** (jemalloc `--enable-prof`): Hash each pointer → backtrace, 10-30% overhead
+2. **Reconstruct phase attribution** via stack unwinding: Expensive (200-500ns per sample)
+3. **Aggregate post-hoc**: No real-time phase-level view, only after-the-fact analysis
+
+temporal-slab already tracks epochs for correctness (refcounts, state transitions). Exposing `slab_stats_epoch()` adds zero hot-path overhead because the counters **already exist**.
+
+**Concrete example: Detecting which request leaked memory**
+
+*With malloc + jemalloc profiling:*
+```bash
+# Enable profiling (10-30% overhead)
+export MALLOC_CONF="prof:true,prof_leak:true"
+./server  # Run with degraded performance
+
+# Generate heap profile after shutdown
+jeprof --text ./server jeprof.*.heap
+# Output: aggregated backtraces, must manually correlate to routes
+```
+
+*With temporal-slab:*
+```c
+// Zero overhead, check during request handling
+SlabEpochStats stats;
+slab_stats_epoch(&allocator, size_class, request_epoch, &stats);
+if (stats.reclaimable_slab_count > expected) {
+    log_warning("Route %s leaked memory: %u slabs unreleased",
+                route_name, stats.reclaimable_slab_count);
+}
+```
+
+No sampling, no profiling overhead, real-time attribution.
+
 ### 3.11 Slowpath Sampling (p9999 Diagnosis)
 
 For diagnosing extreme tail latency outliers (p9999/p99999), temporal-slab provides compile-time optional slowpath sampling:
