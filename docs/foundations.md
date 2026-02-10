@@ -1223,7 +1223,7 @@ To free:
 
 The slab allocator was invented by Jeff Bonwick in 1994 for the Solaris kernel. The problem: the kernel allocates many small objects (process descriptors, file handles, network buffers) with the same sizes repeatedly. Traditional allocators (dlmalloc, BSD malloc) are designed for arbitrary sizes and suffer high metadata overhead for small, fixed-size allocations. Slab allocation reduced kernel memory allocator overhead by 80% and became the standard for kernel-level allocation (Linux SLAB, SLUB, SLOB).
 
-temporal-slab adapts this for user-space, adding temporal grouping (lifetime affinity), lock-free fast paths, and conservative recycling (FULL-only reclamation). The core principle remains: fixed-size slots eliminate search overhead and enable O(1) allocation/free.
+temporal-slab adapts this for user-space, adding temporal grouping (lifetime affinity), lock-free fast paths, and conservative recycling (deferred reclamation via epoch_close rather than immediate recycling on free). The core principle remains: fixed-size slots eliminate search overhead and enable O(1) allocation/free.
 
 ## Lifetime Affinity
 
@@ -1461,6 +1461,80 @@ while (has_more_batches()) {
     process_batch(batch);
 }
 ```
+
+### Passive Epoch Reclamation
+
+temporal-slab uses **passive epoch reclamation**—epoch state transitions require no thread coordination or quiescence periods. This distinguishes it from RCU-style epoch-based reclamation schemes.
+
+**What is passive reclamation?**
+
+When `epoch_advance()` is called, three atomic operations occur:
+
+```c
+void epoch_advance(SlabAllocator* a) {
+    uint32_t old_epoch = current_epoch % 16;
+    uint32_t new_epoch = (current_epoch + 1) % 16;
+    
+    // Phase 1: Mark old epoch CLOSING (atomic store)
+    atomic_store(&epoch_state[old_epoch], EPOCH_CLOSING);
+    
+    // Phase 2: Mark new epoch ACTIVE (atomic store)
+    atomic_store(&epoch_state[new_epoch], EPOCH_ACTIVE);
+    
+    // Phase 3: Null current_partial pointers (8 atomic stores, one per size class)
+    for (size_t i = 0; i < 8; i++) {
+        atomic_store(&classes[i].epochs[old_epoch].current_partial, NULL);
+    }
+    
+    // That's it. No locks, no barriers, no waiting.
+}
+```
+
+**No coordination required:**
+- No grace periods (RCU-style "wait for all threads to reach quiescent state")
+- No thread registration/deregistration
+- No hazard pointer publication/unpublication
+- No epoch counter increments per-thread
+
+**Threads observe state changes asynchronously:**
+
+After `epoch_advance()`, threads discover the CLOSING state independently:
+
+```c
+void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch) {
+    // Every allocation checks epoch state (acquire ordering)
+    uint32_t state = atomic_load(&a->epoch_state[epoch], memory_order_acquire);
+    if (state != EPOCH_ACTIVE) {
+        return NULL;  // Epoch closed, reject allocation
+    }
+    
+    // Continue with allocation...
+}
+```
+
+The CLOSING epoch drains **passively**:
+- New allocations are rejected (state check fails)
+- Existing allocations remain valid (no forced invalidation)
+- Frees continue normally (lock-free bitmap operations)
+- Empty slabs accumulate until `epoch_close()` sweeps them
+
+**Contrast with RCU:**
+
+| Mechanism | Coordination | Reclamation Trigger | Remote Ops |
+|-----------|--------------|---------------------|------------|
+| **RCU** | Quiescent states required | Grace period expires (all threads reached quiescence) | Often requires slow path |
+| **Hazard Pointers** | Per-pointer protection | Retry scan on contention | Lock-free but complex |
+| **Passive Epoch (temporal-slab)** | None (observe & adapt) | Explicit `epoch_close()` or passive drain | Lock-free bitmap CAS |
+
+**Why this matters for performance:**
+
+Passive reclamation eliminates coordination overhead:
+- No per-thread epoch counters to increment
+- No grace period waiting (deterministic latency)
+- No callback queues or deferred work
+- Application controls reclamation timing via `epoch_close()`
+
+The cost is deferred reclamation: empty slabs stay allocated until `epoch_close()` is called. But this cost is predictable and application-controlled, unlike GC pauses or background reclamation threads.
 
 **Epoch closing with epoch_close():**
 
@@ -4267,44 +4341,47 @@ Cost: 40-80 cycles per access. For short-lived accesses (allocate → use → fr
 
 temporal-slab uses conservative recycling instead:
 
-**Conservative recycling rule:** Only recycle slabs that are **provably unreachable** by any thread in the fast path.
+**Conservative recycling rule:** Defer all slab recycling until explicit `epoch_close()` calls, avoiding immediate recycling in the allocation/free hot path.
 
 ```
-Slabs on PARTIAL list:
-- Published to current_partial
-- Threads may hold pointers
-- NEVER recycled (even if empty)
+During allocation/free (hot path):
+- free_obj() NEVER recycles empty slabs
+- Empty slabs just move to PARTIAL list or stay there
+- Increments empty_partial_count for tracking
+- Zero recycling overhead in fast path
 
-Slabs on FULL list:
-- Never published to current_partial
-- No thread can hold pointers (no way to obtain them)
-- Safe to recycle immediately when empty
+During epoch_close() (cold path):
+- Scans BOTH partial AND full lists for empty slabs
+- Removes empty slabs from lists atomically
+- Pushes to slab cache for reuse
+- madvise() reclaims RSS for unpublished slabs
 ```
 
 This avoids complexity:
-- **No per-access overhead:** Threads don't publish/unpublish pointers (no hazard pointer cost)
-- **No per-object refcounts:** No atomic increments on every access
-- **No scanning:** No need to check if pointers are live (only FULL slabs are recycled)
-- **No retire lists:** Recycling is immediate for FULL slabs (no deferred free queue)
+- **No per-access overhead:** Threads don't track slab lifecycle during alloc/free
+- **No immediate recycling decisions:** free_obj() just updates bitmap and moves slabs between lists
+- **No retire lists:** Recycling happens in bulk during epoch_close (deterministic timing)
+- **Deferred reclamation:** Application controls when RSS drops happen (aligned with phase boundaries)
 
 **The tradeoff:**
 
-Hazard pointers / reference counting enable aggressive recycling:
-- Can recycle any empty slab immediately
-- Lower RSS (no "stranded" empty slabs on PARTIAL list)
-- Cost: 20-80 cycles overhead per access
+Immediate recycling (malloc-style):
+- Can recycle any empty slab as soon as it becomes empty
+- Lower RSS baseline (no accumulated empty slabs)
+- Cost: Recycling logic in every free() path, unpredictable RSS fluctuations
 
-Conservative recycling enables simple, fast allocation:
-- Zero per-access overhead (no hazard pointer stores, no refcount increments)
-- Slightly higher RSS (empty PARTIAL slabs not recycled)
-- Cost: Some empty slabs remain allocated (but RSS is still bounded)
+Conservative (deferred) recycling:
+- Zero recycling overhead in alloc/free paths
+- RSS drops are deterministic (only during epoch_close)
+- Cost: RSS stays elevated until epoch_close() is called
 
-temporal-slab chooses simplicity and predictability: a 90% empty slab on the PARTIAL list contributes to RSS, but this is acceptable because:
-1. RSS is still bounded (no drift over time)
-2. The slab will be refilled quickly under churn (temporal reuse)
-3. Worst case: RSS = 2× ideal (if every PARTIAL slab is 50% empty)
+temporal-slab chooses predictability and control: empty slabs accumulate during an epoch's lifetime, then get recycled in bulk when the application calls epoch_close(). This means:
+1. RSS reflects high-water mark until explicit reclamation
+2. No surprise GC pauses or background reclamation threads
+3. Application controls when RSS drops happen (e.g., after request completes)
+4. Recycling cost is amortized across many slabs (bulk operation)
 
-In practice, under high churn, PARTIAL slabs refill faster than they drain—the 0% recycling observed in benchmarks is expected behavior, not a bug. The epoch mechanism prevents RSS growth by ensuring new cohorts use fresh slabs, not by aggressively recycling old ones.
+In practice, this matches application-level phase boundaries: a web server processes a request (RSS grows), then calls epoch_close() when the request completes (RSS drops). The epoch mechanism prevents unbounded growth by ensuring old epochs drain and get recycled before wraparound.
 
 ## ABA Problem
 
@@ -5781,8 +5858,9 @@ Result: `RSS(t) = baseline + drift(t)` where `drift(t)` grows linearly with time
 - Bitmap tracks slot state in 8 bytes per slab (1.6% overhead)
 - O(1) allocation/free (find first zero bit, atomic CAS)
 
-**3. Conservative recycling (FULL-only + Slab Cache):**
-- Empty slabs from FULL list are recycled (safe, no race conditions)
+**3. Conservative recycling (Deferred + Slab Cache):**
+- Empty slabs recycled only during epoch_close() (not in alloc/free path)
+- Scans both PARTIAL and FULL lists for empty slabs
 - Recycled slabs enter the cache (32 per size class)
 - Cache hits reuse existing slabs → RSS doesn't grow
 - Overflow list tracks excess empty slabs → Bounded growth
@@ -5885,7 +5963,8 @@ Slab allocation solves this by dividing pages into fixed-size slots (size classe
 temporal-slab extends this with:
 - **Lock-free fast-path allocation** (120ns p99, 340ns p999 validated on GitHub Actions)
 - **Phase boundary alignment** (applications signal lifetime phase completion via epoch_close())
-- **Conservative recycling** (only FULL slabs recycled, eliminating use-after-free races)
+- **Passive epoch reclamation** (no quiescence requirements—threads observe state changes asynchronously)
+- **Conservative recycling** (deferred until epoch_close, zero overhead in alloc/free paths)
 - **Slab registry with generation counters** (enables safe madvise/munmap with ABA protection)
 - **Epoch-granular reclamation** (deterministic RSS drops aligned with application phase boundaries)
 - **O(1) class selection** (lookup table eliminates branching jitter)
