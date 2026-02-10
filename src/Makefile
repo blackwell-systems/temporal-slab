@@ -2,6 +2,10 @@ CC = gcc
 CFLAGS = -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include -DENABLE_RSS_RECLAMATION=1
 TSAN_FLAGS = -O1 -g -std=c11 -pthread -Wall -Wextra -pedantic -I../include -DENABLE_RSS_RECLAMATION=1 -fsanitize=thread
 
+# Conditional TLS cache support (optional dependency)
+# Build with: make CFLAGS="$(CFLAGS) -DENABLE_TLS_CACHE=1" TLS_OBJ=slab_tls_cache.o
+TLS_OBJ ?=
+
 all: smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump synthetic_bench
 
 # ThreadSanitizer builds for data race detection
@@ -28,37 +32,41 @@ slab_lib.c: slab_alloc.c
 slab_lib.o: slab_lib.c
 	$(CC) $(CFLAGS) -c slab_lib.c -o slab_lib.o
 
+# TLS cache module (optional, enabled with -DENABLE_TLS_CACHE=1)
+slab_tls_cache.o: slab_tls_cache.c
+	$(CC) $(CFLAGS) -c slab_tls_cache.c -o slab_tls_cache.o
+
 # Epoch domain module
 epoch_domain.o: epoch_domain.c
 	$(CC) $(CFLAGS) -c epoch_domain.c -o epoch_domain.o
 
 # Smoke tests executable
-smoke_tests: smoke_tests.c slab_lib.o
-	$(CC) $(CFLAGS) smoke_tests.c slab_lib.o -o smoke_tests
+smoke_tests: smoke_tests.c slab_lib.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) smoke_tests.c slab_lib.o $(TLS_OBJ) -o smoke_tests
 
 # Accurate benchmark executable
-benchmark_accurate: benchmark_accurate.c slab_lib.o
-	$(CC) $(CFLAGS) benchmark_accurate.c slab_lib.o -o benchmark_accurate
+benchmark_accurate: benchmark_accurate.c slab_lib.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) benchmark_accurate.c slab_lib.o $(TLS_OBJ) -o benchmark_accurate
 
 # Multi-threaded scaling benchmark
-benchmark_threads: benchmark_threads.c slab_lib.o slab_stats.o
-	$(CC) $(CFLAGS) benchmark_threads.c slab_lib.o slab_stats.o -o benchmark_threads
+benchmark_threads: benchmark_threads.c slab_lib.o slab_stats.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) benchmark_threads.c slab_lib.o slab_stats.o $(TLS_OBJ) -o benchmark_threads
 
 # Soak test executable (long-running stability test)
-soak_test: soak_test.c slab_lib.o
-	$(CC) $(CFLAGS) soak_test.c slab_lib.o -o soak_test
+soak_test: soak_test.c slab_lib.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) soak_test.c slab_lib.o $(TLS_OBJ) -o soak_test
 
 # Churn test executable (Phase 2.1 RSS bounds validation)
-churn_test: churn_test.c slab_lib.o
-	$(CC) $(CFLAGS) churn_test.c slab_lib.o -o churn_test
+churn_test: churn_test.c slab_lib.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) churn_test.c slab_lib.o $(TLS_OBJ) -o churn_test
 
 # Malloc wrapper test executable
-test_malloc_wrapper: test_malloc_wrapper.c slab_lib.o
-	$(CC) $(CFLAGS) test_malloc_wrapper.c slab_lib.o -o test_malloc_wrapper
+test_malloc_wrapper: test_malloc_wrapper.c slab_lib.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) test_malloc_wrapper.c slab_lib.o $(TLS_OBJ) -o test_malloc_wrapper
 
 # Domain usage examples
-domain_usage: ../examples/domain_usage.c slab_lib.o epoch_domain.o
-	$(CC) $(CFLAGS) ../examples/domain_usage.c slab_lib.o epoch_domain.o -o domain_usage
+domain_usage: ../examples/domain_usage.c slab_lib.o epoch_domain.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) ../examples/domain_usage.c slab_lib.o epoch_domain.o $(TLS_OBJ) -o domain_usage
 
 # Phase 2.0: Observability stats snapshot tool
 slab_stats.o: slab_stats.c
@@ -68,16 +76,16 @@ slab_stats.o: slab_stats.c
 slab_diagnostics.o: slab_diagnostics.c
 	$(CC) $(CFLAGS) -c slab_diagnostics.c -o slab_diagnostics.o
 
-stats_dump: stats_dump.c slab_lib.o slab_stats.o slab_diagnostics.o
-	$(CC) $(CFLAGS) stats_dump.c slab_lib.o slab_stats.o slab_diagnostics.o -o stats_dump
+stats_dump: stats_dump.c slab_lib.o slab_stats.o slab_diagnostics.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) stats_dump.c slab_lib.o slab_stats.o slab_diagnostics.o $(TLS_OBJ) -o stats_dump
 
 # Phase 2.2: Era stamping test
-test_era_stamping: test_era_stamping.c slab_lib.o
-	$(CC) $(CFLAGS) test_era_stamping.c slab_lib.o -o test_era_stamping
+test_era_stamping: test_era_stamping.c slab_lib.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) test_era_stamping.c slab_lib.o $(TLS_OBJ) -o test_era_stamping
 
 # Canonical benchmark harness
-synthetic_bench: ../workloads/synthetic_bench.c slab_lib.o slab_stats.o
-	$(CC) $(CFLAGS) ../workloads/synthetic_bench.c slab_lib.o slab_stats.o -o ../workloads/synthetic_bench
+synthetic_bench: ../workloads/synthetic_bench.c slab_lib.o slab_stats.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) ../workloads/synthetic_bench.c slab_lib.o slab_stats.o $(TLS_OBJ) -o ../workloads/synthetic_bench
 
 clean:
 	rm -f smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump slab_lib.c slab_lib.o epoch_domain.o slab_stats.o benchmark_threads_tsan slab_lib_tsan.o tsan_test ../workloads/synthetic_bench
