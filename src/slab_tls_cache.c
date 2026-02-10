@@ -39,6 +39,8 @@ static inline int tls_should_bypass_alloc(TLSCache* tls) {
         if (tls->window_ops >= tls->bypass_ends_at) {
             tls->bypass_alloc = 0;  /* Re-enable after bypass window */
             tls->bypass_free = 0;
+            tls->window_hits = 0;   /* Reset window state for clean measurement */
+            tls->window_ops = 0;
         }
         return 1;
     }
@@ -55,7 +57,9 @@ static inline void tls_record_alloc(TLSCache* tls, int hit) {
         uint32_t hits = tls->window_hits;
         uint32_t pct = (hits * 100) / TLS_WINDOW_OPS;
         
-        if (pct < TLS_MIN_HIT_PCT) {
+        /* Warmup protection: Don't enable bypass during first measurement window.
+         * Allow at least one refill opportunity before deciding TLS is ineffective. */
+        if (tls->window_ops > TLS_WINDOW_OPS && pct < TLS_MIN_HIT_PCT) {
             /* Hit rate too low - disable both alloc and free */
             tls->bypass_alloc = 1;
             tls->bypass_free = 1;  /* Also bypass free (no reuse expected) */
