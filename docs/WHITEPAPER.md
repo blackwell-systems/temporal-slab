@@ -41,9 +41,11 @@ This paper makes the following contributions:
 
 3. **Conservative deferred recycling:** Elimination of recycling overhead from allocation/free hot paths by deferring all reclamation to explicit `epoch_close()` calls.
 
-4. **Implementation validation:** Comprehensive benchmarking showing 12-13× tail latency improvement over malloc, with detailed analysis of contention behavior under multi-threaded load.
+4. **Production-grade robustness features:** Zombie partial slab repair (defense-in-depth against metadata divergence), semantic attribution via bounded label registry (zero-overhead per-phase contention tracking), and slowpath sampling (p9999 outlier diagnosis in virtualized environments).
 
-5. **Commercial applicability analysis:** Concrete evaluation of how the design maps to five production domains, with working reference implementations.
+5. **Implementation validation:** Comprehensive benchmarking showing 12-13× tail latency improvement over malloc, with detailed analysis of contention behavior under multi-threaded load.
+
+6. **Commercial applicability analysis:** Concrete evaluation of how the design maps to five production domains, with working reference implementations.
 
 ---
 
@@ -383,6 +385,162 @@ bool tls_try_free(SlabAllocator* a, uint32_t sc, SlabHandle h) {
 ```
 
 This eliminates metadata divergence while preserving the alloc-path benefit.
+
+### 3.8 Semantic Attribution (Label Registry)
+
+For production observability, temporal-slab provides **bounded semantic attribution** via a label registry mapping epochs to human-readable labels:
+
+```c
+// Assign semantic label to epoch
+slab_epoch_set_label(alloc, epoch, "request_id:abc123");
+
+// Query stats with label context
+EpochStats stats;
+slab_stats_epoch(alloc, epoch, &stats);
+printf("Epoch '%s': %lu live allocations, %lu bytes RSS\n",
+       stats.label, stats.alloc_count, stats.estimated_rss_bytes);
+```
+
+**Label registry architecture:**
+
+```c
+#define MAX_LABEL_IDS 16  // Bounded cardinality for hot-path lookup
+
+typedef struct {
+    char labels[MAX_LABEL_IDS][32];  // ID → label string mapping
+    uint8_t count;                    // Currently registered labels
+    pthread_mutex_t lock;             // Protects allocation
+} LabelRegistry;
+
+typedef struct {
+    char label[32];                   // Full label string
+    uint8_t label_id;                 // Compact ID (0-15)
+} EpochMetadata;
+```
+
+**Label ID assignment:**
+1. Search for existing label (reuse ID if found)
+2. If not found and space available, allocate new ID
+3. If registry full (16 labels), fall back to ID=0 ("unlabeled")
+
+**Why bounded cardinality matters:**
+
+Hot-path contention attribution uses label_id for fast indexing:
+
+```c
+#ifdef ENABLE_LABEL_CONTENTION
+uint8_t lid = current_label_id(alloc);  // TLS lookup: O(1)
+atomic_fetch_add(&sc->bitmap_alloc_cas_retries_by_label[lid], retries);
+#endif
+```
+
+With 16 labels, the attribution array fits in 128 bytes (16 × 8-byte counters), staying within a single cache line for hot data.
+
+**Use case example:**
+
+```c
+// Web server with per-route attribution
+epoch_domain_t* d = epoch_domain_enter(alloc, "/api/users");
+// All contention during this request attributed to "/api/users"
+
+// Dashboard shows:
+//   /api/users:    10K lock contentions, 50K CAS retries
+//   /api/orders:   2K lock contentions,  8K CAS retries
+//   /api/products: 1K lock contentions,  3K CAS retries
+```
+
+This enables identifying which application phases cause allocator contention without profiler overhead.
+
+### 3.9 Zombie Partial Repair
+
+**Problem:** Under rare race conditions, free_count and bitmap can diverge:
+
+```
+free_count = 1 (slab reports "1 free slot")
+bitmap = 0xFFFFFFFF (all bits set = "0 free slots")
+```
+
+This creates a **zombie partial slab**: reported as having free slots but bitmap is actually full. Threads attempting allocation will CAS-retry infinitely.
+
+**Repair mechanism:**
+
+```c
+// In alloc_obj_epoch slow path
+while (s = es->partial.head) {
+    uint32_t fc = atomic_load(&s->free_count, memory_order_relaxed);
+    
+    // Quick check: fc >= 2 means definitely not full
+    if (fc >= 2) break;
+    
+    // If fc == 0 or 1, verify against bitmap (double-check with fence)
+    _Atomic uint32_t* bm = slab_bitmap_ptr(s);
+    bool bitmap_full = check_all_bits_set(bm, s->object_count);
+    
+    if (bitmap_full) {
+        atomic_thread_fence(memory_order_acquire);  // Fence before re-check
+        bitmap_full = check_all_bits_set(bm, s->object_count);  // Verify stability
+    }
+    
+    if (bitmap_full) {
+        // Zombie detected: move PARTIAL → FULL
+        fprintf(stderr, "*** REPAIRING zombie partial slab (free_count=%u) ***\n", fc);
+        list_remove(&es->partial, s);
+        list_push_back(&es->full, s);
+        s->list_id = SLAB_LIST_FULL;
+        s = es->partial.head;  // Try next slab
+    } else {
+        break;  // Slab is actually usable
+    }
+}
+```
+
+**Why double-check with fence:**
+
+Without the fence, transient views during concurrent bitmap updates could false-positive. The acquire fence synchronizes with bitmap CAS release stores, ensuring we observe stable state.
+
+**Root cause mitigation:**
+
+The divergence source was identified and fixed (lines 1470-1526 in slab_alloc.c), but the repair mechanism remains as defense-in-depth.
+
+### 3.10 Slowpath Sampling (p9999 Diagnosis)
+
+For diagnosing extreme tail latency outliers (p9999/p99999), temporal-slab provides compile-time optional slowpath sampling:
+
+```c
+// Enable with: make CFLAGS="-DENABLE_SLOWPATH_SAMPLING=1"
+
+typedef struct {
+    uint64_t wall_ns;       // Wall-clock time (CLOCK_MONOTONIC)
+    uint64_t cpu_ns;        // Thread CPU time (CLOCK_THREAD_CPUTIME_ID)
+    uint32_t size_class;    // Which size class
+    uint32_t reason_flags;  // Bitfield of SLOWPATH_* reasons
+    uint32_t retries;       // CAS retry count if applicable
+} SlowpathSample;
+```
+
+**Reason flags distinguish allocator work from VM noise:**
+
+```c
+#define SLOWPATH_LOCK_WAIT      (1u << 0)  // Blocked on sc->lock
+#define SLOWPATH_NEW_SLAB       (1u << 1)  // Called mmap
+#define SLOWPATH_ZOMBIE_REPAIR  (1u << 2)  // Repaired zombie slab
+#define SLOWPATH_CACHE_OVERFLOW (1u << 3)  // Overflow list scan
+#define SLOWPATH_CAS_RETRY      (1u << 4)  // Excessive bitmap CAS retries
+```
+
+**Analysis example:**
+
+```
+Sample 1: wall=45µs, cpu=42µs, reason=LOCK_WAIT
+  → Real contention (CPU-bound work)
+
+Sample 2: wall=15ms, cpu=80µs, reason=LOCK_WAIT
+  → VM scheduling noise (WSL2 preemption, wall >> cpu)
+```
+
+Samples stored in lock-free ring buffer (10,000 entries, overwriting oldest). Overhead: ~50-100ns per sample, only triggered for allocations exceeding threshold (default 5µs).
+
+**Use case:** Debugging p99999 outliers in CI/CD environments where virtualization introduces non-deterministic scheduling delays.
 
 ---
 
