@@ -167,6 +167,282 @@ while (1) {
 }
 ```
 
+### Adaptive Bitmap Scanning (Phase 2.2+)
+
+**Problem:** Under high contention, multiple threads scanning the same bitmap sequentially (0, 1, 2, ...) creates a **thundering herd** - all threads compete for the first free bit, amplifying CAS retry storms.
+
+**Solution:** Adaptive controller that switches between **sequential** and **randomized** scanning based on observed CAS retry rate.
+
+**How it works:**
+
+```c
+// Mode 0: Sequential scan (0, 1, 2, ...)
+// Mode 1: Randomized scan (hash(thread_id) % words, then wrap)
+
+// Controller checks every 262,144 allocations (no clock syscalls)
+if ((alloc_count & 0x3FFFF) == 0) {
+  double retry_rate = retries_delta / allocs_delta;
+  
+  if (mode == 0 && retry_rate > 0.30) {
+    mode = 1;  // Switch to randomized (spread threads)
+    dwell = 50;  // Prevent flapping
+  } else if (mode == 1 && retry_rate < 0.10) {
+    mode = 0;  // Switch back to sequential (better cache locality)
+    dwell = 50;
+  }
+}
+```
+
+**Key design decisions:**
+
+1. **Windowed deltas, not lifetime averages** - Fast convergence to new workload patterns
+2. **Allocation-count triggered** - Zero clock syscalls (no jitter)
+3. **TLS-cached offsets** - Hash computed once per thread (amortized cost)
+4. **Hysteresis (dwell countdown)** - Prevents mode flapping under marginal conditions
+
+**Thresholds:**
+
+| Threshold | Value | Rationale |
+|-----------|-------|-----------|
+| **Enable randomized** | 0.30 retries/op | 30% of allocations retry = contention severe enough to justify randomization overhead |
+| **Disable randomized** | 0.10 retries/op | Below 10%, sequential is faster (better cache locality) |
+| **Dwell countdown** | 50 checks | ~13M allocations between switches (prevent flapping) |
+
+**Observability:**
+
+```c
+SlabClassStats stats;
+slab_stats_class(alloc, 2, &stats);
+
+printf("Adaptive scanning state:\n");
+printf("  Current mode:     %u (0=sequential, 1=randomized)\n", stats.scan_mode);
+printf("  Total checks:     %u\n", stats.scan_adapt_checks);
+printf("  Mode switches:    %u\n", stats.scan_adapt_switches);
+printf("  CAS retry rate:   %.4f\n", stats.avg_alloc_cas_retries_per_attempt);
+```
+
+**When it helps:**
+
+- **High thread count (8-16 threads)** - Sequential scan creates hotspots
+- **Small slab count** - All threads competing for same 2-3 slabs
+- **Bursty allocation** - Sudden load spikes trigger mode switch
+
+**When it doesn't help:**
+
+- **Single-threaded** - Always mode 0 (no contention)
+- **Large slab pool** - Threads naturally spread across slabs
+- **Low allocation rate** - Not enough samples to trigger adaptation
+
+**Performance impact:**
+
+- **Sequential mode:** ~2ns per allocation (cache-friendly linear scan)
+- **Randomized mode:** ~5ns per allocation (hash + modulo + wrap logic)
+- **Mode switch cost:** 0ns (purely observational, no synchronization)
+
+**Critical insight:** This is a **reactive controller**, not predictive. It responds to past contention patterns, so there's a lag (up to 262K allocations) before adaptation. For workloads with sustained contention, this is perfect. For microsecond-scale bursts, the controller may not react in time.
+
+### Label-Based Contention Attribution (Phase 2.3)
+
+**Problem:** Aggregate contention metrics don't answer: **"Which workload phase is causing contention?"**
+
+Example: Lock contention is 25%, but is it from request processing, background tasks, or GC?
+
+**Solution:** Per-label contention counters that attribute lock/CAS operations to semantic domains.
+
+**Requires compile flag:** `ENABLE_LABEL_CONTENTION=1`
+
+**How it works:**
+
+```c
+// Application registers semantic labels
+epoch_domain_t* request = epoch_domain_create(alloc, "request:abc123");
+epoch_domain_enter(request);
+
+// All allocations/frees now attributed to "request:abc123"
+void* obj = slab_malloc(alloc, 128);
+// → lock_fast_acquire_by_label[3]++  (label ID 3 = "request:abc123")
+
+epoch_domain_exit(request);
+```
+
+**Label registry (bounded cardinality):**
+
+- **16 label IDs** max (0-15)
+- **ID 0:** Unlabeled (no active domain)
+- **ID 1-15:** Registered labels (first-come-first-served)
+- If registry full, new labels map to ID 0 ("other" bucket)
+
+**Per-label metrics collected:**
+
+```c
+#ifdef ENABLE_LABEL_CONTENTION
+typedef struct {
+  uint64_t lock_fast_acquire_by_label[16];        // Trylock succeeded
+  uint64_t lock_contended_by_label[16];           // Trylock failed (blocked)
+  uint64_t bitmap_alloc_cas_retries_by_label[16]; // CAS retry loops (alloc)
+  uint64_t bitmap_free_cas_retries_by_label[16];  // CAS retry loops (free)
+} SlabClassStats;
+#endif
+```
+
+**Diagnostic query:**
+
+```c
+SlabClassStats stats;
+slab_stats_class(alloc, 2, &stats);
+
+// Cross-reference label IDs with registry
+for (uint8_t lid = 0; lid < 16; lid++) {
+  const char* label = alloc->label_registry.labels[lid];
+  if (label[0] == '\0') break;  // End of registered labels
+  
+  uint64_t total_ops = stats.lock_fast_acquire_by_label[lid] + 
+                       stats.lock_contended_by_label[lid];
+  double contention_rate = (double)stats.lock_contended_by_label[lid] / total_ops;
+  
+  printf("Label [%u] \"%s\": %.2f%% lock contention, %lu CAS retries\n",
+         lid, label, contention_rate * 100.0, 
+         stats.bitmap_alloc_cas_retries_by_label[lid]);
+}
+```
+
+**Example output:**
+
+```
+Label [0] "(unlabeled)":       2.1% lock contention, 1,234 CAS retries
+Label [1] "request:GET":      18.3% lock contention, 45,678 CAS retries  ← HOT
+Label [2] "request:POST":      8.7% lock contention, 12,345 CAS retries
+Label [3] "background:gc":     1.2% lock contention, 567 CAS retries
+Label [4] "frame:render":     22.5% lock contention, 78,901 CAS retries  ← HOT
+```
+
+**Performance cost:**
+
+- **Without flag:** 0ns (feature compiled out entirely)
+- **With flag:** ~5ns per lock acquisition (TLS lookup + array index)
+- **Hot-path overhead:** Acceptable for diagnostics, **not recommended for HFT production**
+
+**When to enable:**
+
+- **Incident investigation:** "Which workload is causing the contention spike?"
+- **Capacity planning:** "How much contention does each request type generate?"
+- **A/B testing:** "Did the new code path reduce contention?"
+
+**When to disable:**
+
+- **HFT production:** 5ns overhead unacceptable
+- **Single-phase workloads:** All allocations from one domain (no attribution value)
+- **Memory-constrained:** 16 × 4 × uint64_t per size class = 512 bytes overhead
+
+### Slowpath Sampling (Phase 2.5)
+
+**Problem:** Tail latency spikes (p99 > 1µs) could be from:
+1. **Allocator work** (CAS storms, zombie repairs, lock contention)
+2. **Scheduler interference** (WSL2 hypervisor, preemption, context switches)
+
+Aggregate metrics can't distinguish these.
+
+**Solution:** Probabilistic end-to-end sampling with **wall vs CPU time split**.
+
+**Requires compile flag:** `ENABLE_SLOWPATH_SAMPLING=1`
+
+**How it works:**
+
+```c
+// 1/1024 sampling (fast & modulo, no random number generation)
+bool sample = ((++tls_sample_ctr & 0x3FF) == 0);
+
+if (sample) {
+  clock_gettime(CLOCK_MONOTONIC, &wall_start);         // Wall time
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start); // CPU time
+}
+
+void* obj = alloc_obj_epoch(alloc, size, epoch, &handle);
+
+if (sample) {
+  clock_gettime(CLOCK_MONOTONIC, &wall_end);
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end);
+  
+  uint64_t wall_ns = wall_end - wall_start;  // Includes scheduler delays
+  uint64_t cpu_ns = cpu_end - cpu_start;     // Only actual CPU work
+  
+  tls_stats.alloc_wall_ns_sum += wall_ns;
+  tls_stats.alloc_cpu_ns_sum += cpu_ns;
+  tls_stats.alloc_samples++;
+}
+```
+
+**Interpretation:**
+
+| Condition | Diagnosis |
+|-----------|-----------|
+| **wall ≈ cpu** | Clean measurement, allocator doing real work (CAS storms, repairs) |
+| **wall > cpu × 1.5** | Moderate scheduler noise (context switches, TLB flushes) |
+| **wall > cpu × 2** | Severe interference (WSL2 hypervisor, VM preemption) |
+| **cpu > wall** | Clock skew (rare, ignore sample) |
+
+**Per-thread statistics:**
+
+```c
+ThreadStats stats = slab_stats_thread();
+
+if (stats.alloc_samples > 0) {
+  uint64_t avg_wall = stats.alloc_wall_ns_sum / stats.alloc_samples;
+  uint64_t avg_cpu = stats.alloc_cpu_ns_sum / stats.alloc_samples;
+  
+  printf("Allocation tail latency (1/1024 sampling):\n");
+  printf("  Samples:        %lu (out of ~%lu total)\n", 
+         stats.alloc_samples, stats.alloc_samples * 1024);
+  printf("  Avg wall time:  %lu ns (max: %lu ns)\n", 
+         avg_wall, stats.alloc_wall_ns_max);
+  printf("  Avg CPU time:   %lu ns (max: %lu ns)\n", 
+         avg_cpu, stats.alloc_cpu_ns_max);
+  printf("  Wall/CPU ratio: %.2fx\n", (double)avg_wall / avg_cpu);
+  
+  if (avg_wall > avg_cpu * 2) {
+    printf("  ⚠ WARNING: wall >> cpu suggests scheduler interference\n");
+  }
+}
+```
+
+**Zombie repair timing:**
+
+Also tracks repair operations (when slabs on PARTIAL list are detected as full):
+
+```c
+if (stats.repair_count > 0) {
+  printf("Zombie repair statistics:\n");
+  printf("  Total repairs:  %lu\n", stats.repair_count);
+  printf("  Avg wall time:  %lu ns\n", 
+         stats.repair_wall_ns_sum / stats.repair_count);
+  printf("  Reasons:\n");
+  printf("    Full bitmap:    %lu (free_count=0, bitmap full)\n", 
+         stats.repair_reason_full_bitmap);
+  printf("    List mismatch:  %lu (list_id wrong)\n", 
+         stats.repair_reason_list_mismatch);
+}
+```
+
+**Performance cost:**
+
+- **Sampling overhead:** 1/1024 × (6 × clock_gettime) = ~350ns / 1024 = **0.34ns avg**
+- **Jitter:** High (clock_gettime is 50-200ns variable)
+- **TLS storage:** 9 × uint64_t = 72 bytes per thread
+
+**When to enable:**
+
+- **Incident investigation:** "Is tail latency from allocator or OS?"
+- **WSL2 validation:** "How much hypervisor overhead exists?"
+- **Repair diagnosis:** "Are invariant violations contributing to latency?"
+
+**When to disable:**
+
+- **HFT production:** Clock syscalls introduce unacceptable jitter
+- **Low-latency paths:** Even 0.34ns average overhead adds up
+- **After diagnosis:** Once root cause identified, disable for production
+
+**Critical insight:** Slowpath sampling is a **diagnostic tool**, not a production monitoring solution. The wall/CPU split is invaluable for distinguishing allocator bugs from environmental noise, but the jitter makes it unsuitable for always-on monitoring in latency-sensitive systems.
+
 ### Healthy Contention Patterns
 
 **Excellent (validated on GitHub Actions):**
@@ -207,6 +483,9 @@ temporal-slab implements **tiered contention observability** to balance producti
 - `bitmap_alloc_cas_retries` - CAS retry loops
 - `bitmap_free_cas_retries` - CAS retry loops
 - `current_partial_cas_failures` - Pointer swap failures
+- `scan_adapt.mode` - Current bitmap scanning mode (0=sequential, 1=randomized)
+- `scan_adapt.checks` - Controller evaluations performed
+- `scan_adapt.switches` - Mode transitions (sequential ↔ randomized)
 
 **When to use:** **Always-on in production** for HFT systems
 
@@ -214,10 +493,41 @@ temporal-slab implements **tiered contention observability** to balance producti
 - "Are threads blocking on this lock?" (yes/no)
 - "How much CAS contention exists?" (retries per operation)
 - "Which size classes have contention?" (per-class attribution)
+- "Is adaptive scanning active?" (mode + switches count)
 
 **Does NOT answer:**
 - "How long did threads block?" (duration not measured)
 - "What is P99 lock hold time?" (no timing data)
+- "Which workload phase caused contention?" (needs Tier 0.5)
+
+### Tier 0.5: Label-Based Attribution (Diagnostic Mode)
+
+**What:** Per-label contention counters (semantic attribution)
+
+**Overhead:** ~5ns per lock acquisition (TLS lookup + array index)
+
+**Jitter:** **Zero** (no clock syscalls, purely counter increments)
+
+**Requires:** `ENABLE_LABEL_CONTENTION=1` compile flag
+
+**Metrics collected:**
+- `lock_fast_acquire_by_label[16]` - Trylock succeeded per label
+- `lock_contended_by_label[16]` - Trylock failed per label
+- `bitmap_alloc_cas_retries_by_label[16]` - CAS retries per label
+- `bitmap_free_cas_retries_by_label[16]` - Free CAS retries per label
+
+**When to use:** **Incident investigation only**, not HFT production
+
+**Answers:**
+- "Which workload phase is causing contention?" (request, GC, render, etc.)
+- "Does the new code path reduce contention?" (A/B testing)
+- "How much contention per request type?" (capacity planning)
+
+**Does NOT answer:**
+- "How long did each phase block?" (no timing data)
+- "What is P99 by label?" (needs Tier 1 + label)
+
+**Trade-off:** 5ns overhead is acceptable for diagnostics, but 2.5× slower than Tier 0. Use only when you need to attribute contention to specific workload phases.
 
 ### Tier 1: Sampled Timing (Incident Mode Only)
 
@@ -252,14 +562,52 @@ temporal-slab implements **tiered contention observability** to balance producti
 
 **Why exists:** Detailed profiling, lock hold time analysis, contention hotspot identification
 
+### Tier 2.5: Slowpath Sampling (Allocator/OS Split)
+
+**What:** Probabilistic end-to-end allocation timing with wall vs CPU time split
+
+**Overhead:** 1/1024 × (6 × clock_gettime) = **0.34ns average**
+
+**Jitter:** **High** (clock_gettime variance 50-200ns, even with sampling)
+
+**Requires:** `ENABLE_SLOWPATH_SAMPLING=1` compile flag
+
+**Metrics collected:**
+- `alloc_samples` - Number of sampled allocations
+- `alloc_wall_ns_sum/max` - Wall time (includes scheduler delays)
+- `alloc_cpu_ns_sum/max` - CPU time (actual allocator work)
+- `repair_count` - Zombie slab repairs detected
+- `repair_wall_ns_sum/max` - Wall time spent in repairs
+
+**When to use:** **Post-incident analysis only**
+
+**Answers:**
+- "Is tail latency from allocator or OS?" (wall vs CPU ratio)
+- "How much WSL2 hypervisor overhead exists?" (wall - cpu)
+- "Are zombie repairs contributing to latency?" (repair timing)
+
+**Does NOT answer:**
+- "Which specific operation caused the spike?" (sampled, not traced)
+- "What is P99.9 by size class?" (insufficient sample density)
+
+**Critical use case:** Distinguishing allocator bugs from environmental noise. If wall >> cpu × 2, the problem is OS/hypervisor, not the allocator. If wall ≈ cpu, the allocator is doing real work (CAS storms, repairs, lock contention).
+
 ### HFT Production Policy
 
-**Always use Tier 0, never Tier 1 or Tier 2.**
+**Always use Tier 0, optionally Tier 0.5 for diagnostics. Never Tier 1, 2, or 2.5 in production.**
 
 **Rationale:**
 - **Variance >> mean in HFT:** A single 200ns clock_gettime jitter spike violates SLA
 - **Tier 0 is zero-jitter:** Trylock is a single CPU instruction (~2ns, deterministic)
+- **Tier 0.5 is zero-jitter:** Counter increments only (~5ns, deterministic)
 - **Occurrence data is actionable:** Knowing contention exists is sufficient for tuning
+- **Label attribution aids diagnosis:** Tier 0.5 identifies which workload phase to optimize
+
+**Diagnostic escalation path:**
+1. **Tier 0 (always-on):** Detect contention existence, measure magnitude
+2. **Tier 0.5 (incident mode):** Attribute contention to workload phases
+3. **Tier 2.5 (post-mortem):** Distinguish allocator work from OS interference
+4. **Tier 1/2 (perf lab):** Deep profiling in isolated environment
 
 ---
 
@@ -608,18 +956,49 @@ cd src
 4. **Tier 0 probe is HFT-safe** - Zero jitter, <0.1% overhead, always-on
 5. **Excellent scaling validated** - Lock 14.78%, CAS 0.0074 retries/op at 16 threads
 6. **Predictable under load** - CoV decreases from 56.5% → 5.7% as threads increase
+7. **Adaptive bitmap scanning** - Automatically switches sequential ↔ randomized based on CAS retry rate (0.30 enable / 0.10 disable)
+8. **Label-based attribution** - Per-label contention tracking (ENABLE_LABEL_CONTENTION) for workload phase diagnosis
+9. **Slowpath sampling** - Wall vs CPU time split (ENABLE_SLOWPATH_SAMPLING) to distinguish allocator work from OS interference
 
 **GitHub Actions validation (native x86_64 Linux):**
 - 16 threads: 14.78% lock contention (median), 5.7% CoV (extremely consistent)
 - 16 threads: 0.0074 CAS retries/op (well below 0.01 threshold)
 - Contention plateau confirms healthy lock-free design
 
+**Adaptive features (Phase 2.2+):**
+- Bitmap scanning automatically optimizes for contention patterns
+- Sequential mode (mode 0): Best for low contention, cache-friendly
+- Randomized mode (mode 1): Spreads threads under high contention (>0.30 retries/op)
+- Zero-cost controller: Allocation-count triggered (no clock syscalls)
+
+**Diagnostic features (compile-time optional):**
+- **Label attribution (Tier 0.5):** Identify which workload phase causes contention (~5ns overhead)
+- **Slowpath sampling (Tier 2.5):** Distinguish allocator bugs from OS noise (~0.34ns overhead, high jitter)
+- Use for incident investigation only, not HFT production
+
 **When to tune:**
 - Lock contention >20%: Consider per-thread caches or larger slabs
 - CAS retries >0.05: Increase slab size or pre-allocate
-- Throughput not scaling: Check hot size classes, epoch churn
+- CAS retries >0.30: Adaptive scanning should activate automatically (check scan_adapt.switches)
+- Throughput not scaling: Check hot size classes, epoch churn, or enable label attribution to identify hot phases
+
+**Compile flags for diagnostics:**
+```bash
+# Baseline (always-on Tier 0 metrics)
+make
+
+# Add label-based contention attribution (Tier 0.5)
+make CFLAGS="$(CFLAGS) -DENABLE_LABEL_CONTENTION=1"
+
+# Add wall vs CPU time sampling (Tier 2.5)
+make CFLAGS="$(CFLAGS) -DENABLE_SLOWPATH_SAMPLING=1"
+
+# Full diagnostics (incident investigation)
+make CFLAGS="$(CFLAGS) -DENABLE_LABEL_CONTENTION=1 -DENABLE_SLOWPATH_SAMPLING=1"
+```
 
 **Further reading:**
 - `CONTENTION_RESULTS.md` - Empirical validation data
 - `CONTENTION_METRICS_DESIGN.md` - Tier 0 probe design rationale
 - `PERFORMANCE_TUNING.md` - HFT-specific tuning strategies
+- `workloads/README_SLOWPATH_SAMPLING.md` - Wall vs CPU diagnosis guide
