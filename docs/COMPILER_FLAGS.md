@@ -12,7 +12,6 @@ This document lists all compile-time configuration flags for the ZNS-Slab alloca
   - [ENABLE_LOCK_RANK_DEBUG](#enable_lock_rank_debug)
 - [Tuning Parameters](#tuning-parameters)
   - [SLAB_PAGE_SIZE](#slab_page_size)
-  - [SLOWPATH_THRESHOLD_NS](#slowpath_threshold_ns)
 - [Build Examples](#build-examples)
 
 ---
@@ -55,43 +54,80 @@ make CFLAGS="-DENABLE_TLS_CACHE=1 -I../include"
 
 ### ENABLE_SLOWPATH_SAMPLING
 
-**Purpose**: Records tail latency samples to diagnose slow allocations in production.
+**Purpose**: Probabilistic end-to-end allocation timing to diagnose tail latency sources and distinguish allocator work from scheduler interference.
 
 **Default**: `0` (disabled)
 
 **Overhead**:
-- Memory: ~320KB (10,000 sample ring buffer)
-- Latency: ~50-100ns per sample (only when threshold exceeded)
+- Memory: ~160 bytes per thread (TLS counters, no heap allocation)
+- Latency: ~0.2ns average per allocation (1/1024 sampling × 200ns per sample)
+- CPU: Negligible (<0.02% overall impact)
+
+**Sampling strategy (Phase 2.5)**:
+- **Probabilistic** (not threshold-based): Samples 1 out of every 1024 allocations regardless of latency
+- **Why probabilistic**: Validates measurement infrastructure works, doesn't miss fast-but-preempted operations
+- **Per-thread TLS counters**: No atomic contention, safe for multi-threaded workloads
 
 **When to use**:
-- Diagnosing p99/p999/p9999 latency outliers
-- Distinguishing allocator slowness from VM/OS scheduling noise
-- Production tail latency debugging (WSL2, VMs, noisy neighbors)
+- Diagnosing p99/p999 latency outliers on WSL2 or VMs
+- Distinguishing allocator slowness from OS scheduling noise
+- Investigating zombie repair frequency (invariant violation signal)
+- Validating that sampling infrastructure works (not just "did we see slow ops?")
 
 **Instrumentation collected**:
-- Wall-clock time (CLOCK_MONOTONIC)
-- Thread CPU time (CLOCK_THREAD_CPUTIME_ID)
-- Size class, reason flags (lock wait, new slab, zombie repair, etc.)
-- CAS retry count
+- **Allocation timing** (end-to-end `alloc_obj_epoch()`):
+  - Wall-clock time (CLOCK_MONOTONIC)
+  - Thread CPU time (CLOCK_THREAD_CPUTIME_ID)
+  - Sample count, avg/max for both metrics
+- **Zombie repair timing** (explicit measurement):
+  - Repair count, wall/CPU timing
+  - Reason attribution: full_bitmap, list_mismatch, other
 
 **Analysis output**:
 ```
-=== Slowpath Samples ===
-Total samples: 127 (threshold: 5000ns)
+=== Slowpath Sampling (1/1024) ===
+Samples: 97
+Avg wall: 4382 ns (max: 251618 ns)
+Avg CPU:  1536 ns (max: 9293 ns)
+Ratio: 2.85x
+⚠ wall >> cpu: Scheduler interference detected
 
-Classification:
-  Preempted (wall>3×cpu): 94 (74.0%) - WSL2/VM scheduling noise
-  Real work (wall≈cpu):    33 (26.0%) - Actual allocator slowpath
+=== Zombie Repairs ===
+Count: 0
+✓ No invariant violations
 ```
+
+**Interpretation**:
+- **wall >> cpu** (e.g., 2.85×): WSL2/VM preemption, not allocator issue
+- **wall ≈ cpu** (e.g., 1.1×): Real allocator work (locks, CAS storms, new slabs)
+- **High repair_count**: Invariant violations (publication races, memory ordering bugs)
 
 **Build example**:
 ```bash
-make CFLAGS="-DENABLE_SLOWPATH_SAMPLING=1 -DSLOWPATH_THRESHOLD_NS=5000 -I../include"
+# Enable probabilistic sampling
+make CFLAGS="-DENABLE_SLOWPATH_SAMPLING -I../include"
+
+# Add to your test code:
+#ifdef ENABLE_SLOWPATH_SAMPLING
+  ThreadStats stats = slab_stats_thread();
+  printf("Avg wall: %lu ns (max: %lu ns)\n", ...);
+#endif
 ```
 
-**Tuning**: See [SLOWPATH_THRESHOLD_NS](#slowpath_threshold_ns) below.
+**API**:
+```c
+#include "slab_stats.h"
 
-**Related documentation**: `workloads/README_SLOWPATH_SAMPLING.md`
+ThreadStats slab_stats_thread(void);  // Get current thread's statistics
+```
+
+**Migration from old threshold-based approach**:
+- Old: `SLOWPATH_THRESHOLD_NS` required tuning, could miss fast ops
+- New: No threshold needed, samples 1/1024 regardless of latency
+- Old: Ring buffer, complex sample storage
+- New: Simple TLS counters (avg/max only)
+
+**Related documentation**: `workloads/README_SLOWPATH_SAMPLING.md` (comprehensive guide)
 
 ---
 
@@ -209,40 +245,12 @@ make CFLAGS="-DSLAB_PAGE_SIZE=65536 -I../include"  # 64KB pages
 
 ---
 
-### SLOWPATH_THRESHOLD_NS
-
-**Purpose**: Sets the latency threshold (nanoseconds) for slowpath sampling.
-
-**Default**: `5000` (5µs)
-
-**Requires**: `ENABLE_SLOWPATH_SAMPLING=1`
-
-**Tuning guidance**:
-- **5µs (default)**: Captures extreme tail (p9999+), minimal overhead
-- **1µs**: Captures p999 outliers, low overhead
-- **500ns**: Captures p99 outliers, moderate overhead
-- **Lower**: More samples, more overhead, larger ring buffer churn
-
-**Calibration**:
-1. Run benchmark to measure average allocation latency
-2. Set threshold to 2-3× average latency
-3. Validate sample count is reasonable (1-100 per million ops)
-
-**Build example**:
-```bash
-# Capture operations > 1µs
-make CFLAGS="-DENABLE_SLOWPATH_SAMPLING=1 -DSLOWPATH_THRESHOLD_NS=1000 -I../include"
-```
-
----
-
 ## Build Examples
 
 ### Development Build (All Diagnostics)
 ```bash
 make CFLAGS="-DENABLE_TLS_CACHE=1 \
-             -DENABLE_SLOWPATH_SAMPLING=1 \
-             -DSLOWPATH_THRESHOLD_NS=1000 \
+             -DENABLE_SLOWPATH_SAMPLING \
              -DENABLE_DIAGNOSTIC_COUNTERS=1 \
              -DENABLE_LOCK_RANK_DEBUG=1 \
              -g -O2 -I../include"
@@ -262,8 +270,7 @@ make CFLAGS="-DENABLE_RSS_RECLAMATION=1 \
 
 ### Benchmark Build (Profiling)
 ```bash
-make CFLAGS="-DENABLE_SLOWPATH_SAMPLING=1 \
-             -DSLOWPATH_THRESHOLD_NS=5000 \
+make CFLAGS="-DENABLE_SLOWPATH_SAMPLING \
              -O3 -g -I../include"
 ```
 
@@ -274,12 +281,11 @@ make CFLAGS="-DENABLE_SLOWPATH_SAMPLING=1 \
 | Flag | Default | Overhead | Use Case |
 |------|---------|----------|----------|
 | `ENABLE_TLS_CACHE` | 0 | ~10-20ns | High locality workloads |
-| `ENABLE_SLOWPATH_SAMPLING` | 0 | ~50-100ns/sample | Tail latency diagnosis |
+| `ENABLE_SLOWPATH_SAMPLING` | 0 | ~0.2ns avg | Tail latency diagnosis (1/1024 sampling) |
 | `ENABLE_RSS_RECLAMATION` | 0 | ~1-5µs/epoch | Memory-constrained systems |
 | `ENABLE_DIAGNOSTIC_COUNTERS` | 0 | ~1-2% | RSS debugging |
 | `ENABLE_LOCK_RANK_DEBUG` | 0 | ~5-10% | Deadlock detection (dev) |
 | `SLAB_PAGE_SIZE` | 4096 | Varies | Platform-specific tuning |
-| `SLOWPATH_THRESHOLD_NS` | 5000 | Varies | Sampling sensitivity |
 
 ---
 
