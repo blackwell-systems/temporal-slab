@@ -497,7 +497,7 @@ static uint32_t reg_get_gen24(SlabRegistry* r, uint32_t id) {
  * If we observe new ptr but old gen (or vice versa) due to independent atomics,
  * validation fails and returns NULL early. Caller retries or treats as invalid.
  */
-static Slab* reg_lookup_validate(SlabRegistry* r, uint32_t id, uint32_t gen24) {
+Slab* reg_lookup_validate(SlabRegistry* r, uint32_t id, uint32_t gen24) {
   if (id >= r->cap) return NULL;  /* Out of bounds */
   
   /* Step 1: Load ptr with acquire (synchronizes with reg_set_ptr release) */
@@ -566,7 +566,7 @@ static inline uint8_t* slab_data_ptr(Slab* s) {
   return (uint8_t*)slab_bitmap_ptr(s) + ((size_t)words * 4u);
 }
 
-static inline void* slab_slot_ptr(Slab* s, uint32_t slot_index) {
+inline void* slab_slot_ptr(Slab* s, uint32_t slot_index) {
   return (void*)(slab_data_ptr(s) + ((size_t)slot_index * (size_t)s->object_size));
 }
 
@@ -1283,7 +1283,7 @@ static inline SlabHandle handle_pack(uint32_t slab_id, uint32_t gen, uint8_t slo
        | (uint64_t)HANDLE_VERSION_V1;             /* 2 bits */
 }
 
-static inline void handle_unpack(SlabHandle h, uint32_t* slab_id, uint32_t* gen, uint32_t* slot, uint32_t* cls) {
+inline void handle_unpack(SlabHandle h, uint32_t* slab_id, uint32_t* gen, uint32_t* slot, uint32_t* cls) {
   uint32_t version = (uint32_t)(h & 0x3u);
   if (version != HANDLE_VERSION_V1) {
     /* Invalid version - set sentinel values that will fail validation */
@@ -1354,16 +1354,23 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
   extern __thread bool _tls_in_refill;
   
   if (!_tls_in_refill) {
-    /* TLS fast path: Check thread-local handle cache first (no atomics, no locks) */
-    void* ptr = tls_try_alloc(a, (uint32_t)ci, epoch, out);
-    if (ptr) return ptr;  /* TLS cache hit - fastest path (~10-15ns) */
+    /* Check if TLS bypass is active for this size class */
+    extern __thread TLSCache _tls_cache[8];
+    TLSCache* tls = &_tls_cache[ci];
     
-    /* TLS miss: Refill from global allocator, then retry */
-    tls_refill(a, (uint32_t)ci, epoch);
-    ptr = tls_try_alloc(a, (uint32_t)ci, epoch, out);
-    if (ptr) return ptr;  /* Refill succeeded */
-    
-    /* Fall through to global allocator if refill failed (out of memory) */
+    /* HARD BYPASS: skip all TLS logic if bypass is enabled */
+    if (!tls->bypass_alloc) {
+      /* TLS fast path: Check thread-local handle cache first (no atomics, no locks) */
+      void* ptr = tls_try_alloc(a, (uint32_t)ci, epoch, out);
+      if (ptr) return ptr;  /* TLS cache hit - fastest path (~10-15ns) */
+      
+      /* TLS miss: Refill from global allocator, then retry */
+      tls_refill(a, (uint32_t)ci, epoch);
+      ptr = tls_try_alloc(a, (uint32_t)ci, epoch, out);
+      if (ptr) return ptr;  /* Refill succeeded */
+      
+      /* Fall through to global allocator if refill failed (out of memory) */
+    }
   }
 #endif
   

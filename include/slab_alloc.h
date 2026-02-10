@@ -582,6 +582,21 @@ void slab_epoch_dec_refcount(SlabAllocator* alloc, EpochId epoch);
  */
 uint64_t slab_epoch_get_refcount(SlabAllocator* alloc, EpochId epoch);
 
+#if ENABLE_TLS_CACHE
+/* Print TLS cache statistics
+ * 
+ * Prints aggregate statistics across all threads showing:
+ * - Alloc attempts, bypassed, hits, refills
+ * - Free cached, dribbles, bypassed
+ * - Hit rates and bypass rates
+ * 
+ * USAGE: Call at end of benchmark to validate TLS behavior
+ * 
+ * THREAD SAFETY: Acquires thread registry lock
+ */
+void tls_print_stats(void);
+#endif
+
 /* Allocate object in specific epoch (handle-based)
  * 
  * Same as alloc_obj(), but allocates into specified epoch for temporal grouping.
