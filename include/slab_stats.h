@@ -55,12 +55,20 @@ typedef struct {
   uint64_t alloc_wall_ns_max;      /* Maximum wall time observed */
   uint64_t alloc_cpu_ns_max;       /* Maximum CPU time observed */
   
+  /* Wait time (scheduler interference metric) */
+  uint64_t alloc_wait_ns_sum;      /* Total wait time (wall - cpu) */
+  uint64_t alloc_wait_ns_max;      /* Maximum wait time observed */
+  
   /* Zombie repair timing */
   uint64_t repair_count;           /* Number of repairs performed */
   uint64_t repair_wall_ns_sum;     /* Total wall time in repairs */
   uint64_t repair_cpu_ns_sum;      /* Total CPU time in repairs */
   uint64_t repair_wall_ns_max;     /* Maximum wall time for single repair */
   uint64_t repair_cpu_ns_max;      /* Maximum CPU time for single repair */
+  
+  /* Repair wait time */
+  uint64_t repair_wait_ns_sum;     /* Total repair wait (wall - cpu) */
+  uint64_t repair_wait_ns_max;     /* Maximum repair wait observed */
   
   /* Repair reason attribution */
   uint64_t repair_reason_full_bitmap;    /* fc==0 && bitmap full */

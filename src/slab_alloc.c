@@ -1344,11 +1344,14 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1); \
       uint64_t wall_ns = ns_from_ts(&wall1) - ns_from_ts(&wall0); \
       uint64_t cpu_ns = ns_from_ts(&cpu1) - ns_from_ts(&cpu0); \
+      uint64_t wait_ns = (wall_ns > cpu_ns) ? (wall_ns - cpu_ns) : 0; \
       tls_stats.alloc_samples++; \
       tls_stats.alloc_wall_ns_sum += wall_ns; \
       tls_stats.alloc_cpu_ns_sum += cpu_ns; \
+      tls_stats.alloc_wait_ns_sum += wait_ns; \
       if (wall_ns > tls_stats.alloc_wall_ns_max) tls_stats.alloc_wall_ns_max = wall_ns; \
       if (cpu_ns > tls_stats.alloc_cpu_ns_max) tls_stats.alloc_cpu_ns_max = cpu_ns; \
+      if (wait_ns > tls_stats.alloc_wait_ns_max) tls_stats.alloc_wait_ns_max = wait_ns; \
     } \
   } while (0)
 #else
@@ -1676,12 +1679,15 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       
       uint64_t repair_wall_ns = ns_from_ts(&repair_wall1) - ns_from_ts(&repair_wall0);
       uint64_t repair_cpu_ns = ns_from_ts(&repair_cpu1) - ns_from_ts(&repair_cpu0);
+      uint64_t repair_wait_ns = (repair_wall_ns > repair_cpu_ns) ? (repair_wall_ns - repair_cpu_ns) : 0;
       
       tls_stats.repair_count++;
       tls_stats.repair_wall_ns_sum += repair_wall_ns;
       tls_stats.repair_cpu_ns_sum += repair_cpu_ns;
+      tls_stats.repair_wait_ns_sum += repair_wait_ns;
       if (repair_wall_ns > tls_stats.repair_wall_ns_max) tls_stats.repair_wall_ns_max = repair_wall_ns;
       if (repair_cpu_ns > tls_stats.repair_cpu_ns_max) tls_stats.repair_cpu_ns_max = repair_cpu_ns;
+      if (repair_wait_ns > tls_stats.repair_wait_ns_max) tls_stats.repair_wait_ns_max = repair_wait_ns;
       
       if (repair_reason & REPAIR_REASON_FULL_BITMAP) tls_stats.repair_reason_full_bitmap++;
       if (repair_reason & REPAIR_REASON_LIST_MISMATCH) tls_stats.repair_reason_list_mismatch++;

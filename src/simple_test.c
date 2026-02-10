@@ -32,22 +32,26 @@ int main() {
     if (stats.alloc_samples > 0) {
         uint64_t avg_wall = stats.alloc_wall_ns_sum / stats.alloc_samples;
         uint64_t avg_cpu = stats.alloc_cpu_ns_sum / stats.alloc_samples;
+        uint64_t avg_wait = stats.alloc_wait_ns_sum / stats.alloc_samples;
         printf("\nAllocation timing:\n");
         printf("  Avg wall: %lu ns  (max: %lu ns)\n", avg_wall, stats.alloc_wall_ns_max);
         printf("  Avg CPU:  %lu ns  (max: %lu ns)\n", avg_cpu, stats.alloc_cpu_ns_max);
+        printf("  Avg wait: %lu ns  (max: %lu ns)\n", avg_wait, stats.alloc_wait_ns_max);
         printf("  Ratio:    %.2fx\n", (double)avg_wall / avg_cpu);
         
-        if (avg_wall > avg_cpu * 2) {
-            printf("  ⚠ wall >> cpu: Scheduler interference detected\n");
+        if (avg_wait > avg_cpu) {
+            printf("  WARNING: wait >> cpu: Scheduler interference dominates\n");
+        } else if (avg_wall > avg_cpu * 1.5) {
+            printf("  WARNING: wall > cpu: Moderate scheduler interference\n");
         } else {
-            printf("  ✓ Clean measurement\n");
+            printf("  Clean measurement\n");
         }
     }
     
     if (stats.repair_count > 0) {
-        printf("\n⚠ Zombie repairs: %lu\n", stats.repair_count);
+        printf("\nWARNING: Zombie repairs: %lu\n", stats.repair_count);
     } else {
-        printf("\n✓ No zombie repairs\n");
+        printf("\nNo zombie repairs\n");
     }
 #else
     printf("(ENABLE_SLOWPATH_SAMPLING not defined - no sampling data)\n");
