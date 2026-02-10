@@ -11,9 +11,9 @@
 
 We present **temporal-slab**, a memory allocator that introduces **passive epoch reclamation**—a novel approach to memory management that achieves deterministic reclamation timing without requiring thread coordination or garbage collection. Unlike traditional allocators (malloc) that operate at the pointer level or garbage collectors that operate at the reachability level, temporal-slab operates at the **phase level**, grouping allocations by application-defined structural boundaries. We demonstrate that this approach eliminates three fundamental sources of unpredictability in production systems: (1) malloc's history-dependent fragmentation leading to unbounded search times, (2) garbage collection's heuristic-triggered stop-the-world pauses, and (3) allocator internal policies triggering coalescing or compaction at arbitrary moments.
 
-Our implementation achieves 120ns p99 and 340ns p999 allocation latency (12-13× better than malloc on AMD EPYC 7763), provides deterministic RSS drops aligned with application phase boundaries, and eliminates entire classes of memory safety bugs through structural lifetime management. We validate the design through extensive benchmarking on GitHub Actions infrastructure and demonstrate applicability across five commercial domains: serverless computing, game engines, database systems, ETL pipelines, and multi-agent AI systems.
+Our implementation achieves 120ns p99 and 340ns p999 allocation latency (12-13× better than malloc on AMD EPYC 7763), provides deterministic RSS drops aligned with application phase boundaries, and enables **structural observability**—the allocator exposes phase-level metrics (RSS per epoch, contention per application label) that pointer-based allocators fundamentally cannot provide. We validate the design through extensive benchmarking on GitHub Actions infrastructure and demonstrate applicability across five commercial domains: serverless computing, game engines, database systems, ETL pipelines, and multi-agent AI systems.
 
-**Keywords:** Memory management, epoch-based reclamation, lock-free algorithms, phase-aligned cleanup, structural determinism
+**Keywords:** Memory management, epoch-based reclamation, lock-free algorithms, phase-aligned cleanup, structural determinism, zero-cost observability
 
 ---
 
@@ -30,6 +30,8 @@ The industry has largely accepted this tradeoff as fundamental: either you contr
 The central insight underlying temporal-slab is that many programs exhibit **structural determinism**: logical units of work (requests, frames, transactions) have observable boundaries where all intermediate allocations become semantically dead. A web server knows when a request completes. A game engine knows when a frame renders. A database knows when a transaction commits. These moments already exist in application logic—they are not artificial constructs introduced by the allocator.
 
 temporal-slab makes these implicit boundaries explicit through the `epoch_close()` API, enabling memory reclamation aligned with application semantics rather than allocator heuristics. This shifts the unit of memory management from individual pointers (malloc model) or object reachability (GC model) to collective phases (epoch model).
+
+**A second-order benefit emerges:** phase-level memory management enables **structural observability**—metrics naturally organized by application semantics. When the allocator tracks epochs, it can trivially answer questions like "which HTTP route consumed 40MB?" or "did this database transaction leak memory?"—questions malloc cannot answer because it operates at the pointer level. This observability is not grafted onto the allocator; it emerges naturally from the phase-level abstraction, with zero added overhead (the counters already exist for correctness).
 
 ### 1.3 Contributions
 
@@ -450,6 +452,26 @@ epoch_domain_t* d = epoch_domain_enter(alloc, "/api/users");
 ```
 
 This enables identifying which application phases cause allocator contention without profiler overhead.
+
+**Structural observability as emergent property:**
+
+Semantic attribution demonstrates a key advantage of phase-level memory management: **observability emerges naturally from the allocator's structure rather than requiring external instrumentation**.
+
+With malloc, answering "which requests leaked memory?" requires:
+1. External tracking system (tag every allocation with request ID)
+2. Auxiliary data structures (maps, hash tables storing allocations)
+3. Periodic scanning (traverse millions of allocations to aggregate)
+4. Production overhead (every allocation pays metadata cost)
+
+With temporal-slab, the same question is answered via:
+1. Atomic read of `epoch_meta[epoch_id].domain_refcount`
+2. No external tracking (epoch is first-class)
+3. No scanning (counters maintained during normal operation)
+4. Zero added overhead (counters exist for correctness, not observability)
+
+**The insight:** When the allocator groups allocations by phase (epochs), it already maintains per-phase metadata for correctness (refcounts, state, era). Exposing this metadata as observability APIs is trivial—the hard work was already done. This is fundamentally different from malloc-based profilers that must reconstruct phase attribution through sampling or tracing.
+
+This architectural property—**observability as a zero-cost consequence of structural design**—extends beyond allocation tracking to contention diagnosis (per-label CAS retries), RSS accounting (per-epoch RSS deltas), and leak detection (stuck epochs with refcount > 0 after expected completion).
 
 ### 3.9 Zombie Partial Repair
 
