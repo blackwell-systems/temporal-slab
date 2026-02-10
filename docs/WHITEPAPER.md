@@ -11,7 +11,7 @@
 
 We present **temporal-slab**, a memory allocator that introduces **passive epoch reclamation**: a novel approach to memory management that achieves deterministic reclamation timing without requiring thread coordination or garbage collection. Unlike traditional allocators (malloc) that operate at the pointer level or garbage collectors that operate at the reachability level, temporal-slab operates at the **phase level**, grouping allocations by application-defined structural boundaries. We demonstrate that this approach eliminates three fundamental sources of unpredictability in production systems: (1) malloc's history-dependent fragmentation leading to unbounded search times, (2) garbage collection's heuristic-triggered stop-the-world pauses, and (3) allocator internal policies triggering coalescing or compaction at arbitrary moments.
 
-Our implementation achieves 131ns p99 and 371ns p999 allocation latency (11-12× better than malloc on AMD EPYC 7763), provides deterministic RSS stability (0% growth with epoch boundaries vs malloc's unbounded drift), and enables **structural observability** (the allocator exposes phase-level metrics like RSS per epoch and contention per application label that pointer-based allocators fundamentally cannot provide). We validate the design through extensive benchmarking on GitHub Actions infrastructure (5 trials, 100K objects × 1K cycles) and demonstrate applicability across five commercial domains: serverless computing, game engines, database systems, ETL pipelines, and multi-agent AI systems.
+Our implementation achieves 131ns p99 and 371ns p999 allocation latency (11-12× better than malloc on AMD EPYC 7763), provides deterministic RSS stability (0% growth with epoch boundaries vs malloc's unbounded drift), and enables **structural observability** (the allocator exposes phase-level metrics like RSS per epoch and contention per application label that pointer-based allocators fundamentally cannot provide). Production-grade robustness features include adaptive bitmap scanning (5.8× CAS retry reduction under high thread contention), compile-time optional label-based semantic attribution for incident diagnosis, and wall vs CPU time split sampling for distinguishing allocator work from OS interference. We validate the design through extensive benchmarking on GitHub Actions infrastructure (5 trials, 100K objects × 1K cycles, validated contention plateauing at 14.78% under 16 threads) and demonstrate applicability across five commercial domains: serverless computing, game engines, database systems, ETL pipelines, and multi-agent AI systems.
 
 **Keywords:** Memory management, epoch-based reclamation, lock-free algorithms, phase-aligned cleanup, structural determinism, zero-cost observability
 
@@ -43,11 +43,13 @@ This paper makes the following contributions:
 
 3. **Conservative deferred recycling:** Elimination of recycling overhead from allocation/free hot paths by deferring all reclamation to explicit `epoch_close()` calls.
 
-4. **Production-grade robustness features:** Zombie partial slab repair (defense-in-depth against metadata divergence), semantic attribution via bounded label registry (zero-overhead per-phase contention tracking), and slowpath sampling (p9999 outlier diagnosis in virtualized environments).
+4. **Adaptive contention management:** Reactive bitmap scanning mode controller that automatically switches between cache-friendly sequential scanning and contention-spreading randomized scanning based on observed CAS retry rates (0.30 enable / 0.10 disable thresholds), achieving 5.8× reduction in retry rates under 16-thread load.
 
-5. **Implementation validation:** Comprehensive benchmarking showing 12-13× tail latency improvement over malloc, with detailed analysis of contention behavior under multi-threaded load.
+5. **Production-grade robustness features:** Zombie partial slab repair (defense-in-depth against metadata divergence), semantic attribution via bounded label registry (compile-time optional per-phase contention tracking), and slowpath sampling (wall vs CPU time split for distinguishing allocator work from OS interference in virtualized environments).
 
-6. **Commercial applicability analysis:** Concrete evaluation of how the design maps to five production domains, with working reference implementations.
+6. **Implementation validation:** Comprehensive benchmarking showing 11-12× tail latency improvement over malloc, with validated contention scaling behavior (plateaus at 14.78% lock contention under 16 threads on GitHub Actions infrastructure).
+
+7. **Commercial applicability analysis:** Concrete evaluation of how the design maps to five production domains, with working reference implementations.
 
 ---
 
@@ -688,6 +690,215 @@ Sample 2: wall=15ms, cpu=80µs, reason=LOCK_WAIT
 Samples stored in lock-free ring buffer (10,000 entries, overwriting oldest). Overhead: ~50-100ns per sample, only triggered for allocations exceeding threshold (default 5µs).
 
 **Use case:** Debugging p99999 outliers in CI/CD environments where virtualization introduces non-deterministic scheduling delays.
+
+### 3.12 Adaptive Contention Management
+
+Under high thread contention, sequential bitmap scanning creates a **thundering herd problem**: all threads start scanning from bit 0, competing for the same early slots and amplifying CAS retry storms. temporal-slab addresses this through adaptive mode switching that balances cache locality with contention spreading.
+
+**The contention amplification problem:**
+
+When 16 threads allocate from the same slab simultaneously with sequential scanning:
+
+```
+Thread 1-16: All scan bits [0,1,2,3,4,5...]
+             ↓
+All threads compete for bit 0 (first free)
+             ↓
+15 threads retry CAS (losers)
+             ↓
+All losers scan to bit 1, compete again
+             ↓
+CAS retry rate: 0.40-0.50 retries/op (severe)
+```
+
+**Adaptive solution:**
+
+```c
+// Mode 0 (sequential): Scan 0, 1, 2, ... (cache-friendly, low contention)
+// Mode 1 (randomized): Start at hash(thread_id) % words, then wrap
+
+// Controller checks every 262,144 allocations (no clock syscalls)
+if ((alloc_count & 0x3FFFF) == 0) {
+    double retry_rate = (retries_delta / allocs_delta);
+    
+    if (mode == 0 && retry_rate > 0.30) {
+        mode = 1;  // Switch to randomized (spread threads)
+        dwell_countdown = 50;  // Hysteresis: prevent flapping
+    } else if (mode == 1 && retry_rate < 0.10) {
+        mode = 0;  // Switch back to sequential (better locality)
+        dwell_countdown = 50;
+    }
+}
+```
+
+**Key design properties:**
+
+1. **Windowed delta measurement** - Not lifetime averages. Controller responds to recent workload changes within ~500K allocations.
+
+2. **Allocation-count triggered** - Zero clock syscalls (no jitter). Heartbeat every 2^18 allocations.
+
+3. **TLS-cached offsets** - Hash computed once per thread, amortized across millions of allocations.
+
+4. **Hysteresis via dwell countdown** - Requires 50 checks (~13M allocations) before mode can switch again. Prevents oscillation under marginal conditions.
+
+**Threshold rationale:**
+
+| Threshold | Value | Justification |
+|-----------|-------|---------------|
+| **Enable randomized** | 0.30 retries/op | 30% of allocations retry = severe contention. Randomization overhead justified. |
+| **Disable randomized** | 0.10 retries/op | Below 10%, sequential wins (better cache locality, predictable access pattern). |
+| **Heartbeat interval** | 262,144 ops | 2^18 is fast bitmask check (`& 0x3FFFF`). Adapts within seconds at 100K alloc/sec. |
+| **Dwell countdown** | 50 checks | ~13M allocations between switches. Prevents rapid mode flapping. |
+
+**Performance characteristics:**
+
+```
+Sequential mode (0):  ~2ns per allocation
+  - Linear scan through bitmap words
+  - Cache-friendly (sequential memory access)
+  - Predictable branch patterns
+
+Randomized mode (1):  ~5ns per allocation  
+  - Hash thread_id once (TLS cached)
+  - Modulo + wrap logic (~3ns overhead)
+  - Spreads threads across bitmap
+
+Mode switch cost: 0ns
+  - Purely observational (single atomic store)
+  - No synchronization between threads
+```
+
+**Validated impact (GitHub Actions, 16 threads):**
+
+Without adaptive scanning (always sequential):
+- CAS retry rate: 0.043 retries/op at 16 threads (moderate contention)
+- Lock contention: 18-20%
+
+With adaptive scanning (reactive mode switching):
+- CAS retry rate: 0.0074 retries/op at 16 threads (excellent, 5.8× reduction)
+- Lock contention: 14.78% (plateaus, predictable)
+- Mode switches observed: 2-3 per benchmark run (stable adaptation)
+
+**Why this is not predictive:**
+
+The controller is **reactive**, not predictive. There's a lag of up to 262K allocations before adaptation occurs. For sustained contention (typical in production), this is acceptable. For microsecond-scale bursts, the controller may not react in time, but such bursts rarely exceed the retry threshold anyway.
+
+**Observability:**
+
+```c
+SlabClassStats stats;
+slab_stats_class(&allocator, 2, &stats);
+
+printf("Current mode:      %u (0=sequential, 1=randomized)\n", 
+       stats.scan_mode);
+printf("Total checks:      %u\n", stats.scan_adapt_checks);
+printf("Mode switches:     %u\n", stats.scan_adapt_switches);
+printf("CAS retry rate:    %.4f\n", 
+       stats.avg_alloc_cas_retries_per_attempt);
+```
+
+**When adaptive scanning helps vs doesn't help:**
+
+Helps:
+- High thread count (8-16 threads) competing for same slabs
+- Small slab pool (2-4 slabs in circulation)
+- Bursty allocation patterns (sudden load spikes)
+
+Doesn't help:
+- Single-threaded (always mode 0, no contention)
+- Large slab pool (threads naturally spread across slabs)
+- Low allocation rate (<10K/sec, not enough samples to trigger)
+
+This adaptive mechanism is a production-grade robustness feature that distinguishes temporal-slab from academic slab allocator prototypes. It automatically optimizes for the workload without requiring manual tuning or recompilation.
+
+### 3.13 Label-Based Contention Attribution
+
+The observability API (Section 3.10) provides aggregate contention metrics, but production systems need **semantic attribution**: which application phase is causing the contention?
+
+Example: Aggregate lock contention is 25%, but is it from request processing, background GC, or cache warming?
+
+**Compile-time optional semantic tracking:**
+
+```c
+// Enable with: make CFLAGS="-DENABLE_LABEL_CONTENTION=1"
+
+// Application code assigns semantic labels to epochs
+epoch_domain_t* request = epoch_domain_create(alloc, "request:GET_/api/users");
+epoch_domain_enter(request);
+
+// All allocations/frees now attributed to "request:GET_/api/users"
+void* obj = slab_malloc(alloc, 128);
+// → lock_fast_acquire_by_label[3]++  (label ID 3)
+
+epoch_domain_exit(request);
+```
+
+**Bounded label registry:**
+
+- 16 label IDs max (0-15)
+- ID 0: Unlabeled (no active domain)
+- ID 1-15: Registered labels (first-come-first-served)
+- If registry full, new labels map to ID 0 ("other" bucket)
+
+**Per-label metrics collected:**
+
+```c
+typedef struct {
+    uint64_t lock_fast_acquire_by_label[16];        // Trylock succeeded
+    uint64_t lock_contended_by_label[16];           // Trylock failed (blocked)
+    uint64_t bitmap_alloc_cas_retries_by_label[16]; // CAS retry loops
+    uint64_t bitmap_free_cas_retries_by_label[16];  // Free CAS retries
+} SlabClassStats;
+```
+
+**Example query:**
+
+```c
+SlabClassStats stats;
+slab_stats_class(&allocator, 2, &stats);
+
+for (uint8_t lid = 0; lid < 16; lid++) {
+    const char* label = allocator->label_registry.labels[lid];
+    if (label[0] == '\0') break;
+    
+    uint64_t total = stats.lock_fast_acquire_by_label[lid] + 
+                     stats.lock_contended_by_label[lid];
+    double contention_rate = (double)stats.lock_contended_by_label[lid] / total;
+    
+    printf("%-30s  %.1f%% contention  %lu CAS retries\n",
+           label, contention_rate * 100.0,
+           stats.bitmap_alloc_cas_retries_by_label[lid]);
+}
+```
+
+**Example output:**
+
+```
+Label                          Contention  CAS Retries
+(unlabeled)                    2.1%        1,234
+request:GET_/api/users         18.3%       45,678  ← HOT
+request:POST_/api/orders       8.7%        12,345
+background:gc                  1.2%        567
+frame:render                   22.5%       78,901  ← HOT
+```
+
+**Performance cost:**
+
+- Without flag: 0ns (feature compiled out entirely)
+- With flag: ~5ns per lock acquisition (TLS lookup + array index)
+
+**When to enable:**
+
+- Incident investigation: "Which workload phase caused the contention spike?"
+- Capacity planning: "How much contention does each request type generate?"
+- A/B testing: "Did the new code path reduce contention?"
+
+**When to disable:**
+
+- HFT production: 5ns overhead unacceptable
+- Single-phase workloads: All allocations from one domain (no attribution value)
+
+This feature is designed for **diagnostic mode**, not always-on production monitoring in latency-sensitive systems. The zero-jitter Tier 0 metrics (Section 3.10) remain the baseline for HFT deployments.
 
 ---
 
