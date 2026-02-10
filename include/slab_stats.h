@@ -27,6 +27,83 @@
 
 #define SLAB_STATS_VERSION 2  /* Phase 2.3: Added per-label contention maps */
 
+/* ==================== Slowpath Sampling (Phase 2.5) ==================== */
+
+/* Per-thread statistics for probabilistic end-to-end sampling
+ * 
+ * Answers: "Are tail latencies from allocator work or scheduler noise?"
+ * 
+ * DESIGN:
+ * - TLS counters (no atomic contention)
+ * - Probabilistic sampling (1/1024 operations)
+ * - Wall vs CPU time split to detect WSL2/virtualization interference
+ * - Explicit repair timing with reason codes
+ * 
+ * INTERPRETATION:
+ * - wall >> cpu: Scheduler preemption (WSL2 noise)
+ * - wall ≈ cpu: Real allocator work (locks, CAS storms, repairs)
+ * - High repair_count: Invariant violations (publication races, stale views)
+ */
+#ifdef ENABLE_SLOWPATH_SAMPLING
+
+typedef struct {
+  /* End-to-end allocation sampling */
+  uint64_t alloc_samples;          /* Number of sampled alloc_obj_epoch calls */
+  uint64_t alloc_wall_ns_sum;      /* Total wall time of sampled allocs */
+  uint64_t alloc_cpu_ns_sum;       /* Total CPU time of sampled allocs */
+  uint64_t alloc_wall_ns_max;      /* Maximum wall time observed */
+  uint64_t alloc_cpu_ns_max;       /* Maximum CPU time observed */
+  
+  /* Zombie repair timing */
+  uint64_t repair_count;           /* Number of repairs performed */
+  uint64_t repair_wall_ns_sum;     /* Total wall time in repairs */
+  uint64_t repair_cpu_ns_sum;      /* Total CPU time in repairs */
+  uint64_t repair_wall_ns_max;     /* Maximum wall time for single repair */
+  uint64_t repair_cpu_ns_max;      /* Maximum CPU time for single repair */
+  
+  /* Repair reason attribution */
+  uint64_t repair_reason_full_bitmap;    /* fc==0 && bitmap full */
+  uint64_t repair_reason_list_mismatch;  /* list_id wrong */
+  uint64_t repair_reason_other;          /* Other conditions */
+} ThreadStats;
+
+/* TLS storage (defined in slab_stats.c) */
+extern __thread ThreadStats tls_stats;
+extern __thread uint64_t tls_sample_ctr;
+
+/* Sample rate (power of 2 for fast & mask) */
+#define SAMPLE_RATE_MASK 1023u  /* 1/1024 sampling */
+
+/* Helper to convert timespec to nanoseconds */
+static inline uint64_t ns_from_ts(const struct timespec* t) {
+  return (uint64_t)t->tv_sec * 1000000000ull + (uint64_t)t->tv_nsec;
+}
+
+/* Repair reason flags */
+#define REPAIR_REASON_FULL_BITMAP    (1u << 0)
+#define REPAIR_REASON_LIST_MISMATCH  (1u << 1)
+
+/* Get current thread's sampling statistics
+ * 
+ * Returns a snapshot of TLS counters for the calling thread.
+ * Call this at the end of a workload to print tail latency analysis.
+ * 
+ * THREAD SAFETY: Only safe to read from the same thread (TLS)
+ * 
+ * USAGE:
+ *   ThreadStats stats = slab_stats_thread();
+ *   if (stats.alloc_samples > 0) {
+ *     uint64_t avg_wall = stats.alloc_wall_ns_sum / stats.alloc_samples;
+ *     uint64_t avg_cpu = stats.alloc_cpu_ns_sum / stats.alloc_samples;
+ *     if (avg_wall > avg_cpu * 2) {
+ *       fprintf(stderr, "WARNING: wall >> cpu suggests scheduler interference\n");
+ *     }
+ *   }
+ */
+ThreadStats slab_stats_thread(void);
+
+#endif /* ENABLE_SLOWPATH_SAMPLING */
+
 /* ==================== Global Statistics ==================== */
 
 /* Aggregate statistics across all size classes and epochs
