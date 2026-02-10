@@ -36,7 +36,7 @@ This gives you:
 - Pure hot path (no reclamation cost during alloc/free)
 - Structural observability (phase-level metrics emerge naturally)
 
-**This isn't just a faster allocator. It's a temporal memory model with slab-level structure and epoch-level semantics.**
+temporal-slab is a temporal memory model with slab-level structure and epoch-level semantics.
 
 ---
 
