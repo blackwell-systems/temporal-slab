@@ -150,16 +150,45 @@ extern _Thread_local int _lock_rank_depth;
 /* Thread-local handle cache structures */
 #if ENABLE_TLS_CACHE
 
-#define TLS_CACHE_SIZE 32        /* Handles per size class (tunable) */
-#define TLS_REFILL_BATCH 16      /* Batch size for global allocator refills */
-#define TLS_FLUSH_BATCH 16       /* Batch size for flushes to global */
+/* TLS cache tuning parameters */
+#define TLS_CACHE_CAP 256        /* Total capacity per size class */
+#define TLS_REFILL_BATCH 32      /* Handles to allocate when cache empty */
+#define TLS_FLUSH_HI 256         /* Trigger flush when count reaches this */
+#define TLS_FLUSH_LO 192         /* Flush down to this watermark */
+#define TLS_FLUSH_DRIBBLE 4      /* Handles to flush per dribble (spreads cost) */
 #define MAX_THREADS 128          /* Maximum threads for registry */
 
+/* Adaptive bypass parameters (shortened for fast response to phasey workloads) */
+#define TLS_WINDOW_OPS 256       /* Check hit rate every N ops (was 4096) */
+#define TLS_BYPASS_OPS 8192      /* Disable TLS for N ops when hit rate too low (was 65536) */
+#define TLS_MIN_HIT_PCT 2        /* Minimum hit rate % to keep TLS enabled */
+
+/* TLS cache item: stores both handle and pointer for zero-overhead hits */
 typedef struct {
-    SlabHandle handles[TLS_CACHE_SIZE];   /* Pre-allocated handle stack */
-    uint32_t epoch_id[TLS_CACHE_SIZE];    /* Epoch ID per handle */
-    uint32_t count;                        /* Current stack depth [0, TLS_CACHE_SIZE] */
-    uint32_t padding;                      /* Align to cache line */
+    SlabHandle h;      /* Handle for free_obj */
+    void* p;           /* Pre-validated pointer for immediate return */
+} TLSItem;
+
+typedef struct {
+    TLSItem items[TLS_CACHE_CAP];  /* Handle+pointer stack */
+    uint32_t count;                 /* Current stack depth [0, TLS_CACHE_CAP] */
+    
+    /* Adaptive bypass (per size class) - separate for alloc and free */
+    uint32_t window_ops;            /* Ops in current measurement window */
+    uint32_t window_hits;           /* Hits in current window */
+    uint32_t bypass_ends_at;        /* Window ops count when bypass ends */
+    uint8_t bypass_alloc;           /* 1 = bypass alloc (hit rate too low) */
+    uint8_t bypass_free;            /* 1 = bypass free (no reuse expected) */
+    
+    /* Detailed stats for validation (thread-local, no atomics needed) */
+    uint32_t tls_alloc_attempts;    /* Total alloc calls */
+    uint32_t tls_alloc_bypassed;    /* Allocs that hit hard bypass */
+    uint32_t tls_alloc_hits;        /* Allocs served from cache */
+    uint32_t tls_alloc_refills;     /* Cache refill operations */
+    uint32_t tls_free_cached;       /* Frees cached for reuse */
+    uint32_t tls_free_dribbles;     /* Dribble flush operations */
+    uint32_t tls_free_bypassed;     /* Frees that hit hard bypass */
+    uint32_t padding;               /* Align to cache line */
 } TLSCache;
 
 typedef struct {
@@ -183,6 +212,7 @@ bool tls_try_free(SlabAllocator* a, uint32_t sc, SlabHandle h);
 void tls_refill(SlabAllocator* a, uint32_t sc, uint32_t epoch_id);
 void tls_flush_batch(SlabAllocator* a, uint32_t sc, uint32_t batch_size);
 void tls_flush_epoch_all_threads(SlabAllocator* a, uint32_t epoch_id);
+void tls_print_stats(void);  /* Print aggregate stats across all threads */
 
 #endif /* ENABLE_TLS_CACHE */
 
