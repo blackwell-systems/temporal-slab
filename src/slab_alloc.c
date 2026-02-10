@@ -1526,7 +1526,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
               (unsigned long)pthread_self(), slow_path_attempts);
       fprintf(stderr, "Size class: %d, epoch: %u, state: %u\n",
               ci, epoch, state);
-      fprintf(stderr, "Partial list length: %u, current_partial: %p\n",
+      fprintf(stderr, "Partial list length: %zu, current_partial: %p\n",
               es->partial.len, (void*)atomic_load_explicit(&es->current_partial, memory_order_relaxed));
       fflush(stderr);
       abort();
@@ -1652,36 +1652,6 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     if (idx == UINT32_MAX) {
       /* Race: slab filled between our publish and allocation attempt.
        * Loop back and try again with a different slab. */
-      
-      /* DIAGNOSTIC: Print slab invariants when allocation fails */
-      uint32_t fc = atomic_load_explicit(&s->free_count, memory_order_relaxed);
-      fprintf(stderr, "\n*** SLOW-PATH ALLOC FAILED: slab appears full ***\n");
-      fprintf(stderr, "Thread %lu, attempt %u\n", 
-              (unsigned long)pthread_self(), slow_path_attempts);
-      fprintf(stderr, "Slab: %p, object_count: %u, free_count: %u\n",
-              (void*)s, s->object_count, fc);
-      fprintf(stderr, "List state: list_id=%d, on partial list, len=%u\n",
-              s->list_id, es->partial.len);
-      
-      /* Check if bitmap is truly full (diagnostic output).
-       * Use full_mask_for_word() to avoid UB when object_count % 32 == 0. */
-      _Atomic uint32_t* bm = slab_bitmap_ptr(s);
-      uint32_t words = slab_bitmap_words(s->object_count);
-      uint32_t full_words = 0;
-      for (uint32_t i = 0; i < words; i++) {
-        uint32_t x = atomic_load_explicit(&bm[i], memory_order_relaxed);
-        uint32_t expected_full = full_mask_for_word(s->object_count, i, words);
-        if (x == expected_full) {
-          full_words++;
-        }
-      }
-      fprintf(stderr, "Bitmap: %u/%u words appear full\n", full_words, words);
-      
-      if (full_words == words && fc != 0) {
-        fprintf(stderr, "*** DIVERGENCE: bitmap full but free_count=%u (should be 0) ***\n", fc);
-      }
-      fflush(stderr);
-      
       continue;
     }
     
@@ -1749,8 +1719,6 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
   }
 }
 
-
-/*
 /* Free an object using its handle.
  *
  * Handle-based free is safe:
