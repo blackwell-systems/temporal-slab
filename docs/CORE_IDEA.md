@@ -1,11 +1,46 @@
-# The Core Idea: Structure Over Pointers
+# The Core Idea: Memory Reclamation as a Structural Property
 
-**temporal-slab in one sentence:**  
-Memory management should follow application phase boundaries, not individual pointer lifetimes.
+**The fundamental innovation in one sentence:**  
+**Objects don't have individual lifetimes. Phases do.**
+
+When a phase ends, its entire memory region becomes reclaimable as a unit. This lets the allocator avoid all unpredictable behaviors that come from treating each object as an independent lifetime.
 
 ---
 
-## The Three Innovations
+## What This Means
+
+**Traditional view (per-object lifetime):**
+```c
+void* obj1 = malloc(128);  // Lifetime: now → free(obj1)
+void* obj2 = malloc(128);  // Lifetime: now → free(obj2)
+// Allocator must handle arbitrary interleaving of allocations/frees
+// Result: fragmentation, search times, unpredictable coalescing
+```
+
+**temporal-slab view (per-phase lifetime):**
+```c
+epoch_domain_t* request = epoch_domain_enter(alloc, "request");
+void* obj1 = slab_malloc(alloc, 128);  // Lifetime: now → epoch_close(request)
+void* obj2 = slab_malloc(alloc, 128);  // Lifetime: now → epoch_close(request)
+epoch_domain_exit(request);
+// epoch_close() reclaims ALL objects from this phase as a unit
+// Result: deterministic timing, no fragmentation, bounded RSS
+```
+
+**The key insight:** General-purpose allocators try to **infer** lifetimes from frees, heuristics, or tracing. temporal-slab makes lifetimes **explicit**, **phase-aligned**, and **deterministic**.
+
+This gives you:
+- Predictable tail latency (no emergent pathological states)
+- Bounded RSS under churn (phases reclaim in bulk)
+- Deterministic reclamation (application controls WHEN)
+- Pure hot path (no reclamation cost during alloc/free)
+- Structural observability (phase-level metrics emerge naturally)
+
+**This isn't just a faster allocator. It's a temporal memory model with slab-level structure and epoch-level semantics.**
+
+---
+
+## The Three Core Mechanisms
 
 ### 1. Passive Epoch Reclamation
 
@@ -162,12 +197,31 @@ Deterministic reclamation without pointer tracking or GC infrastructure
 
 ## The Bottom Line
 
-**temporal-slab introduces a third computational model for memory management:**
+**temporal-slab's unique contribution:**
 
-1. **Manual (malloc):** Programmer tracks individual pointers
-2. **Automatic (GC):** Runtime traces object reachability
-3. **Structural (epochs):** Application declares phase boundaries
+**Memory reclamation is a structural property of program phases, not a per-object decision.**
 
-The insight is that many systems exhibit **structural determinism**: logical units of work have observable boundaries where all intermediate allocations become semantically dead. temporal-slab makes this implicit structure explicit, achieving deterministic reclamation without the fragility of manual memory management or the unpredictability of garbage collection.
+Everything else flows from this single shift in perspective.
 
-**Core contribution:** Shifting the unit of memory management from pointers to phases enables both performance (deterministic timing) and observability (phase-level metrics) as emergent properties, not grafted-on features.
+**Three models for memory management:**
+
+1. **Manual (malloc):** Programmer tracks individual pointers  
+   → Fragile (use-after-free, leaks), unpredictable (fragmentation, coalescing)
+
+2. **Automatic (GC):** Runtime traces object reachability  
+   → Unpredictable (10-100ms pauses), heuristic triggers
+
+3. **Temporal (epochs):** Application declares phase boundaries  
+   → **Deterministic** (reclamation at explicit moments), **predictable** (no emergent states)
+
+**The fundamental insight:** Many systems exhibit **structural determinism**—logical units of work have observable boundaries where all intermediate allocations become semantically dead. 
+
+Web servers know when requests complete.  
+Game engines know when frames render.  
+Database transactions know when they commit.
+
+These moments **already exist** in application logic. temporal-slab makes them explicit through `epoch_close()`, shifting the unit of memory management from individual pointers to collective phases.
+
+**What you invented:** A temporal memory model where lifetime is defined by program phases, enabling deterministic reclamation and eliminating allocator-induced tail latency.
+
+**Core contribution:** Making lifetimes explicit, phase-aligned, and deterministic enables both performance (predictable timing) and observability (phase-level metrics) as emergent properties of the temporal model, not features grafted onto a traditional allocator.
