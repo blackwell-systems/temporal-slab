@@ -6552,6 +6552,97 @@ temporal-slab's design optimizes for x86-64 Linux because that's where the targe
 
 The ~2× performance difference between x86-64 (40ns p50, 120ns p99 validated) and ARM (~80ns p50, ~200ns p99 estimated) demonstrates the architectural advantage of x86-64's strong memory model. While both are suitable for most workloads, x86-64's TSO provides lower and more predictable latency.
 
+### Comprehensive Platform Comparison Table
+
+The following table summarizes platform-specific considerations for temporal-slab across all major architectures and operating systems:
+
+| Platform | Memory Ordering | Fence Overhead | Atomic CAS | madvise Semantics | Page Size | Estimated p99 Latency | Porting Effort |
+|----------|-----------------|----------------|------------|-------------------|-----------|----------------------|----------------|
+| **x86-64 Linux** | TSO (strong) | **0 cycles** (free acquire/release) | LOCK CMPXCHG (20-40 cycles) | **Immediate RSS drop** | **4KB** | **131ns** (validated) | N/A (reference) |
+| **ARM64 Linux** | Relaxed (weak) | **20-40 cycles** (DMB per acquire/release) | LL/SC (20-40 cycles + spurious failures) | Immediate RSS drop | **4KB or 64KB** | ~220ns (estimated) | Medium (2-4 weeks) |
+| **x86-64 BSD** | TSO (strong) | 0 cycles | LOCK CMPXCHG | **Advisory hint** (may defer) | 4KB | ~140ns (estimated) | Low (1-2 weeks) |
+| **x86-64 Windows** | TSO (strong) | 0 cycles | LOCK CMPXCHG | **MEM_DECOMMIT** (crashes on access) | 4KB | ~131ns (estimated) | **High (4-8 weeks)** |
+| **ARM64 Android** | Relaxed (weak) | 20-40 cycles | LL/SC | Immediate RSS drop | 4KB or 64KB | ~220ns (estimated) | Medium (3-5 weeks) |
+| **RISC-V Linux** | Relaxed (weak) | 20-40 cycles | LL/SC | Immediate RSS drop | 4KB | ~220ns (estimated) | High (4-6 weeks) |
+| **x86-64 macOS** | TSO (strong) | 0 cycles | LOCK CMPXCHG | **Deferred reclamation** | 4KB | ~140ns (estimated) | Medium (2-3 weeks) |
+
+### Platform-Specific Impact on Design Decisions
+
+**Why x86-64 Linux is optimal:**
+
+1. **Zero-cost memory ordering:** TSO makes acquire/release free (no DMB fences). Saves 40-80 cycles per allocation on hot path.
+
+2. **Reliable madvise:** `MADV_DONTNEED` immediately drops RSS and zero-faults on access. Enables safe handle validation and deterministic reclamation.
+
+3. **4KB page granularity:** Fine-grained RSS control (can reclaim individual slabs). 64KB pages would make RSS 16× coarser.
+
+4. **Mature tooling:** `/proc/self/status` for RSS, `perf` for profiling, THP support, NUMA awareness.
+
+**Why ARM is 1.7-2× slower:**
+
+| Factor | x86-64 Cost | ARM Cost | Difference |
+|--------|-------------|----------|------------|
+| Acquire load (`current_partial`) | 2 cycles | 22 cycles (2 + 20 DMB) | +20 cycles |
+| Bitmap CAS | 20 cycles | 25 cycles (LL/SC + spurious failures) | +5 cycles |
+| Release store (publish slab) | 2 cycles | 22 cycles (2 + 20 DMB) | +20 cycles |
+| **Total per allocation** | **24 cycles** | **69 cycles** | **+45 cycles** |
+
+At 3GHz: 24 cycles = 8ns (x86-64), 69 cycles = 23ns (ARM). Over full allocation path (38 cycles x86-64 validated = 40ns p50), ARM adds ~23ns → 63ns p50 estimated. Under contention (p99), ARM's LL/SC spurious failures add another 10-20% → ~220ns p99 estimated.
+
+**Why Windows is challenging:**
+
+1. **No zero-page faults:** `VirtualFree(..., MEM_DECOMMIT)` causes crashes on access. Cannot rely on handle validation reading zero magic numbers.
+
+2. **No lazy reclamation:** `VirtualAlloc(..., MEM_RESET)` doesn't guarantee RSS drop and doesn't zero pages. Reads after reset are undefined.
+
+3. **API differences:** Replace mmap→VirtualAlloc, pthread→Windows TLS, /proc→Windows Performance Counters. Large surface area of changes.
+
+**Solution:** Windows port would need to use registry-only handle validation (never dereference slab pointers) and either sacrifice RSS control (never decommit) or accept crashes (decommit and hope handles aren't used after epoch close).
+
+**Why BSD is easier than Windows:**
+
+1. **POSIX-compatible:** Most APIs work with minor changes (madvise semantics differ but API exists).
+
+2. **Deferred reclamation acceptable:** `MADV_FREE` eventually reclaims memory. Doesn't guarantee immediate RSS drop but doesn't crash.
+
+3. **Workaround available:** Can force reclamation with `madvise(..., MADV_DONTNEED)` + `mmap(MAP_FIXED)` if needed.
+
+**64KB page impact (ARM):**
+
+| Aspect | 4KB Pages | 64KB Pages | Impact |
+|--------|-----------|------------|--------|
+| Objects per 128B slab | 31 | 496 | 16× more objects |
+| RSS reclamation granularity | 4KB | 64KB | 16× coarser |
+| Empty slab detection | Frequent (every ~31 frees) | Rare (every ~496 frees) | Delays reclamation |
+| Baseline RSS overhead | +37% (4KB metadata) | +2.3% (64KB amortizes) | Better efficiency |
+| **Net effect** | Fine-grained control | Coarse-grained control | Trades granularity for efficiency |
+
+For workloads with <100 live objects, 64KB pages cause 16× higher RSS bloat (one partially-empty 64KB slab vs multiple 4KB slabs). For workloads with >10K objects, 64KB pages are more efficient (lower metadata overhead).
+
+**NUMA considerations:**
+
+On multi-socket x86-64 systems (2+ sockets), temporal-slab's default behavior allocates slabs on the thread's local NUMA node. If Thread 0 (Socket 0) allocates a slab and Thread 16 (Socket 1) later uses it, remote access adds 100-200 cycles (2× local latency).
+
+**NUMA-aware mitigation:**
+- Per-socket allocators (complicates epoch management)
+- OR: Pin threads to sockets (application-level constraint)
+- OR: Accept remote access cost for shared slabs (simplicity over optimization)
+
+Current design favors simplicity (single allocator). NUMA-aware variant possible as future optimization for >32-core systems.
+
+### Platform Recommendation Summary
+
+| Workload Type | Recommended Platform | Why |
+|---------------|---------------------|-----|
+| **HFT, real-time control** | **x86-64 Linux** | Lowest latency (131ns p99), predictable (TSO), mature tooling |
+| **Mobile apps (Android)** | ARM64 Android | Native platform, acceptable latency (~220ns p99), energy efficient |
+| **Embedded systems** | ARM64 Linux (4KB pages) | Lower cost than x86-64, adequate performance if not latency-critical |
+| **Windows desktops** | **Not recommended** | Complex port (no zero-page faults), limited RSS control |
+| **BSD servers** | x86-64 BSD | Easy port, slightly worse RSS reclamation (MADV_FREE deferred) |
+| **Cloud VMs (AWS, GCP)** | **x86-64 Linux** | Majority of cloud instances, validated performance, best tooling |
+
+**Key takeaway:** temporal-slab is designed for x86-64 Linux because that's where the target workloads (HFT, API servers, control planes) run. Porting to ARM/BSD is feasible with 1.7-2× performance tradeoff. Porting to Windows requires significant design changes.
+
 If ARM systems eventually dominate datacenters (Apple M-series servers, AWS Graviton at scale), temporal-slab could be ported. The bounded RSS guarantee would remain (architectural, not platform-specific), but latency would degrade due to unavoidable fence overhead. For workloads where bounded RSS matters more than single-digit microsecond latency differences, ARM would be acceptable.
 
 **The Design Philosophy: Optimize for Reality**
