@@ -2,10 +2,10 @@
 
 **A complete chronicle of debugging catastrophic concurrency bugs in a lock-free memory allocator**
 
-Date: February 2026  
-Severity: Critical (both bugs caused production failures)  
-Duration: 2 debugging sessions across 2 days  
-Outcome: Both bugs fixed, allocator hardened, comprehensive test suite added
+**Date:** February 9-10, 2026  
+**Severity:** Critical (data corruption + API contract violation)  
+**Duration:** 2 debugging sessions across 2 days  
+**Outcome:** Both bugs fixed, allocator hardened, comprehensive test suite added
 
 ---
 
@@ -23,21 +23,49 @@ Outcome: Both bugs fixed, allocator hardened, comprehensive test suite added
 
 ## Executive Summary
 
-This document chronicles the discovery and repair of two critical concurrency bugs in the temporal-slab allocator. Both bugs involved subtle temporal ordering issues in lock-free code paths:
+This document chronicles the discovery and repair of two critical concurrency bugs in the temporal-slab allocator. Both bugs involved subtle temporal ordering issues in lock-free code paths.
 
-**Bug 1: Reuse-Before-Madvise Race**
-- **Symptom**: Catastrophic corruption (`free_count=UINT32_MAX`, `object_count=0`)
-- **Root Cause**: `madvise()` zeroing slab headers after slab became visible in cache
-- **Impact**: Zombie slabs under high concurrency + RSS reclamation
-- **Fix**: Perform madvise BEFORE making slab reachable
+### Bug #1: Reuse-Before-Madvise Race (Data Corruption)
 
-**Bug 2: Premature Slab Recycling**
-- **Symptom**: `free_obj()` returning false, handle invalidation
-- **Root Cause**: Empty slabs immediately recycled while threads held handles
-- **Impact**: Multi-threaded bulk alloc/free patterns failed
-- **Fix**: Defer recycling to `epoch_close()`, keep empty slabs on partial list
+**Blast radius:** Catastrophic memory corruption (slab headers zeroed while live)  
+**Trigger conditions:**
+- `ENABLE_RSS_RECLAMATION=1` (compile-time flag)
+- Cache reuse path active (slab recycling enabled)
+- Concurrent `cache_pop()` during `cache_push()` execution
 
-Both bugs demonstrate that **lock-free correctness requires careful attention to visibility ordering and resource lifecycle**.
+**Symptom:** `free_count=UINT32_MAX`, `object_count=0` (physically impossible values)  
+**Root cause:** `madvise()` executed AFTER slab became visible in cache  
+**Fix:** Perform madvise BEFORE linearization point (cache insertion)
+
+### Bug #2: Premature Slab Recycling (Handle Invalidation)
+
+**Blast radius:** API contract violation (`free_obj()` returns false for valid handles)  
+**Trigger conditions:**
+- Bulk alloc then bulk free pattern (handles accumulate)
+- Multiple threads share same epoch
+- Slabs become empty while other threads hold handles
+
+**Symptom:** `free_obj()` returns false, generation mismatch in registry  
+**Root cause:** Generation incremented at slab-empty time, not at quiescence  
+**Fix:** Defer recycling to `epoch_close()` (safe quiescence point)
+
+### Core Principle
+
+Both bugs violated the same invariant: **operations that invalidate metadata must occur only at linearization points or quiescence boundaries**, never while resources are reachable.
+
+---
+
+## Allocator Invariants
+
+These are the "laws of physics" that make corruption detectable:
+
+1. **Slab structure invariant:** `0 <= free_count <= object_count`
+2. **Bitmap consistency:** Bitmap cardinality equals `object_count - free_count`
+3. **Active slab invariant:** `object_count > 0` for any slab on partial/full lists
+4. **Publication safety:** Published slabs must never be madvised (or must be protected by grace period)
+5. **Handle validity contract:** Once `alloc_obj_epoch()` returns a handle, `free_obj(handle)` must succeed exactly once unless the handle was already freed or is malformed—independent of what other threads do
+
+When Bug #1 occurred, invariants 1-3 were violated (impossible `free_count` values). When Bug #2 occurred, invariant 5 was violated (valid handles rejected).
 
 ---
 
@@ -162,8 +190,8 @@ T=6: Thread B publishes slab X to current_partial
      - Other threads can allocate from it
 
 T=7: Thread A finally calls madvise(slab X, MADV_DONTNEED)
-     - Kernel zeros the entire 4KB page
-     - Slab header is DESTROYED
+     - Kernel discards physical pages; subsequent reads fault in zero-filled pages
+     - From program's perspective: slab header is DESTROYED
      - All fields become 0x00000000
 
 T=8: Slab X header after madvise:
@@ -223,10 +251,16 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
 
 **Why this is safe:**
 
+> **Linearization Point:** Slab becomes reachable by other threads at `UNLOCK(&sc->cache_lock)` after insertion into cache_array or overflow_list.
+>
+> **Safety Rule:** Any operation that can invalidate slab header (`madvise`, `munmap`, `memset`) must happen **strictly before** linearization.
+
 1. **Off-page metadata:** Snapshots survive header zeroing
 2. **Temporal ordering:** madvise → lock → insert → unlock
 3. **Visibility control:** Slab unreachable during madvise
 4. **Never madvise published slabs:** Lock-free pointers may exist
+
+**Cache invariant:** Slabs that were ever published (`was_published=true`) are stored in overflow nodes with their `was_published` flag. Array cache entries are guaranteed unpublished (`was_published=false`) because published slabs always use the overflow path to preserve metadata.
 
 **Updated cache_pop():**
 
@@ -623,6 +657,12 @@ if (new_fc == s->object_count) {
 
 **Why this works:**
 
+> **Linearization Point:** Generation increment in registry is the moment old handles become invalid.
+>
+> **Safety Rule:** Generation increments must occur only after a quiescence boundary (`epoch_close`) when no outstanding handles exist.
+>
+> **Empty slab tracking:** We only increment `empty_partial_count` on the transition to fully-empty (detected by `new_fc == object_count`). It is decremented only when the slab is actually reclaimed during `epoch_close()`. This prevents double-counting if a slab repeatedly transitions empty→non-empty→empty.
+
 1. **Handle validity preserved:** Slab stays in registry with same generation
 2. **Reuse enabled:** Empty slab on partial list can be reallocated from
 3. **Safe reclamation:** `epoch_close()` recycles empty slabs when no outstanding allocations exist
@@ -840,10 +880,15 @@ Result: Stable slab pool
 
 **Performance benefits:**
 
+**Key insight:** By keeping empty slabs resident on `partial`, we reduced **publication churn**—the frequency with which `current_partial` points at slabs mid-transition. This reduced the window where zombie repairs are needed.
+
+> Fix #2 reduced *publication churn*, which reduced windows where `current_partial` points at a slab whose state has moved. Fewer state transitions → fewer zombie detections → fewer repair operations.
+
 1. **Memory efficiency:** Reuse empty slabs instead of allocating new ones
 2. **Cache locality:** Reusing recently-freed slabs keeps them hot in cache
 3. **Lock contention:** Fewer list operations under lock
 4. **OS overhead:** Fewer `mmap()` calls
+5. **Publication stability:** Reduced churn of `current_partial` pointer
 
 **Validation:**
 
@@ -1505,6 +1550,42 @@ These two bugs demonstrate that **lock-free programming is fundamentally about v
 **The meta-lesson:** Lock-free allocators have subtle lifecycle dependencies. Correctness requires understanding when resources are **reachable** vs **safe to modify**.
 
 Both bugs involved temporal ordering. Both fixes involved deferring dangerous operations until safe points. This pattern will apply to future lock-free code.
+
+---
+
+## Hardening Checklist for Lock-Free Allocators
+
+Based on these debugging experiences, here's a checklist for developing lock-free memory allocators:
+
+**Code Structure:**
+- [ ] Mark linearization points in code comments (where resources become reachable)
+- [ ] Document invariants at module boundaries (`0 <= free_count <= object_count`, etc.)
+- [ ] Add explicit quiescence boundaries (epoch_close, grace periods)
+- [ ] Use off-page metadata for operations that can invalidate memory
+
+**Ordering Requirements:**
+- [ ] Any operation that can invalidate metadata (madvise/munmap/memset) must occur BEFORE publication or AFTER quiescence
+- [ ] Generation increments only at quiescence boundaries, never while handles exist
+- [ ] Maintain handle validity contract: valid until freed, independent of other threads
+
+**Testing Strategy:**
+- [ ] **Interleaved churn** (catch madvise races, lock contention)
+- [ ] **Bulk alloc/free** (catch premature recycling, handle lifetime issues)
+- [ ] **Phase-shift RSS** (catch memory leaks, reclamation failures)
+- [ ] **Long soak tests** (catch slow drifts, rare races)
+- [ ] **Adversarial pinning** (catch fragmentation, worst-case behavior)
+
+**Observability:**
+- [ ] Add diagnostics on every failed validation branch (which check failed?)
+- [ ] Log linearization events in debug builds
+- [ ] Track state transition counters (empty→non-empty→empty cycles)
+- [ ] Export generation mismatch rates for production monitoring
+
+**Documentation:**
+- [ ] Document blast radius (corruption vs API violation)
+- [ ] Document trigger conditions (what flags/patterns expose this?)
+- [ ] Explain linearization points and safety rules
+- [ ] Maintain debugging saga for critical bugs
 
 ---
 
