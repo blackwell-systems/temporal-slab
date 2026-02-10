@@ -2063,6 +2063,182 @@ The CLOSING epoch drains **passively**:
 | **Hazard Pointers** | Per-pointer protection | Retry scan on contention | Lock-free but complex |
 | **Passive Epoch (temporal-slab)** | None (observe & adapt) | Explicit `epoch_close()` or passive drain | Lock-free bitmap CAS |
 
+### Deep Dive: RCU vs Passive Epoch Reclamation
+
+To fully appreciate temporal-slab's passive approach, it's essential to understand how RCU (Read-Copy-Update) works and why its coordination overhead is incompatible with allocation hot paths.
+
+**RCU: Quiescence-Based Reclamation**
+
+RCU is a synchronization mechanism used in the Linux kernel for read-mostly data structures. It allows readers to access shared data without locks, deferring reclamation until all readers have finished.
+
+**How RCU works:**
+
+```c
+// Reader side (very fast)
+rcu_read_lock();       // Mark: "I'm reading"
+data = rcu_dereference(ptr);  // Read pointer
+use(data);
+rcu_read_unlock();     // Mark: "Done reading"
+
+// Writer side (reclaims old data)
+new_data = create_new_version();
+rcu_assign_pointer(ptr, new_data);  // Atomic pointer update
+synchronize_rcu();     // WAIT for grace period (expensive!)
+free(old_data);        // Now safe to free
+```
+
+**Grace period mechanism:**
+
+A grace period completes when **all threads have reached a quiescent state** (a point where they hold no RCU read locks). The `synchronize_rcu()` call blocks until this happens.
+
+```
+Thread A: [rcu_read_lock]───[use data]───[rcu_read_unlock] ← quiescent
+Thread B: [rcu_read_lock]─────────────[use data]─────[rcu_read_unlock] ← quiescent
+                                                     ↑
+                              Grace period completes here
+```
+
+**RCU overhead:**
+
+| Operation | Cost | Explanation |
+|-----------|------|-------------|
+| `rcu_read_lock()` | 0-2 cycles | Just disables preemption on some systems |
+| `rcu_read_unlock()` | 0-2 cycles | Re-enables preemption |
+| `synchronize_rcu()` | **10-50ms** | Must wait for all CPUs to reach quiescence |
+| Per-thread tracking | Memory overhead | Each CPU tracks current RCU state |
+
+**Why RCU is unsuitable for allocation:**
+
+1. **Grace period latency:** `synchronize_rcu()` can take 10-50ms. Blocking allocation for milliseconds is unacceptable.
+
+2. **Per-thread coordination:** RCU requires tracking whether each thread is in a quiescent state. For N threads doing M allocations/sec, that's N×M coordination points.
+
+3. **Kernel-specific:** RCU relies on scheduler cooperation (tracking context switches as quiescent states). User-space can't use this infrastructure.
+
+**Example: Why RCU doesn't fit allocation:**
+
+```c
+// Hypothetical RCU-based allocator (doesn't work)
+void* alloc_obj() {
+    rcu_read_lock();  // Must hold lock for entire allocation
+    void* ptr = find_free_slot();
+    rcu_read_unlock();
+    return ptr;
+}
+
+void reclaim_empty_slabs() {
+    synchronize_rcu();  // PROBLEM: Blocks for 10-50ms!
+    // Can't hold up allocation for milliseconds
+    free_slabs();
+}
+```
+
+If you tried to use `synchronize_rcu()` in an allocator, every `epoch_close()` would block for 10-50ms, adding huge latency spikes to allocation paths.
+
+**Hazard Pointers: Per-Pointer Protection**
+
+Hazard pointers are an alternative to RCU that avoid grace periods, but they introduce per-access overhead.
+
+**How hazard pointers work:**
+
+```c
+// Thread publishes pointer it's using
+void access_slab(Slab* slab) {
+    hazard_ptr[thread_id] = slab;  // Publish: "I'm using this"
+    atomic_thread_fence(memory_order_seq_cst);  // Ensure visibility
+    
+    // Use slab safely (no one can free it while published)
+    allocate_from_slab(slab);
+    
+    hazard_ptr[thread_id] = NULL;  // Unpublish
+}
+
+// Before freeing, check if anyone is using it
+void free_slab(Slab* slab) {
+    for (int i = 0; i < num_threads; i++) {
+        if (hazard_ptr[i] == slab) {
+            // Someone is using it! Defer free
+            retire_list_push(slab);
+            return;
+        }
+    }
+    actual_free(slab);  // Safe to free
+}
+```
+
+**Hazard pointer overhead:**
+
+| Operation | Cost | Explanation |
+|-----------|------|-------------|
+| Publish hazard pointer | 10-20 cycles | Atomic store + fence |
+| Unpublish hazard pointer | 10-20 cycles | Atomic store |
+| Scan hazard list on free | N × 5 cycles | Scan N threads' hazard pointers |
+| Per-thread storage | 64-128 bytes | Array of hazard pointers per thread |
+
+**Why hazard pointers don't fit:**
+
+1. **Per-access overhead:** Every slab access requires publishing a hazard pointer (20-40 cycles). For allocations happening at 131ns p99, adding 40 cycles (doubling latency) is unacceptable.
+
+2. **Scan on every free:** Every `free_slab()` must scan all threads' hazard pointers. For 32 threads, that's 32 memory loads on the free path.
+
+3. **Retire list complexity:** Deferred frees accumulate in retire lists, requiring periodic scanning and retry logic.
+
+**Passive Epoch Reclamation: The Key Insight**
+
+temporal-slab's passive approach avoids both grace periods (RCU) and per-access overhead (hazard pointers) by making epoch state **observable but not coordinated**.
+
+**How passive reclamation works:**
+
+1. **State is announced, not negotiated:**
+   ```c
+   // Announcement (no coordination)
+   atomic_store(&epoch_state[3], EPOCH_CLOSING);
+   ```
+
+2. **Threads observe asynchronously:**
+   ```c
+   // Thread discovers state change on next allocation
+   if (atomic_load(&epoch_state[3]) != EPOCH_ACTIVE) {
+       return NULL;  // Epoch closed, reject allocation
+   }
+   ```
+
+3. **No waiting for quiescence:**
+   - RCU: "Wait until all threads reach quiescent state" (10-50ms)
+   - Passive: "Announce state change, threads adapt" (0ms wait)
+
+4. **No per-access overhead:**
+   - Hazard pointers: Publish/unpublish on every access (20-40 cycles)
+   - Passive: State check only on allocation (already on critical path)
+
+**Detailed overhead comparison:**
+
+| Mechanism | Per-Access Overhead | Reclamation Latency | Memory Overhead | Complexity |
+|-----------|---------------------|---------------------|-----------------|------------|
+| **RCU** | 0-4 cycles (`rcu_read_lock/unlock`) | **10-50ms** (grace period) | Per-CPU state tracking | High (scheduler integration) |
+| **Hazard Pointers** | **20-40 cycles** (publish/unpublish) | 0ms (immediate) | 64-128 bytes per thread | Medium (retire lists) |
+| **Passive Epoch** | **0 cycles** (state check on alloc path) | **0ms** (announce) | 64 bytes (epoch state array) | Low (atomic stores only) |
+
+**Why passive reclamation enables 131ns p99:**
+
+By eliminating coordination overhead, temporal-slab keeps the allocation hot path simple:
+- No RCU lock/unlock (would add 4 cycles)
+- No hazard pointer publish (would add 20-40 cycles)
+- No grace period waiting (would add 10-50ms)
+- Just: bitmap CAS + state check (already required for correctness)
+
+**The tradeoff:**
+
+**RCU/Hazard Pointers:**
+- **Advantage:** Can safely reclaim any data structure immediately after last access
+- **Cost:** Coordination overhead (grace periods or per-access tracking)
+
+**Passive Epochs:**
+- **Advantage:** Zero coordination overhead, deterministic timing
+- **Cost:** Reclamation granularity is per-epoch, not per-object
+
+For an allocator handling millions of allocations per second, eliminating per-access overhead is decisive. temporal-slab accepts coarser reclamation granularity (epochs, not pointers) to achieve lock-free performance.
+
 **Why this matters for performance:**
 
 Passive reclamation eliminates coordination overhead:
