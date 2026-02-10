@@ -9,9 +9,9 @@
 
 ## Abstract
 
-We present **temporal-slab**, a memory allocator that introduces **passive epoch reclamation**—a novel approach to memory management that achieves deterministic reclamation timing without requiring thread coordination or garbage collection. Unlike traditional allocators (malloc) that operate at the pointer level or garbage collectors that operate at the reachability level, temporal-slab operates at the **phase level**, grouping allocations by application-defined structural boundaries. We demonstrate that this approach eliminates three fundamental sources of unpredictability in production systems: (1) malloc's history-dependent fragmentation leading to unbounded search times, (2) garbage collection's heuristic-triggered stop-the-world pauses, and (3) allocator internal policies triggering coalescing or compaction at arbitrary moments.
+We present **temporal-slab**, a memory allocator that introduces **passive epoch reclamation**: a novel approach to memory management that achieves deterministic reclamation timing without requiring thread coordination or garbage collection. Unlike traditional allocators (malloc) that operate at the pointer level or garbage collectors that operate at the reachability level, temporal-slab operates at the **phase level**, grouping allocations by application-defined structural boundaries. We demonstrate that this approach eliminates three fundamental sources of unpredictability in production systems: (1) malloc's history-dependent fragmentation leading to unbounded search times, (2) garbage collection's heuristic-triggered stop-the-world pauses, and (3) allocator internal policies triggering coalescing or compaction at arbitrary moments.
 
-Our implementation achieves 131ns p99 and 371ns p999 allocation latency (11-12× better than malloc on AMD EPYC 7763), provides deterministic RSS stability (0% growth with epoch boundaries vs malloc's unbounded drift), and enables **structural observability**—the allocator exposes phase-level metrics (RSS per epoch, contention per application label) that pointer-based allocators fundamentally cannot provide. We validate the design through extensive benchmarking on GitHub Actions infrastructure (5 trials, 100K objects × 1K cycles) and demonstrate applicability across five commercial domains: serverless computing, game engines, database systems, ETL pipelines, and multi-agent AI systems.
+Our implementation achieves 131ns p99 and 371ns p999 allocation latency (11-12× better than malloc on AMD EPYC 7763), provides deterministic RSS stability (0% growth with epoch boundaries vs malloc's unbounded drift), and enables **structural observability** (the allocator exposes phase-level metrics like RSS per epoch and contention per application label that pointer-based allocators fundamentally cannot provide). We validate the design through extensive benchmarking on GitHub Actions infrastructure (5 trials, 100K objects × 1K cycles) and demonstrate applicability across five commercial domains: serverless computing, game engines, database systems, ETL pipelines, and multi-agent AI systems.
 
 **Keywords:** Memory management, epoch-based reclamation, lock-free algorithms, phase-aligned cleanup, structural determinism, zero-cost observability
 
@@ -21,17 +21,17 @@ Our implementation achieves 131ns p99 and 371ns p999 allocation latency (11-12×
 
 ### 1.1 The Memory Management Trilemma
 
-Modern systems face a fundamental tension when choosing memory management strategies. Manual memory management (malloc/free) provides predictable allocation timing and zero garbage collection overhead, but introduces fragility: use-after-free bugs, double-frees, and leaks from forgotten deallocations. Automatic memory management (garbage collection) eliminates these safety issues but introduces unpredictable pause times—10-100ms stop-the-world collections that violate latency service-level agreements in request-serving systems.
+Modern systems face a fundamental tension when choosing memory management strategies. Manual memory management (malloc/free) provides predictable allocation timing and zero garbage collection overhead, but introduces fragility: use-after-free bugs, double-frees, and leaks from forgotten deallocations. Automatic memory management (garbage collection) eliminates these safety issues but introduces unpredictable pause times (10-100ms stop-the-world collections that violate latency service-level agreements in request-serving systems).
 
-The industry has largely accepted this tradeoff as fundamental: either you control memory and pay the fragility cost, or you gain safety and accept unpredictable pauses. We demonstrate that this is a **false dichotomy**—there exists a third computational model that provides deterministic reclamation without pointer tracking or garbage collection infrastructure.
+The industry has largely accepted this tradeoff as fundamental: either you control memory and pay the fragility cost, or you gain safety and accept unpredictable pauses. We demonstrate that this is a **false dichotomy**. There exists a third computational model that provides deterministic reclamation without pointer tracking or garbage collection infrastructure.
 
 ### 1.2 Key Insight: Structure Over Pointers
 
-The central insight underlying temporal-slab is that many programs exhibit **structural determinism**: logical units of work (requests, frames, transactions) have observable boundaries where all intermediate allocations become semantically dead. A web server knows when a request completes. A game engine knows when a frame renders. A database knows when a transaction commits. These moments already exist in application logic—they are not artificial constructs introduced by the allocator.
+The central insight underlying temporal-slab is that many programs exhibit **structural determinism**: logical units of work (requests, frames, transactions) have observable boundaries where all intermediate allocations become semantically dead. A web server knows when a request completes. A game engine knows when a frame renders. A database knows when a transaction commits. These moments already exist in application logic; they are not artificial constructs introduced by the allocator.
 
 temporal-slab makes these implicit boundaries explicit through the `epoch_close()` API, enabling memory reclamation aligned with application semantics rather than allocator heuristics. This shifts the unit of memory management from individual pointers (malloc model) or object reachability (GC model) to collective phases (epoch model).
 
-**A second-order benefit emerges:** phase-level memory management enables **structural observability**—metrics naturally organized by application semantics. When the allocator tracks epochs, it can trivially answer questions like "which HTTP route consumed 40MB?" or "did this database transaction leak memory?"—questions malloc cannot answer because it operates at the pointer level. This observability is not grafted onto the allocator; it emerges naturally from the phase-level abstraction, with zero added overhead (the counters already exist for correctness).
+**A second-order benefit emerges:** phase-level memory management enables **structural observability** (metrics naturally organized by application semantics). When the allocator tracks epochs, it can trivially answer questions like "which HTTP route consumed 40MB?" or "did this database transaction leak memory?" (questions malloc cannot answer because it operates at the pointer level). This observability is not grafted onto the allocator; it emerges naturally from the phase-level abstraction, with zero added overhead (the counters already exist for correctness).
 
 ### 1.3 Contributions
 
@@ -71,7 +71,7 @@ temporal-slab adapts slab allocation for user-space by adding: (1) temporal grou
 
 **Read-Copy-Update (RCU)** (McKenney & Slingwine 1998) uses grace periods to safely reclaim memory: a grace period completes when all threads have passed through a quiescent state. While effective for read-mostly data structures, RCU's coordination overhead (tracking per-thread epochs, waiting for grace periods) makes it unsuitable for allocation hot paths.
 
-**Hazard pointers** (Michael 2004) provide per-pointer protection by having threads announce which pointers they're dereferencing. This avoids grace periods but introduces 20-80 cycles overhead per access—acceptable for concurrent data structures but prohibitive for general allocation.
+**Hazard pointers** (Michael 2004) provide per-pointer protection by having threads announce which pointers they're dereferencing. This avoids grace periods but introduces 20-80 cycles overhead per access (acceptable for concurrent data structures but prohibitive for general allocation).
 
 temporal-slab's **passive reclamation** differs fundamentally: epoch state transitions are announcements (atomic stores), not negotiations (quiescent state tracking). Threads discover epoch closure asynchronously, enabling zero coordination overhead.
 
@@ -79,7 +79,7 @@ temporal-slab's **passive reclamation** differs fundamentally: epoch state trans
 
 **Region inference** (Tofte & Talpin 1997) groups allocations into regions freed in stack order. While conceptually similar to epochs, region systems require compiler support and cannot express non-stack lifetimes (e.g., long-lived sessions interspersed with short-lived requests).
 
-**Apache Portable Runtime (APR) pools** provide manual region management but lack temporal grouping—allocations from different logical phases intermingle if allocated to the same pool, causing fragmentation.
+**Apache Portable Runtime (APR) pools** provide manual region management but lack temporal grouping. Allocations from different logical phases intermingle if allocated to the same pool, causing fragmentation.
 
 temporal-slab's epoch domains provide region-like RAII semantics but add: (1) automatic lifetime tracking via refcounts, (2) temporal isolation (different epochs use different slabs), and (3) explicit control over reclamation timing.
 
@@ -469,9 +469,9 @@ With temporal-slab, the same question is answered via:
 3. No scanning (counters maintained during normal operation)
 4. Zero added overhead (counters exist for correctness, not observability)
 
-**The insight:** When the allocator groups allocations by phase (epochs), it already maintains per-phase metadata for correctness (refcounts, state, era). Exposing this metadata as observability APIs is trivial—the hard work was already done. This is fundamentally different from malloc-based profilers that must reconstruct phase attribution through sampling or tracing.
+**The insight:** When the allocator groups allocations by phase (epochs), it already maintains per-phase metadata for correctness (refcounts, state, era). Exposing this metadata as observability APIs is trivial since the hard work was already done. This is fundamentally different from malloc-based profilers that must reconstruct phase attribution through sampling or tracing.
 
-This architectural property—**observability as a zero-cost consequence of structural design**—extends beyond allocation tracking to contention diagnosis (per-label CAS retries), RSS accounting (per-epoch RSS deltas), and leak detection (stuck epochs with refcount > 0 after expected completion).
+This architectural property (**observability as a zero-cost consequence of structural design**) extends beyond allocation tracking to contention diagnosis (per-label CAS retries), RSS accounting (per-epoch RSS deltas), and leak detection (stuck epochs with refcount > 0 after expected completion).
 
 ### 3.9 Zombie Partial Repair
 
@@ -704,7 +704,7 @@ void cache_push(SizeClassAlloc* sc, Slab* s) {
 - p99 improvement: 1,332ns saved (36× median cost) - decisive for latency SLAs
 - p999 improvement: 4,047ns saved (100× median cost) - eliminates tail-risk violations
 
-This is not a performance trade-off—it's **tail-risk elimination**. A single malloc p99 outlier (1,463ns) costs more than 36 temporal-slab median allocations. For systems where p99 latency determines customer experience (trading systems, real-time APIs, gaming), this exchange is decisive.
+This is not a performance trade-off; it's **tail-risk elimination**. A single malloc p99 outlier (1,463ns) costs more than 36 temporal-slab median allocations. For systems where p99 latency determines customer experience (trading systems, real-time APIs, gaming), this exchange is decisive.
 
 temporal-slab eliminates malloc's tail latency sources:
 - No lock contention (lock-free fast path)
@@ -753,7 +753,7 @@ The allocator automatically switches to randomized scanning when retry rate exce
 
 1. **With epoch boundaries:** temporal-slab achieves 0% RSS growth across 1,000 cycles. Memory is deterministically reclaimed at phase boundaries via `epoch_close()`, enabling perfect slab reuse across epochs.
 
-2. **Without epoch boundaries:** temporal-slab exhibits 1,033% growth (similar to malloc's 1,111%). This demonstrates that **epoch structure is the key innovation**—without explicit phase boundaries, temporal-slab behaves like a standard allocator.
+2. **Without epoch boundaries:** temporal-slab exhibits 1,033% growth (similar to malloc's 1,111%). This demonstrates that **epoch structure is the key innovation**. Without explicit phase boundaries, temporal-slab behaves like a standard allocator.
 
 3. **Baseline overhead:** temporal-slab has +37% higher baseline RSS (metadata, slab headers, bitmap). This is the cost of deterministic reclamation infrastructure.
 
@@ -854,7 +854,7 @@ Measured overhead: 180ns for complete cycle
 
 If an epoch has 10,000 slabs across 8 size classes, `epoch_close()` scans all 10,000. At ~50ns per slab check (memory load + comparison), this is 500µs. For systems with millions of allocations per epoch, `epoch_close()` can take milliseconds.
 
-**Mitigation:** Applications should size epochs appropriately. A web server handling 1M requests/second should not put all requests in one epoch—use per-request domains or rotate epochs every 1,000 requests.
+**Mitigation:** Applications should size epochs appropriately. A web server handling 1M requests/second should not put all requests in one epoch; instead use per-request domains or rotate epochs every 1,000 requests.
 
 ---
 
@@ -914,7 +914,7 @@ void render_loop() {
 
 ### 6.3 Database Systems (Transaction + Query Scope)
 
-**Problem:** Query metadata (parse trees, optimizer stats) should be freed immediately, but transaction state (locks, WAL entries) must persist until commit—potentially seconds later. Manual tracking is error-prone.
+**Problem:** Query metadata (parse trees, optimizer stats) should be freed immediately, but transaction state (locks, WAL entries) must persist until commit (potentially seconds later). Manual tracking is error-prone.
 
 **Solution:** Nested domains:
 
@@ -1119,17 +1119,17 @@ let request_data = allocate_in_epoch(size);
 
 **Cyclone** (Jim et al. 2002) provides region inference but requires compile-time analysis. temporal-slab provides similar benefits at runtime without language changes.
 
-**Apache APR pools** lack temporal isolation—allocations from different logical phases intermingle if allocated to the same pool.
+**Apache APR pools** lack temporal isolation. Allocations from different logical phases intermingle if allocated to the same pool.
 
 ---
 
 ## 9. Conclusion
 
-We have presented temporal-slab, a memory allocator that achieves deterministic reclamation timing through passive epoch reclamation—a mechanism requiring no thread coordination or quiescence periods. By grouping allocations by application-defined phases rather than tracking individual pointers, temporal-slab eliminates three fundamental sources of unpredictability in production systems: malloc's history-dependent fragmentation, GC's heuristic-triggered pauses, and allocator internal policies triggering coalescing at arbitrary moments.
+We have presented temporal-slab, a memory allocator that achieves deterministic reclamation timing through passive epoch reclamation (a mechanism requiring no thread coordination or quiescence periods). By grouping allocations by application-defined phases rather than tracking individual pointers, temporal-slab eliminates three fundamental sources of unpredictability in production systems: malloc's history-dependent fragmentation, GC's heuristic-triggered pauses, and allocator internal policies triggering coalescing at arbitrary moments.
 
 Our implementation achieves 12-13× tail latency improvement over malloc while providing deterministic RSS drops aligned with application phase boundaries. We demonstrate applicability across five commercial domains and provide working reference implementations for each.
 
-The key insight—that many programs exhibit structural determinism through observable phase boundaries—opens a new design space for memory management systems. Rather than asking "when did this pointer become unreachable?" (GC) or "when should I free this allocation?" (malloc), temporal-slab asks "when did this logical phase complete?"—a question applications can answer precisely.
+The key insight (that many programs exhibit structural determinism through observable phase boundaries) opens a new design space for memory management systems. Rather than asking "when did this pointer become unreachable?" (GC) or "when should I free this allocation?" (malloc), temporal-slab asks "when did this logical phase complete?" This is a question applications can answer precisely.
 
 ### 9.1 Availability
 
