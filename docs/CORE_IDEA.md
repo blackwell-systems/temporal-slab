@@ -7,7 +7,40 @@ When a phase ends, its entire memory region becomes reclaimable as a unit. This 
 
 ---
 
-## What This Means
+## Why This Matters
+
+**The problem with per-object lifetime:**
+
+When you treat every object as having an independent lifetime, three things go wrong:
+
+1. **Fragmentation accumulates unpredictably**  
+   Free slots scatter across memory. Allocator searches grow. Coalescing triggers at arbitrary moments. RSS drifts unbounded under steady-state workloads.
+
+2. **Reclamation happens at the wrong moments**  
+   malloc coalesces during allocation hot paths. GC pauses when heap pressure crosses heuristic thresholds. Neither aligns with application semantics—you get 100ms pauses during request handling, not between requests.
+
+3. **You can't answer "which phase leaked memory?"**  
+   malloc sees pointers. It cannot attribute RSS growth to "the /api/users route" or "frame 1847" because those concepts don't exist at the pointer level.
+
+**The real-world cost:**
+
+- **Tail latency violations:** p99 allocation spikes to 1-4µs (malloc measured) from allocator search times and coalescing operations triggered mid-request
+- **RSS unbounded drift:** 1,111% growth under steady-state churn (malloc measured) from temporal fragmentation—old objects linger in young slabs
+- **Unpredictable pauses:** 10-100ms GC stop-the-world during request handling because heap heuristic triggered
+- **Blind spot in production:** RSS grows 40MB but you can't tell if it's the payment API, background task, or cache warming because malloc operates at pointer granularity
+
+**What changes with per-phase lifetime:**
+
+When you make phase boundaries explicit, the allocator knows:
+- **When** reclamation should happen (end of request, not mid-request)
+- **What** to reclaim (entire epoch's slabs, not scattered free slots)
+- **Why** RSS grew (epoch 3 = /api/users route leaked 15MB)
+
+Fragmentation becomes impossible (phases reclaim as units). Reclamation becomes deterministic (application controls timing). Observability becomes structural (metrics align with application semantics).
+
+---
+
+## What This Means in Code
 
 **Traditional view (per-object lifetime):**
 ```c
