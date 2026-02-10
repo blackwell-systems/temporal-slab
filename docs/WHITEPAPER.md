@@ -1,7 +1,7 @@
 # temporal-slab: Passive Epoch Reclamation for Deterministic Phase-Aligned Memory Management
 
-**Authors:** [Your Name/Institution]  
-**Contact:** [contact information]  
+**Author:** Dayna Blackwell (Independent Researcher)  
+**Contact:** dayna@blackwell-systems.com  
 **Date:** February 2026  
 **Version:** 1.0
 
