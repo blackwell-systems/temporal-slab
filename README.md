@@ -641,6 +641,13 @@ make CFLAGS="-DENABLE_SLOWPATH_SAMPLING -I../include"
 
 **For complete flag documentation**, see [docs/COMPILER_FLAGS.md](docs/COMPILER_FLAGS.md).
 
+**Build system notes:**
+- Flags are **opt-in**: Default build has minimal overhead (only RSS_RECLAMATION enabled)
+- **Pass flags via CFLAGS**: `make CFLAGS="$(CFLAGS) -DENABLE_FLAG"`
+- **TLS_OBJ special case**: TLS cache requires both flag AND object file: `make CFLAGS="... -DENABLE_TLS_CACHE=1" TLS_OBJ=slab_tls_cache.o`
+- **Combine flags**: Can enable multiple features in one build
+- **See src/Makefile header** for all flag usage examples
+
 **When to enable TLS cache:**
 - Locality-heavy workloads (high temporal reuse)
 - Tail latency is critical (p99/p999 sensitive systems)
