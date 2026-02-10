@@ -1171,6 +1171,344 @@ Traditional allocators treat fragmentation as an engineering problem—better da
 
 The insight is that the allocator should not fight entropy by constantly reordering memory. It should manage entropy by ensuring objects expire in an organized way—grouping objects with similar lifetimes so that when their lifetimes end, entire pages become empty and can be reclaimed as a unit.
 
+## Memory Management Approaches: A Complete Taxonomy
+
+Before diving deeper into temporal-slab's design, it's essential to understand the full landscape of memory management approaches. Each approach makes different tradeoffs between safety, performance, and control. Understanding these tradeoffs helps explain why temporal-slab exists and when it's the right choice.
+
+### Manual Memory Management (malloc/free)
+
+**How it works:**
+
+The programmer explicitly allocates and frees memory. The allocator tracks which memory is free, but has no concept of object lifetimes or ownership.
+
+```c
+void* ptr = malloc(128);   // Request memory
+use(ptr);                  // Use it
+free(ptr);                 // Return it when done
+```
+
+**Advantages:**
+- **Full control:** Programmer decides exactly when memory is allocated/freed
+- **Predictable timing:** No garbage collection pauses
+- **Low overhead:** No runtime tracking (typical malloc: 50ns allocation)
+
+**Disadvantages:**
+- **Memory safety issues:** Use-after-free, double-free, leaks if programmer forgets to free
+- **Temporal fragmentation:** No lifetime awareness leads to mixed lifetimes on same pages
+- **Unbounded RSS growth:** Long-running systems accumulate partially-empty pages (drift)
+
+**Fragmentation characteristics:**
+
+malloc cannot prevent temporal fragmentation because it operates at the pointer level, not the lifetime level. It sees allocations as independent requests, not as related groups with correlated lifetimes.
+
+```
+Web server after 24 hours with malloc:
+Live objects: 50,000 (steady state)
+Expected RSS: 12 MB
+Actual RSS: 20 MB (+67% drift)
+Cause: 8 MB of partially-empty pages pinned by long-lived objects
+```
+
+**When to use malloc:**
+- Short-lived processes (restart daily, drift doesn't accumulate)
+- Low allocation rate (<1K allocs/sec)
+- Variable allocation sizes (cannot fit into fixed size classes)
+- Arbitrary object lifetimes (no discernible phases)
+
+### Garbage Collection (Tracing)
+
+**How it works:**
+
+The runtime periodically traces all reachable objects from "root" pointers (stack, globals). Any unreachable objects are dead and their memory can be reclaimed. The programmer never explicitly frees memory.
+
+```go
+// Go example (mark-sweep GC)
+func handleRequest() {
+    data := make([]byte, 1024)  // Allocated automatically
+    use(data)
+    // No free() - GC will collect when unreachable
+}
+```
+
+**Garbage collection variants:**
+
+**Mark-Sweep GC** (basic):
+1. **Mark phase:** Trace from roots, mark all reachable objects
+2. **Sweep phase:** Walk heap, free unmarked objects
+3. **Problem:** Must stop-the-world during marking (10-100ms pauses)
+
+**Generational GC** (Java G1, .NET):
+1. **Assumption:** Most objects die young
+2. **Young generation:** Collected frequently (minor GC, 1-10ms pauses)
+3. **Old generation:** Collected rarely (major GC, 50-500ms pauses)
+4. **Problem:** Write barriers required (overhead on pointer updates)
+
+**Concurrent GC** (Go, Azul Zing):
+1. **Goal:** Reduce pause times by collecting concurrently with application
+2. **Method:** Mark in parallel, brief stop-the-world for root scanning
+3. **Problem:** Write barriers (5-10% throughput cost), still has brief pauses (1-5ms)
+
+**Advantages:**
+- **Memory safety:** No use-after-free, double-free, or leaks
+- **Productivity:** Programmer doesn't track lifetimes manually
+- **Compaction:** Can consolidate live objects to eliminate fragmentation
+
+**Disadvantages:**
+- **Unpredictable pauses:** Stop-the-world collections (10-100ms typical, can be seconds)
+- **Write barrier overhead:** Every pointer update requires bookkeeping (5-10% throughput cost)
+- **Heap size tuning:** Requires careful configuration (too small = frequent GC, too large = long pauses)
+- **No control over timing:** GC triggers based on heap pressure, not application logic
+
+**Why GC causes pauses:**
+
+During marking, the heap state must be consistent (no mutations). If threads continue allocating/freeing while GC traces, the reachability graph changes, causing missed objects (incorrect frees) or retained garbage (leaks). Solution: stop-the-world (pause all threads during mark phase).
+
+```
+Example pause times (Java G1GC, 4GB heap):
+Minor collection (young gen): 5-15ms
+Major collection (full heap): 50-200ms
+Worst case (fragmented heap): 500ms-2s
+```
+
+**When to use GC:**
+- Safety more important than performance (financial systems, medical devices)
+- Rapid development (prototypes, MVPs where productivity matters)
+- Complex object graphs with circular references (compilers, IDEs)
+- Languages with GC built-in (Go, Java, C#, Python)
+
+### Reference Counting
+
+**How it works:**
+
+Each object has a counter tracking how many pointers reference it. When the count reaches zero, the object is immediately freed. No tracing or stop-the-world required.
+
+```swift
+// Swift example (ARC = Automatic Reference Counting)
+class Session {
+    var data: Data
+}
+
+var session1 = Session()  // refcount = 1
+var session2 = session1   // refcount = 2
+session1 = nil            // refcount = 1
+session2 = nil            // refcount = 0 → freed immediately
+```
+
+**Advantages:**
+- **Deterministic timing:** Objects freed immediately when last reference dropped
+- **No pauses:** No stop-the-world collections
+- **Bounded latency:** Each operation has constant-time overhead
+
+**Disadvantages:**
+- **Cyclic references:** If A → B → A, refcount never reaches zero (requires cycle detection or weak references)
+- **Contention:** Multiple threads incrementing same refcount cause cache line bouncing
+- **Overhead:** 40-80 cycles per access (atomic increment on acquire, decrement on release)
+
+**Cycle detection problem:**
+
+```python
+# Python example (refcount + cycle detector)
+class Node:
+    def __init__(self):
+        self.next = None
+
+a = Node()
+b = Node()
+a.next = b  # a → b
+b.next = a  # b → a (cycle!)
+
+a = None
+b = None
+# Without cycle detector: a and b leak (refcount never reaches 0)
+# With cycle detector: Periodic tracing required (defeats purpose of refcounting)
+```
+
+**When to use reference counting:**
+- Embedded systems (no GC runtime overhead)
+- Real-time systems (deterministic timing critical)
+- Languages with ARC built-in (Swift, Objective-C)
+- Simple object ownership (no circular structures)
+
+### Region-Based Memory Management
+
+**How it works:**
+
+Group allocations into "regions" (also called arenas or pools). All allocations in a region are freed together when the region is destroyed. No per-object tracking.
+
+```c
+// Apache APR pools example
+apr_pool_t* pool = apr_pool_create();
+void* obj1 = apr_palloc(pool, 100);
+void* obj2 = apr_palloc(pool, 200);
+// Use objects...
+apr_pool_destroy(pool);  // Frees obj1 and obj2 together
+```
+
+**Advantages:**
+- **Fast allocation:** Bump pointer (just increment offset)
+- **Fast deallocation:** Free entire region at once (O(1))
+- **No per-object tracking:** No metadata overhead
+
+**Disadvantages:**
+- **Stack-only lifetimes:** Cannot express interleaved lifetimes (sessions outliving requests)
+- **No partial reclamation:** All-or-nothing (cannot free individual objects)
+- **No threading support:** Regions typically not thread-safe
+- **Memory bloat:** Region holds memory until destruction (even if objects freed early)
+
+**Limitation: Interleaved lifetimes**
+
+```c
+// Problem: Cannot handle long-lived + short-lived in same region
+apr_pool_t* pool = apr_pool_create();
+
+Session* session = apr_palloc(pool, 1024);  // Lives hours
+for (int i = 0; i < 1000; i++) {
+    Request* req = apr_palloc(pool, 128);  // Lives milliseconds
+    process(req);
+    // Cannot free req individually!
+}
+apr_pool_destroy(pool);  // Frees session AND all 1000 requests together
+```
+
+Result: Pool holds 128KB (1000 requests) even though only session (1KB) is live. 99% wasted memory until pool destroyed.
+
+**When to use regions:**
+- Single-threaded parsers (allocate AST nodes, free tree at once)
+- Image processing (allocate temp buffers, destroy after frame processed)
+- Stack-like lifetime patterns (perfect nesting, no interleaving)
+
+### Epoch-Based Memory Management (temporal-slab)
+
+**How it works:**
+
+Group allocations by time window (epochs). Objects allocated in the same epoch are placed on the same pages (slabs). When the application signals that an epoch's lifetime has ended (`epoch_close()`), all empty slabs in that epoch are recycled. This eliminates temporal fragmentation without compaction or GC.
+
+```c
+// temporal-slab example
+SlabAllocator alloc;
+allocator_init(&alloc);
+
+// Long-lived epoch
+void* session = alloc_obj_epoch(&alloc, 128, 0, &handle);
+
+// Short-lived epoch
+void* request = alloc_obj_epoch(&alloc, 128, 1, &handle);
+free_obj(&alloc, request);
+epoch_close(&alloc, 1);  // Reclaim epoch 1's memory
+```
+
+**Advantages:**
+- **Bounded RSS:** No drift (0% growth over weeks)
+- **Deterministic reclamation:** Memory freed at phase boundaries (epoch_close)
+- **Predictable latency:** Lock-free fast path (131ns p99, 371ns p999)
+- **Zero GC overhead:** No tracing, no pauses, no write barriers
+- **Structural observability:** Metrics organized by phase (built-in)
+
+**Disadvantages:**
+- **Fixed size classes:** Only 64-768 bytes (no arbitrary sizes)
+- **Phase boundary alignment required:** Application must call epoch_close()
+- **Internal fragmentation:** 11.1% average (128-byte slot for 100-byte object)
+- **Platform-specific:** Optimized for x86-64 Linux (ARM would be slower)
+
+**Key insight: Temporal grouping prevents fragmentation**
+
+```
+Web server with temporal-slab:
+Epoch 0 (connections): [Conn 1][Conn 2][Conn 3]... (Slab A, stays full)
+Epoch 1 (requests):     [Req 1][Req 2][Req 3]...   (Slab B, becomes empty)
+
+After requests complete:
+Slab A: 100% full (no waste)
+Slab B: 100% empty (recyclable)
+RSS: 12 MB (0% drift over 7 days)
+```
+
+**When to use epoch-based (temporal-slab):**
+- High allocation rate (>10K allocs/sec)
+- Correlated lifetimes (request-scoped, frame-scoped, batch-scoped)
+- Long-running services (days to weeks of uptime)
+- Latency-sensitive (HFT, real-time systems, control planes)
+- Allocation sizes ≤768 bytes
+
+### Comparison Table: All Approaches
+
+| Approach | Safety | Pause Risk | Overhead | RSS Drift | Observability | When to Use |
+|----------|--------|------------|----------|-----------|---------------|-------------|
+| **malloc** | Manual (unsafe) | None | ~50ns | Unbounded | None | Short-lived processes, low churn |
+| **GC (mark-sweep)** | Automatic | 10-100ms | Write barriers (5-10%) | Compaction prevents | External tools | Safety-critical, complex ownership |
+| **Refcounting** | Automatic (cycles leak) | None | 40-80ns per access | Moderate | None | Embedded systems, simple ownership |
+| **Regions** | Manual (unsafe) | None | ~10ns (bump pointer) | Bloat until destroy | None | Stack-like lifetimes, single-threaded |
+| **Epochs (temporal-slab)** | Manual (unsafe) | None | 40ns (p50), 131ns (p99) | **0%** | **Built-in, zero-cost** | High-throughput structured systems |
+
+### Decision Flowchart
+
+```
+START: Choosing memory management approach
+
+┌─────────────────────────────────────┐
+│ Is safety more important than perf? │
+│ (medical, financial, safety-critical)│
+└─────────────────┬───────────────────┘
+                  │
+         YES ─────┴───── NO
+          │                │
+          ▼                ▼
+    ┌─────────┐     ┌──────────────────┐
+    │ Use GC  │     │ Can you identify │
+    │ (Go,    │     │ phase boundaries?│
+    │ Java,   │     │ (requests, frames)│
+    │ C#)     │     └────────┬─────────┘
+    └─────────┘              │
+                    YES ─────┴───── NO
+                     │                │
+                     ▼                ▼
+              ┌──────────────┐  ┌──────────┐
+              │ Are objects  │  │ Use malloc│
+              │ ≤768 bytes?  │  │ or jemalloc│
+              └──────┬───────┘  └──────────┘
+                     │
+            YES ─────┴───── NO
+             │                │
+             ▼                ▼
+       ┌──────────────┐  ┌──────────┐
+       │ High alloc   │  │ Use malloc│
+       │ rate         │  │ (large     │
+       │ (>10K/sec)?  │  │ objects)   │
+       └──────┬───────┘  └──────────┘
+              │
+     YES ─────┴───── NO
+      │                │
+      ▼                ▼
+┌──────────────┐  ┌──────────┐
+│ Use temporal-│  │ Use malloc│
+│ slab         │  │ (overhead  │
+│              │  │ not worth) │
+└──────────────┘  └──────────┘
+```
+
+### Anti-Patterns for Each Approach
+
+**Don't use malloc for:**
+- Long-running services with high churn (RSS drift accumulates)
+- Latency-sensitive systems (p99 = 1,443ns, unpredictable spikes)
+
+**Don't use GC for:**
+- Hard real-time systems (pauses violate latency SLAs)
+- HFT or control planes (10-100ms pauses unacceptable)
+
+**Don't use refcounting for:**
+- Complex object graphs with cycles (requires cycle detector = GC overhead)
+- High contention workloads (cache line bouncing on shared refcounts)
+
+**Don't use regions for:**
+- Interleaved lifetimes (long-lived + short-lived in same region causes bloat)
+- Multi-threaded systems (regions typically not thread-safe)
+
+**Don't use temporal-slab for:**
+- Variable-size allocations >768 bytes (document buffers, video frames)
+- Unpredictable lifetimes (desktop GUI, user-driven interactions)
+- Low allocation rate (<1K/sec) (overhead not justified)
+
 ## Working Set
 
 The working set is the subset of a program's memory that is actively used during a period of time. It is the pages the program touches frequently enough that they should remain resident in physical RAM. The working set is distinct from total allocated memory (which may include rarely-accessed pages) and distinct from RSS (which includes all resident pages, even if not actively used).
