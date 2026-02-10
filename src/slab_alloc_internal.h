@@ -32,6 +32,64 @@
 #define ENABLE_DIAGNOSTIC_COUNTERS 0  /* Default: disabled for production */
 #endif
 
+/* Lock rank debugging (compile-time optional)
+ * 
+ * ENABLE_LOCK_RANK_DEBUG adds assertions to detect lock order inversions.
+ * When enabled, each lock is assigned a rank, and we assert that locks
+ * are acquired in strictly increasing rank order.
+ * 
+ * This catches deadlock-causing inversions immediately at runtime.
+ * 
+ * Usage:
+ *   make CFLAGS="-DENABLE_LOCK_RANK_DEBUG=1"  # Enable lock rank checking
+ *   make                                        # Production build (disabled)
+ */
+#ifndef ENABLE_LOCK_RANK_DEBUG
+#define ENABLE_LOCK_RANK_DEBUG 0  /* Default: disabled */
+#endif
+
+#if ENABLE_LOCK_RANK_DEBUG
+/* Lock ranks - must be acquired in strictly increasing order */
+#define LOCK_RANK_REGISTRY       10  /* SlabRegistry lock (rare) */
+#define LOCK_RANK_CACHE          20  /* sc->cache_lock (slab cache) */
+#define LOCK_RANK_SIZE_CLASS     30  /* sc->lock (per-size-class) */
+#define LOCK_RANK_EPOCH_LABEL    40  /* epoch_label_lock (epoch metadata) */
+#define LOCK_RANK_LABEL_REGISTRY 50  /* label_registry.lock (label mapping) */
+
+/* Per-thread state for rank tracking */
+extern __thread int _lock_rank_highest;
+extern __thread const char* _lock_rank_highest_name;
+extern __thread const char* _lock_rank_highest_location;
+
+/* Rank checking macro - use before pthread_mutex_lock */
+#define CHECK_LOCK_RANK(rank, name, location) do { \
+  if ((rank) < _lock_rank_highest) { \
+    fprintf(stderr, \
+            "\n*** LOCK RANK VIOLATION ***\n" \
+            "Trying to acquire: %s (rank %d) at %s\n" \
+            "Already holding: %s (rank %d) at %s\n" \
+            "This is a lock order inversion that causes deadlock!\n\n", \
+            (name), (rank), (location), \
+            _lock_rank_highest_name, _lock_rank_highest, _lock_rank_highest_location); \
+    abort(); \
+  } \
+  _lock_rank_highest = (rank); \
+  _lock_rank_highest_name = (name); \
+  _lock_rank_highest_location = (location); \
+} while (0)
+
+#define RELEASE_LOCK_RANK() do { \
+  _lock_rank_highest = 0; \
+  _lock_rank_highest_name = NULL; \
+  _lock_rank_highest_location = NULL; \
+} while (0)
+
+#else
+/* No-op when disabled */
+#define CHECK_LOCK_RANK(rank, name, location) ((void)0)
+#define RELEASE_LOCK_RANK() ((void)0)
+#endif
+
 #define SLAB_MAGIC   0x534C4142u /* "SLAB" in ASCII, used to detect corruption */
 #define SLAB_VERSION 1u          /* Handle format version for future compatibility */
 
