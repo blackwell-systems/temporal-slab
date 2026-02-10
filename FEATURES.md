@@ -692,6 +692,11 @@ make
 # Enable RSS reclamation (default: disabled)
 -DENABLE_RSS_RECLAMATION=1
 
+# Enable probabilistic slowpath sampling for tail latency diagnosis (default: disabled)
+# Samples 1/1024 allocations, measures wall vs CPU time to detect WSL2/VM interference
+# See workloads/README_SLOWPATH_SAMPLING.md for usage
+-DENABLE_SLOWPATH_SAMPLING
+
 # Change page size (default: 4096)
 -DSLAB_PAGE_SIZE=8192
 
