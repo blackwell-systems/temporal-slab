@@ -1782,59 +1782,38 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
 
   /* Check if slab just became fully empty (all slots free).
    * 
-   * Protocol C: Zombie-proof empty slab retirement.
-   * This implements the ACTIVE→RETIRED→CACHED state machine:
-   * 1. Unlink from all lists (ACTIVE → RETIRED)
-   * 2. Depublish from current_partial under lock (single-writer invariant)
-   * 3. Mark unreachable (list_id = NONE)
-   * 4. Release lock (linearization point: slab is now unreachable)
-   * 5. Recycle (may madvise/zero header - safe because unreachable)
+   * SAFETY: Do NOT immediately recycle empty slabs!
+   * Other threads may still hold handles to slots in this slab.
+   * Recycling would invalidate those handles (generation mismatch).
    * 
-   * This eliminates zombie states:
-   * - No "unlisted but still published" (Invariant 1 violation)
-   * - No "madvised while reachable" (physical zombie)
-   * - No "full slab stuck on partial" (logical zombie)
+   * Instead: Keep empty slabs on the partial list until epoch_close()
+   * or explicit cleanup. This ensures all outstanding handles remain valid.
+   * 
+   * The empty_partial_count tracks these for potential trimming during
+   * epoch_close() when it's safe (no outstanding allocations from that epoch).
    */
   if (new_fc == s->object_count) {
-    LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");
-    
-    /* Step 1: Unlink from whichever list it's on */
+    /* Slab is now fully empty. Two cases:
+     * 1. Was on FULL list → move to PARTIAL (so it can be reused)
+     * 2. Was on PARTIAL list → already correct, just increment empty counter
+     */
     if (s->list_id == SLAB_LIST_FULL) {
+      LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");
+      
+      /* Move from full→partial */
       list_remove(&es->full, s);
+      list_push_back(&es->partial, s);
+      s->list_id = SLAB_LIST_PARTIAL;
+      
+      /* Track as empty partial */
+      atomic_fetch_add_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
+      
+      UNLOCK_WITH_RANK(&sc->lock);
     } else if (s->list_id == SLAB_LIST_PARTIAL) {
-      list_remove(&es->partial, s);
-      /* Decrement empty counter since we're removing this empty slab */
-      atomic_fetch_sub_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
+      /* Already on partial list, just became fully empty */
+      atomic_fetch_add_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
     }
     
-    /* Step 2: Depublish from current_partial with STORE under lock (no CAS).
-     * Under lock, we are the single writer, so plain store-if-equal is correct.
-     * This is the key fix: no CAS means no "failed → bailout" path that leaves
-     * slab unlisted but potentially still published. */
-    if (atomic_load_explicit(&es->current_partial, memory_order_relaxed) == s) {
-      atomic_store_explicit(&es->current_partial, NULL, memory_order_release);
-    }
-    
-    /* Step 3: Mark unreachable + defensive unlink pointers */
-    s->list_id = SLAB_LIST_NONE;
-    s->prev = NULL;
-    s->next = NULL;
-    
-    /* Step 4: Accounting (do it once, here) */
-    sc->total_slabs--;
-    
-    /* Linearization point: slab is now unreachable from:
-     * - es->partial list (removed)
-     * - es->full list (removed)
-     * - es->current_partial (depublished)
-     * No allocation path can select this slab anymore. */
-    
-    UNLOCK_WITH_RANK(&sc->lock);
-    
-    /* Step 5: Recycle immediately to cache.
-     * cache_push() will madvise only if was_published==false (never reachable lock-free).
-     * If it *was* published, we still cache it but must not madvise. */
-    cache_push(sc, s);
     return true;
   }
 
