@@ -74,7 +74,8 @@ static void* worker_alloc_free(void* arg) {
   for (int i = 0; i < a->iters; i++) {
     void* p = alloc_obj_epoch(a->alloc, 128, 0, &hs[i]);
     if (!p) {
-      fprintf(stderr, "Thread %d: alloc failed at iteration %d\n", a->thread_id, i);
+      fprintf(stderr, "Thread %d: alloc failed at iteration %d (errno=%d: %s)\n", 
+              a->thread_id, i, errno, strerror(errno));
       free(hs);
       return (void*)1;
     }
@@ -83,6 +84,7 @@ static void* worker_alloc_free(void* arg) {
 
   for (int i = 0; i < a->iters; i++) {
     if (!free_obj(a->alloc, hs[i])) {
+      fprintf(stderr, "Thread %d: free failed at iteration %d\n", a->thread_id, i);
       free(hs);
       return (void*)1;
     }
