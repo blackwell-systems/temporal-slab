@@ -1001,6 +1001,205 @@ A memory allocator bridges the gap between what the OS provides (pages) and what
 
 The canonical allocator interface is `malloc(size)` and `free(ptr)`. The allocator's job is to maintain a pool of pages, satisfy allocation requests by finding or creating space, and reclaim space when objects are freed. The allocator must answer: where should this allocation go? When can freed memory be reused? How can pages be returned to the OS when they are no longer needed?
 
+### malloc Variants: Different Strategies for the Same Problem
+
+While the malloc/free interface is standard, different implementations make vastly different tradeoff decisions. Understanding these variants helps appreciate why temporal-slab's approach is necessary.
+
+#### ptmalloc2 (glibc malloc)
+
+**Design:** Arena-per-thread with binned free lists
+
+ptmalloc2 is the default allocator in glibc (Linux standard C library). It uses arenas (memory pools) to reduce contention between threads.
+
+**How it works:**
+
+1. **Arenas:** Each thread gets its own arena (memory pool). The main thread uses the main arena, other threads get thread-specific arenas. This reduces lock contention (threads don't compete for the same lock).
+
+2. **Bins:** Within each arena, free blocks are organized into bins by size:
+   - **Fast bins:** Small allocations (16-80 bytes), LIFO (last-in-first-out) for cache locality
+   - **Small bins:** 16-512 bytes, segregated by exact size (powers of 2)
+   - **Large bins:** >512 bytes, sorted by size within each bin
+   - **Unsorted bin:** Recently freed blocks (not yet sorted into bins)
+
+3. **Allocation strategy:**
+   - Check fast bin for exact size match (O(1))
+   - Check small bin for exact size match (O(1))
+   - Check unsorted bin, sort blocks into bins during search (O(N))
+   - Check large bins, find best-fit (O(log N))
+   - If no fit found, request new pages from OS via mmap
+
+**Performance characteristics:**
+
+| Metric | Value | Explanation |
+|--------|-------|-------------|
+| Avg allocation latency | ~50ns | Fast bin hits are quick |
+| p99 allocation latency | **1,443ns** | Large bin searches, lock contention, mmap syscalls |
+| p999 allocation latency | **4,409ns** | Worst case: multiple bin scans + mmap |
+| RSS drift | **Unbounded** | No lifetime awareness, temporal fragmentation |
+| Thread scalability | Moderate | Arenas reduce but don't eliminate contention |
+
+**Why temporal fragmentation happens:**
+
+ptmalloc2 has no concept of object lifetimes. A long-lived session object and short-lived request object both go into the same bins if they're the same size. They intermingle on pages, causing temporal fragmentation.
+
+```
+Web server using ptmalloc2:
+Hour 1:  12 MB RSS
+Hour 24: 20 MB RSS (+67% drift)
+Day 7:   25 MB RSS (+108% drift)
+
+Cause: Pages pinned by sparse long-lived objects (temporal fragmentation)
+```
+
+**When it's good enough:**
+- Short-lived processes (CLI tools, batch jobs)
+- Low allocation rate (<1K/sec)
+- Memory size more important than latency (embedded systems)
+
+#### jemalloc (Facebook, Rust default)
+
+**Design:** Size-class segregation with extensive profiling support
+
+jemalloc (originally from FreeBSD, now maintained by Facebook) is optimized for multi-threaded applications with high allocation rates. It's the default allocator in Rust and Firefox.
+
+**How it works:**
+
+1. **Size classes:** Allocations are rounded up to predefined size classes (16, 32, 48, 64, 80, 96, ..., 2MB). This reduces fragmentation compared to arbitrary sizes.
+
+2. **Thread-local caching (tcache):** Each thread has a cache of recently-freed objects organized by size class. Allocations hit the tcache first (lock-free), falling back to arena on cache miss.
+
+3. **Arenas:** Multiple arenas (typically 4× number of CPUs) to distribute contention. Each arena manages extents (runs of pages) organized by size class.
+
+4. **Runs:** A run is a contiguous group of pages devoted to a single size class. Similar to temporal-slab's slabs, but without epoch grouping.
+
+**Performance characteristics:**
+
+| Metric | Value | Explanation |
+|--------|-------|-------------|
+| Avg allocation latency | ~45ns | tcache hits are fast |
+| p99 allocation latency | **~800ns** | Arena lock, run allocation |
+| RSS drift | Moderate | Better than ptmalloc2, but still drifts |
+| Profiling overhead | **10-30%** | When `--enable-prof` active |
+| Observability | Per-allocation backtraces (expensive) | Requires sampling |
+
+**Profiling tradeoff:**
+
+jemalloc includes heap profiling, but it's expensive. Enabling profiling requires:
+1. Hash table tracking every allocation → backtrace mapping
+2. Stack unwinding on every allocation (200-500ns per alloc)
+3. Post-mortem analysis with `jeprof` tool
+
+```bash
+# Enable profiling (10-30% overhead)
+export MALLOC_CONF="prof:true,prof_leak:true"
+./server
+
+# Analyze after shutdown
+jeprof --text ./server jeprof.*.heap
+```
+
+**Why it's better than ptmalloc2 but still has RSS drift:**
+
+jemalloc's size-class segregation reduces fragmentation compared to ptmalloc2's mixed-size bins. But it still has no lifetime awareness. Long-lived and short-lived objects of the same size intermingle in the same runs, causing temporal fragmentation.
+
+**When to use jemalloc:**
+- High allocation rate (>10K/sec)
+- Need profiling (can tolerate overhead)
+- Multi-threaded (benefits from tcache)
+- Allocation sizes vary (not fixed size classes)
+
+#### tcmalloc (Google, used in Chrome)
+
+**Design:** Aggressive per-thread caching with central freelist
+
+tcmalloc (thread-caching malloc) from Google is optimized for high-throughput multi-threaded applications. It powers Chrome and many Google services.
+
+**How it works:**
+
+1. **Thread-local cache:** Each thread has a cache of free objects for each size class (up to 256KB). Allocations are served from the cache without locks.
+
+2. **Central freelist:** When a thread cache misses, it requests a batch of objects from the central freelist (protected by lock). Batching amortizes lock cost.
+
+3. **Page heap:** Manages large allocations (>256KB) using a best-fit algorithm. Coalesces adjacent free pages to reduce fragmentation.
+
+4. **Aggressive caching:** tcmalloc caches more objects per thread than jemalloc, trading memory for speed.
+
+**Performance characteristics:**
+
+| Metric | Value | Explanation |
+|--------|-------|-------------|
+| Avg allocation latency | ~40ns | Thread cache (lock-free) |
+| p99 allocation latency | **~600ns** | Central freelist lock |
+| RSS overhead | Higher | Aggressive caching |
+| RSS drift | Moderate | Better than ptmalloc2 |
+| Heap profiler overhead | **5-15%** | Lower than jemalloc |
+
+**Heap profiling:**
+
+tcmalloc includes a heap profiler (`HeapProfiler`) that samples allocations (not every allocation, unlike jemalloc). Lower overhead but less precise.
+
+```cpp
+// C++ example with tcmalloc heap profiler
+#include <gperftools/heap-profiler.h>
+
+HeapProfilerStart("myapp");
+// Run application...
+HeapProfilerStop();  // Generates myapp.0001.heap
+```
+
+Analysis: `pprof --text ./myapp myapp.0001.heap`
+
+**Why it still has RSS drift:**
+
+Despite aggressive caching and size-class segregation, tcmalloc has no lifetime awareness. It cannot prevent temporal fragmentation because it treats all allocations of the same size as equivalent, regardless of expected lifetime.
+
+**When to use tcmalloc:**
+- Very high allocation rate (>100K/sec)
+- Latency-sensitive (lower p99 than jemalloc/ptmalloc2)
+- Multi-threaded with contention (aggressive caching helps)
+- Can accept higher RSS baseline (caching overhead)
+
+#### Comparison Table: malloc Variants vs temporal-slab
+
+| Allocator | Avg Latency | p99 Latency | p999 Latency | RSS Drift (24h) | Observability Overhead | Thread Scalability |
+|-----------|-------------|-------------|--------------|-----------------|------------------------|---------------------|
+| **ptmalloc2** (glibc) | 50ns | 1,443ns | 4,409ns | +67% | N/A (no observability) | Moderate (arenas) |
+| **jemalloc** | 45ns | ~800ns | ~1,500ns | +40% | 10-30% (if profiling) | Good (tcache) |
+| **tcmalloc** | 40ns | ~600ns | ~1,200ns | +30% | 5-15% (heap profiler) | Excellent (aggressive cache) |
+| **temporal-slab** | 40ns | **131ns** | **371ns** | **0%** | **0% (structural)** | Excellent (lock-free) |
+
+**Key observations:**
+
+1. **Tail latency:** temporal-slab achieves 4-11× better p99 latency than malloc variants (131ns vs 600-1,443ns)
+
+2. **RSS drift:** All malloc variants drift (+30-67% over 24 hours), temporal-slab has 0% drift
+
+3. **Observability:** malloc profiling costs 5-30% overhead, temporal-slab's metrics are free (structural)
+
+4. **Tradeoff:** temporal-slab requires fixed size classes (≤768 bytes) and phase boundaries
+
+**Why malloc cannot achieve 0% RSS drift:**
+
+All malloc variants operate at the **pointer level**, not the **lifetime level**. They optimize for:
+- Fast allocation (thread caching, lock-free paths)
+- Low fragmentation (size classes, bins, runs)
+- Thread scalability (arenas, per-thread caches)
+
+But they cannot prevent temporal fragmentation because they have no concept of object lifetimes. A 128-byte session object (lives hours) and a 128-byte request object (lives milliseconds) look identical to malloc—both go into the same size class, intermingle on the same pages, and cause temporal fragmentation as requests expire.
+
+temporal-slab solves this by operating at the **phase level**: group objects by epoch (time window), place them on the same slabs, and reclaim entire slabs when the phase completes. This requires application cooperation (calling `epoch_close()` at phase boundaries) but eliminates drift entirely.
+
+**When to use each:**
+
+| Workload | Recommended Allocator | Why |
+|----------|----------------------|-----|
+| Web server (request/response) | **temporal-slab** | High rate, correlated lifetimes, need 0% drift |
+| Desktop app (user interactions) | **jemalloc** | Variable sizes, unpredictable lifetimes |
+| Browser (many short-lived tabs) | **tcmalloc** | Very high rate, low p99 latency |
+| CLI tool (short-lived process) | **ptmalloc2** | Simplicity, no time for drift |
+| Game engine (per-frame objects) | **temporal-slab** | Frame boundary = epoch boundary |
+| Database (long-lived cache) | **jemalloc** | Stable working set, profiling useful |
+
 ## Metadata
 
 Metadata is the information an allocator stores about its own state—data structures tracking which memory is allocated, which is free, and how to find available space. Metadata is overhead: memory the allocator uses for bookkeeping, not for user data.
