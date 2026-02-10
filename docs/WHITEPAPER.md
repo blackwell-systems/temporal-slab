@@ -524,7 +524,86 @@ Without the fence, transient views during concurrent bitmap updates could false-
 
 The divergence source was identified and fixed (lines 1470-1526 in slab_alloc.c), but the repair mechanism remains as defense-in-depth.
 
-### 3.10 Slowpath Sampling (p9999 Diagnosis)
+### 3.10 Observability API: Built-in Metrics
+
+temporal-slab provides comprehensive runtime metrics through three snapshot APIs that expose allocator state without external instrumentation.
+
+**Three levels of granularity:**
+
+```c
+// Level 1: Global health (all size classes + epochs)
+SlabGlobalStats global;
+slab_stats_global(&allocator, &global);
+printf("Net RSS: %.2f MB, %lu slabs live\n", 
+       global.estimated_slab_rss_bytes / 1024.0 / 1024, global.net_slabs);
+
+// Level 2: Per-size-class diagnosis
+SlabClassStats class_128b;
+slab_stats_class(&allocator, 2, &class_128b);  // 128-byte class
+printf("Lock contention rate: %.1f%%\n", 
+       class_128b.lock_contention_rate * 100);
+
+// Level 3: Per-epoch attribution
+SlabEpochStats epoch;
+slab_stats_epoch(&allocator, 2, 3, &epoch);
+printf("Epoch 3: %u reclaimable slabs, %.2f MB\n",
+       epoch.reclaimable_slab_count,
+       epoch.reclaimable_bytes / 1024.0 / 1024);
+```
+
+**Key metrics available:**
+
+| Category | Metrics | Use Case |
+|----------|---------|----------|
+| **RSS tracking** | `rss_bytes_current`, `estimated_slab_rss_bytes`, `net_slabs` | Capacity planning, leak detection |
+| **Performance** | `slow_path_hits`, `lock_contention_rate`, `avg_alloc_cas_retries_per_attempt` | Tail latency diagnosis |
+| **Reclamation** | `madvise_calls`, `madvise_bytes`, `empty_slab_recycled` | Validate epoch_close() effectiveness |
+| **Phase attribution** | Per-epoch `estimated_rss_bytes`, `reclaimable_slab_count` | "Which phase leaked memory?" |
+| **Semantic labels** | `lock_contended_by_label[16]` (optional) | "Which route causes contention?" |
+
+**Zero instrumentation cost:**
+
+All counters are maintained for correctness during allocation/free. Exposing them via snapshot APIs adds no hot-path overhead. Snapshot functions briefly lock to read list lengths (~10-50µs typical).
+
+**Example: Detecting memory leaks**
+
+```c
+SlabEpochStats stats;
+for (EpochId e = 0; e < 16; e++) {
+    slab_stats_epoch(&allocator, size_class, e, &stats);
+    if (stats.state == EPOCH_CLOSING && stats.reclaimable_slab_count > 100) {
+        fprintf(stderr, "WARNING: Epoch %u stuck CLOSING with %u slabs\n",
+                e, stats.reclaimable_slab_count);
+        // Application bug: forgot to call epoch_close()?
+    }
+}
+```
+
+**Example: Production dashboards**
+
+```c
+// Prometheus exporter pseudocode
+SlabGlobalStats gs;
+slab_stats_global(&allocator, &gs);
+
+prometheus_gauge("slab_rss_bytes", gs.rss_bytes_current);
+prometheus_gauge("slab_net_slabs", gs.net_slabs);
+prometheus_counter("slab_madvise_bytes_total", gs.total_madvise_bytes);
+
+for (uint32_t cls = 0; cls < 8; cls++) {
+    SlabClassStats cs;
+    slab_stats_class(&allocator, cls, &cs);
+    
+    prometheus_gauge("slab_lock_contention_rate", cs.lock_contention_rate,
+                     "size_class", cls);
+    prometheus_counter("slab_slow_path_hits_total", cs.slow_path_hits,
+                       "size_class", cls);
+}
+```
+
+This API enables the "structural observability" claim: metrics organized by application phases (epochs), not reconstructed via sampling.
+
+### 3.11 Slowpath Sampling (p9999 Diagnosis)
 
 For diagnosing extreme tail latency outliers (p9999/p99999), temporal-slab provides compile-time optional slowpath sampling:
 
