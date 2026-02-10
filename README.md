@@ -621,13 +621,25 @@ make CFLAGS="-DENABLE_DIAGNOSTIC_COUNTERS=1 -I../include -DENABLE_RSS_RECLAMATIO
 make CFLAGS="-DENABLE_TLS_CACHE=1 -I../include"
 ```
 
-**Available flags:**
+**Build with tail latency sampling (WSL2/VM diagnosis):**
+```bash
+make CFLAGS="-DENABLE_SLOWPATH_SAMPLING -I../include"
+# Samples 1/1024 allocations, measures wall vs CPU time
+# See: workloads/README_SLOWPATH_SAMPLING.md
+```
 
-| Flag | Default | Purpose | Overhead |
-|------|---------|---------|----------|
-| `ENABLE_TLS_CACHE` | 0 | Thread-local handle cache for tail latency reduction | -11% p50, -75% p99, -76% p999 (improvement) |
-| `ENABLE_RSS_RECLAMATION` | 1 | Empty slab reclamation via madvise() | ~5µs per slab reuse |
-| `ENABLE_DIAGNOSTIC_COUNTERS` | 0 | Track live_bytes/committed_bytes for RSS proof | ~1-2% latency |
+**All compile-time flags:**
+
+| Flag | Default | Purpose | Overhead | When to Use |
+|------|---------|---------|----------|-------------|
+| `ENABLE_RSS_RECLAMATION` | 1 | Returns empty slabs to OS via madvise() | ~5µs per slab | Memory-constrained systems, containers |
+| `ENABLE_TLS_CACHE` | 0 | Thread-local handle cache for tail latency reduction | -11% p50, -75% p99 (faster!) | High-locality workloads, p99-sensitive |
+| `ENABLE_SLOWPATH_SAMPLING` | 0 | Probabilistic sampling (1/1024) for latency diagnosis | ~0.2ns avg | WSL2/VM tail latency investigation |
+| `ENABLE_DIAGNOSTIC_COUNTERS` | 0 | Tracks live_bytes/committed_bytes with atomics | ~1-2% latency | RSS debugging, leak detection |
+| `ENABLE_LOCK_RANK_DEBUG` | 0 | Runtime deadlock detection via lock ordering | ~5-10% latency | Development, debugging only |
+| `ENABLE_LABEL_CONTENTION` | 0 | Per-label contention attribution (16 labels) | Negligible | Multi-domain contention analysis |
+
+**For complete flag documentation**, see [docs/COMPILER_FLAGS.md](docs/COMPILER_FLAGS.md).
 
 **When to enable TLS cache:**
 - Locality-heavy workloads (high temporal reuse)

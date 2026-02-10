@@ -2,8 +2,22 @@ CC = gcc
 CFLAGS = -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include -DENABLE_RSS_RECLAMATION=1
 TSAN_FLAGS = -O1 -g -std=c11 -pthread -Wall -Wextra -pedantic -I../include -DENABLE_RSS_RECLAMATION=1 -fsanitize=thread
 
-# Conditional TLS cache support (optional dependency)
-# Build with: make CFLAGS="$(CFLAGS) -DENABLE_TLS_CACHE=1" TLS_OBJ=slab_tls_cache.o
+# Optional features (add to CFLAGS as needed):
+#
+# TLS Cache (thread-local allocation cache):
+#   Build with: make CFLAGS="$(CFLAGS) -DENABLE_TLS_CACHE=1" TLS_OBJ=slab_tls_cache.o
+#
+# Slowpath Sampling (probabilistic tail latency diagnosis):
+#   Build with: make CFLAGS="$(CFLAGS) -DENABLE_SLOWPATH_SAMPLING"
+#   Note: Samples 1/1024 allocations, measures wall vs CPU time
+#   See: workloads/README_SLOWPATH_SAMPLING.md
+#
+# Diagnostic Counters (live_bytes tracking):
+#   Build with: make CFLAGS="$(CFLAGS) -DENABLE_DIAGNOSTIC_COUNTERS=1"
+#
+# Lock Rank Debugging (deadlock detection):
+#   Build with: make CFLAGS="$(CFLAGS) -DENABLE_LOCK_RANK_DEBUG=1"
+
 TLS_OBJ ?=
 
 all: smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump synthetic_bench
