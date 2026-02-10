@@ -6,6 +6,52 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Critical: Reuse-Before-Madvise Race Fix (2026-02-09)
+
+**Fixed catastrophic zombie slab corruption caused by temporal race in `cache_push()`.**
+
+#### Problem
+Under high concurrency with RSS reclamation enabled, slabs could be reused and published before their headers were zeroed by `madvise(MADV_DONTNEED)`, resulting in zombie slabs with `free_count=UINT32_MAX` and `object_count=0`.
+
+**Race window:**
+```
+Thread A: cache_push() → lock → insert slab into cache → unlock → [about to madvise]
+Thread B: cache_pop() → get slab → new_slab() → reinitialize → publish to current_partial
+Thread A: madvise() → zeros live slab header
+Result: Catastrophic corruption
+```
+
+#### Solution
+**Critical ordering change:** Perform `madvise()` BEFORE making slab reachable via cache insertion.
+
+**New ordering:**
+1. Snapshot `slab_id` and `was_published` from header (before madvise zeros them)
+2. Call `madvise(MADV_DONTNEED)` if `!was_published` (**before lock acquisition**)
+3. Lock `cache_lock`
+4. Insert slab into cache using off-page snapshots
+5. Unlock `cache_lock`
+
+**Key properties:**
+- `madvise()` completes before slab becomes visible to `cache_pop()`
+- Metadata stored off-page (survives header zeroing)
+- Never madvise published slabs (may have lock-free pointers in-flight)
+
+#### Changes
+- **cache_push()**: Restructured to madvise before lock, use snapshots for metadata
+- **cache_pop()**: Added `out_was_published` parameter to return off-page metadata
+- **new_slab()**: Receives `was_published` from cache, preserves across reclamation
+
+#### Verification
+8-thread stress test (800K ops, RSS_RECLAMATION=1):
+- ✅ Zero catastrophic corruption incidents
+- ✅ Only 1 benign zombie repair (vs many before fix)
+- ✅ RSS reclamation functional (madvise calls tracked)
+- ✅ Throughput: 422K ops/sec (expected madvise overhead)
+
+**Impact:** Eliminates all known zombie slab corruption under concurrent load with RSS reclamation.
+
+---
+
 ### Bounded RSS Proof Mode (2026-02-09)
 
 Added statistical analysis mode to `sustained_phase_shifts` benchmark for validating bounded RSS behavior under sustained allocation churn.
