@@ -3,6 +3,7 @@
 
 #include "slab_alloc.h"
 #include <stdint.h>
+#include <time.h>
 
 /*
  * Observability API for temporal-slab
