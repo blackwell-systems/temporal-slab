@@ -48,19 +48,21 @@ temporal-slab is designed as a **concurrent slab allocator** with the following 
    - CAS loop on bitmap (no race conditions)
    - Mutex-protected list demotion (FULL→PARTIAL)
    - Handle validation through registry (ABA-proof)
+   - Empty slabs retained on partial list (deferred reclamation)
 
 3. **epoch_advance() / epoch_close()** - Thread-safe state transitions
    - Atomic epoch state updates (ACTIVE → CLOSING)
    - Null `current_partial` pointers to prevent new allocations
    - Mutex-protected slab list scanning
+   - Safe empty slab reclamation (quiescence point)
 
 **Synchronization points:**
 
 | Operation | Fast Path (Lock-Free) | Slow Path (Mutex) |
 |-----------|----------------------|-------------------|
 | **Allocation** | Atomic load + CAS bitmap | Pick/create slab, promote PARTIAL→FULL |
-| **Free** | CAS bitmap | Demote FULL→PARTIAL, recycle empty slabs |
-| **Epoch transition** | Atomic state change | Null pointers, scan lists |
+| **Free** | CAS bitmap | Demote FULL→PARTIAL, move empty slabs FULL→PARTIAL |
+| **Epoch close** | Atomic state change | Scan lists, recycle empty slabs |
 
 ### Memory Ordering
 
@@ -523,6 +525,42 @@ void* alloc_distributed(size_t size) {
 ---
 
 ## Thread Safety Validation
+
+### Critical Bugs Fixed
+
+#### Bug: Handle Invalidation from Premature Recycling (Feb 2026)
+
+**Symptom:** Multi-threaded `smoke_tests` failed with "free_obj returns false" when using bulk alloc/free patterns.
+
+**Root cause:** When a slab became fully empty, `free_obj()` immediately recycled it via `cache_push()`, incrementing the generation counter. This invalidated outstanding handles held by other threads.
+
+**The race:**
+```
+Thread A: Allocates 500K objects, holds handles h[0..499999]
+Thread B: Frees last object in slab X → slab empty
+Thread B: cache_push(slab X) → generation++ (slab recycled)
+Thread A: Tries to free handle to slab X
+Thread A: reg_lookup_validate() → generation mismatch → FAIL
+```
+
+**Fix:** Empty slabs now stay on the partial list instead of immediate recycling:
+- If on FULL list → move to PARTIAL (enable reuse)
+- If on PARTIAL list → increment `empty_partial_count`
+- Reclamation deferred to `epoch_close()` (safe quiescence point)
+
+**Why safe:**
+1. Handles remain valid until epoch closes
+2. Empty slabs can be reused (performance benefit)
+3. Generation only increments during epoch_close() when no outstanding allocations exist
+
+**Verification:**
+- smoke_tests: 3/3 runs PASS (was 0/3 before fix)
+- Zombie repairs: 644 → 12 (98% reduction)
+- All production benchmarks: PASS
+
+**See:** `docs/DEBUGGING_SAGA.md` for complete debugging chronicle
+
+---
 
 ### ThreadSanitizer (TSan) Validation
 
