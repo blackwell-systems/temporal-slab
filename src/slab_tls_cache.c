@@ -38,7 +38,6 @@ static inline int tls_should_bypass_alloc(TLSCache* tls) {
     if (tls->bypass_alloc) {
         if (tls->window_ops >= tls->bypass_ends_at) {
             tls->bypass_alloc = 0;  /* Re-enable after bypass window */
-            tls->bypass_free = 0;
             tls->window_hits = 0;   /* Reset window state for clean measurement */
             tls->window_ops = 0;
         }
@@ -60,9 +59,8 @@ static inline void tls_record_alloc(TLSCache* tls, int hit) {
         /* Warmup protection: Don't enable bypass during first measurement window.
          * Allow at least one refill opportunity before deciding TLS is ineffective. */
         if (tls->window_ops > TLS_WINDOW_OPS && pct < TLS_MIN_HIT_PCT) {
-            /* Hit rate too low - disable both alloc and free */
+            /* Hit rate too low - disable alloc (free caching already disabled) */
             tls->bypass_alloc = 1;
-            tls->bypass_free = 1;  /* Also bypass free (no reuse expected) */
             tls->bypass_ends_at = tls->window_ops + TLS_BYPASS_OPS;
         }
         
@@ -88,18 +86,41 @@ void* tls_try_alloc(SlabAllocator* a, uint32_t sc, uint32_t epoch_id, SlabHandle
     
     /* Fast path: TLS cache hit */
     if (tls->count > 0) {
-        uint32_t idx = --tls->count;
-        TLSItem item = tls->items[idx];
+        TLSItem item = tls->items[tls->count - 1];
+        
+#if TLS_DEBUG_VALIDATE
+        /* Debug: assert one-shot invariant */
+        if (tls->tls_popped > tls->tls_refilled_added) {
+            fprintf(stderr, "TLS INVARIANT VIOLATION: popped=%u > added=%u\n",
+                    tls->tls_popped, tls->tls_refilled_added);
+            abort();
+        }
+#endif
         
         /* Epoch check: reject stale cached handles from closed epochs */
-        if (item.h != 0) {
-            uint32_t cached_epoch = (uint32_t)(item.h >> 32);
-            if (cached_epoch == epoch_id) {
-                *out_h = item.h;
-                tls->tls_alloc_hits++;
-                tls_record_alloc(tls, 1);  /* Count as hit */
-                return item.p;  /* Zero-overhead return: no unpack, no validation */
-            }
+        if (item.h != 0 && item.epoch_id == epoch_id) {
+            /* Valid entry - consume it (one-shot pop) */
+            tls->count--;
+            tls->tls_popped++;
+            *out_h = item.h;
+            tls->tls_alloc_hits++;
+            tls_record_alloc(tls, 1);  /* Count as hit */
+            
+#if TLS_DEBUG_VALIDATE
+            /* Poison consumed entry to detect double-use */
+            tls->items[tls->count].h = 0xDEADBEEFDEADBEEFULL;
+            tls->items[tls->count].p = (void*)0xDEADBEEFDEADBEEFULL;
+            tls->items[tls->count].epoch_id = 0xDEADBEEF;
+#endif
+            
+            return item.p;  /* Zero-overhead return: no unpack, no validation */
+        }
+        
+        /* Entry failed validation (wrong epoch) - discard it and treat as miss */
+        if (tls->count > 0 && item.epoch_id != epoch_id) {
+            tls->count--;
+            tls->tls_popped++;
+            tls->tls_epoch_rejects++;
         }
     }
     
@@ -109,54 +130,17 @@ void* tls_try_alloc(SlabAllocator* a, uint32_t sc, uint32_t epoch_id, SlabHandle
 }
 
 bool tls_try_free(SlabAllocator* a, uint32_t sc, SlabHandle h) {
-    if (_tls_bypass) return false;  /* Skip TLS during epoch flush */
-    if (_tls_in_refill) return false;  /* Skip TLS during refill (prevents recursion) */
-    if (_tls_in_flush) return false;   /* Skip TLS during cache flush (prevents recursion) */
-    
-    if (!_tls_initialized) {
-        tls_init_thread();
-    }
-    
-    TLSCache* tls = &_tls_cache[sc];
-    
-    /* HARD BYPASS: first instruction after cache lookup */
-    if (tls->bypass_free) {
-        tls->tls_free_bypassed++;
-        return false;
-    }
-    
-    /* Dribble flush: when at high watermark, flush small batch to low watermark */
-    if (tls->count >= TLS_FLUSH_HI) {
-        _tls_in_flush = true;
-        uint32_t target = TLS_FLUSH_LO;
-        uint32_t n = TLS_FLUSH_DRIBBLE;
-        
-        while (n-- && tls->count > target) {
-            SlabHandle flush_h = tls->items[--tls->count].h;
-            free_obj(a, flush_h);
-        }
-        
-        _tls_in_flush = false;
-        tls->tls_free_dribbles++;
-    }
-    
-    /* Cache the freed handle (we need pointer, so validate) */
-    uint32_t slab_id, gen, slot, size_class_check;
-    handle_unpack(h, &slab_id, &gen, &slot, &size_class_check);
-    
-    Slab* s = reg_lookup_validate(&a->reg, slab_id, gen);
-    if (!s) {
-        return false;
-    }
-    
-    /* Store both handle and pointer for future fast alloc */
-    void* p = slab_slot_ptr(s, slot);
-    tls->items[tls->count].h = h;
-    tls->items[tls->count].p = p;
-    tls->count++;
-    tls->tls_free_cached++;
-    
-    return true;
+    /* TLS free caching disabled - always return false to use global free path.
+     * 
+     * Why: Caching frees locally creates metadata divergence. The global allocator
+     * believes slots are allocated when TLS has them cached, causing:
+     * - Slabs appear artificially full (free_count=0, but slots in TLS cache)
+     * - Zombie partial slabs (metadata lies about availability)
+     * - Global selection logic breaks
+     * 
+     * Solution: TLS alloc-only caching. Frees always update global state. */
+    (void)a; (void)sc; (void)h;
+    return false;
 }
 
 void tls_refill(SlabAllocator* a, uint32_t sc, uint32_t epoch_id) {
@@ -182,10 +166,12 @@ void tls_refill(SlabAllocator* a, uint32_t sc, uint32_t epoch_id) {
             break;
         }
         
-        /* Store both handle and pointer for fast alloc hits */
+        /* Store handle, pointer, and epoch for validation at pop time */
         tls->items[tls->count].h = h;
         tls->items[tls->count].p = ptr;
+        tls->items[tls->count].epoch_id = epoch_id;
         tls->count++;
+        tls->tls_refilled_added++;
     }
     
     tls->tls_alloc_refills++;
@@ -240,14 +226,14 @@ void tls_print_stats(void) {
     
     printf("\n=== TLS Cache Statistics ===\n");
     
-    /* Aggregate across all threads and size classes */
+    /* Aggregate across all threads and size classes (alloc only) */
     uint64_t total_alloc_attempts = 0;
     uint64_t total_alloc_bypassed = 0;
     uint64_t total_alloc_hits = 0;
     uint64_t total_alloc_refills = 0;
-    uint64_t total_free_cached = 0;
-    uint64_t total_free_dribbles = 0;
-    uint64_t total_free_bypassed = 0;
+    uint64_t total_popped = 0;
+    uint64_t total_refilled_added = 0;
+    uint64_t total_epoch_rejects = 0;
     
     for (uint32_t t = 0; t < _thread_count; t++) {
         TLSCache* caches = _thread_registry[t].caches;
@@ -259,9 +245,9 @@ void tls_print_stats(void) {
             total_alloc_bypassed += tls->tls_alloc_bypassed;
             total_alloc_hits += tls->tls_alloc_hits;
             total_alloc_refills += tls->tls_alloc_refills;
-            total_free_cached += tls->tls_free_cached;
-            total_free_dribbles += tls->tls_free_dribbles;
-            total_free_bypassed += tls->tls_free_bypassed;
+            total_popped += tls->tls_popped;
+            total_refilled_added += tls->tls_refilled_added;
+            total_epoch_rejects += tls->tls_epoch_rejects;
         }
     }
     
@@ -271,19 +257,18 @@ void tls_print_stats(void) {
     double hit_rate = total_alloc_attempts > 0 
         ? (100.0 * total_alloc_hits) / total_alloc_attempts 
         : 0.0;
-    double bypass_rate_alloc = total_alloc_attempts > 0
+    double bypass_rate = total_alloc_attempts > 0
         ? (100.0 * total_alloc_bypassed) / total_alloc_attempts
-        : 0.0;
-    double bypass_rate_free = (total_free_cached + total_free_bypassed) > 0
-        ? (100.0 * total_free_bypassed) / (total_free_cached + total_free_bypassed)
         : 0.0;
     
     printf("Alloc: attempts=%lu bypassed=%lu (%.1f%%) hits=%lu (%.1f%%) refills=%lu\n",
-           total_alloc_attempts, total_alloc_bypassed, bypass_rate_alloc,
+           total_alloc_attempts, total_alloc_bypassed, bypass_rate,
            total_alloc_hits, hit_rate, total_alloc_refills);
-    printf("Free:  cached=%lu dribbles=%lu bypassed=%lu (%.1f%%)\n",
-           total_free_cached, total_free_dribbles, 
-           total_free_bypassed, bypass_rate_free);
+    printf("Free:  TLS disabled (metadata divergence - see slab_alloc.c:1779)\n");
+    printf("\nOne-shot invariant: popped=%lu added=%lu (delta=%ld)\n",
+           total_popped, total_refilled_added, 
+           (int64_t)total_refilled_added - (int64_t)total_popped);
+    printf("Epoch rejects: %lu (stale cached handles discarded)\n", total_epoch_rejects);
     printf("=============================\n\n");
 }
 

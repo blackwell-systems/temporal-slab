@@ -1776,11 +1776,19 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   if (slab_id == UINT32_MAX || size_class >= (uint32_t)k_num_classes) return false;
 
 #if ENABLE_TLS_CACHE
-  /* TLS fast path: Cache handle in thread-local stack (no atomics, no locks) */
-  if (tls_try_free(a, size_class, h)) {
-    return true;  /* Cached successfully - fastest free path (~5-10ns) */
-  }
-  /* TLS cache full: Fall through to global free (will flush batch first) */
+  /* TLS free caching removed due to metadata divergence problem:
+   * 
+   * If TLS caches frees locally without updating global bitmap/free_count,
+   * the global allocator believes slots are still allocated. This causes:
+   * - Slabs appear artificially full (free_count stays at 0)
+   * - Global selection logic makes wrong decisions
+   * - Zombie partial slabs (free_count=0, but slots available in TLS)
+   * 
+   * Option A: Update global state during TLS free (makes handles "hints" - can be stolen)
+   * Option B: Per-thread slab ownership with explicit reservation (major redesign)
+   * 
+   * Current choice: TLS alloc-only caching. Frees always update global state.
+   * This avoids metadata divergence while preserving alloc fast path benefits. */
 #endif
 
   SizeClassAlloc* sc = &a->classes[size_class];
