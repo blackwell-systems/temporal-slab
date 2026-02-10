@@ -15,8 +15,8 @@
 #include <time.h>
 #include <stdio.h>
 
-/* Get current time in nanoseconds */
-static inline uint64_t now_ns(clockid_t clock_id) {
+/* Get current time in nanoseconds for specific clock */
+static inline uint64_t get_time_ns(clockid_t clock_id) {
     struct timespec ts;
     clock_gettime(clock_id, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
@@ -41,15 +41,15 @@ void slowpath_record_sample(SlabAllocator* a, uint64_t wall_ns, uint64_t cpu_ns,
 
 /* Begin timing a potentially slow operation */
 void slowpath_timing_start(uint64_t* out_wall_start, uint64_t* out_cpu_start) {
-    *out_wall_start = now_ns(CLOCK_MONOTONIC);
-    *out_cpu_start = now_ns(CLOCK_THREAD_CPUTIME_ID);
+    *out_wall_start = get_time_ns(CLOCK_MONOTONIC);
+    *out_cpu_start = get_time_ns(CLOCK_THREAD_CPUTIME_ID);
 }
 
 /* End timing and record sample if above threshold */
 void slowpath_timing_end(SlabAllocator* a, uint64_t wall_start, uint64_t cpu_start,
                         uint32_t size_class, uint32_t reason_flags, uint32_t retries) {
-    uint64_t wall_end = now_ns(CLOCK_MONOTONIC);
-    uint64_t cpu_end = now_ns(CLOCK_THREAD_CPUTIME_ID);
+    uint64_t wall_end = get_time_ns(CLOCK_MONOTONIC);
+    uint64_t cpu_end = get_time_ns(CLOCK_THREAD_CPUTIME_ID);
     
     uint64_t wall_elapsed = wall_end - wall_start;
     

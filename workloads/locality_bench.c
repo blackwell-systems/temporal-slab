@@ -197,6 +197,13 @@ int main(void) {
     printf("TLS cache disabled (ENABLE_TLS_CACHE=0)\n\n");
 #endif
     
+    
+#if ENABLE_SLOWPATH_SAMPLING
+    /* Print slowpath samples for WSL2/VM tail latency diagnosis */
+    extern void slowpath_print_samples(SlabAllocator* a);
+    slowpath_print_samples(alloc);
+#endif
+    
     slab_allocator_free(alloc);
     
     printf("Expected TLS behavior:\n");

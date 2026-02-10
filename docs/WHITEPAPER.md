@@ -674,6 +674,20 @@ void cache_push(SizeClassAlloc* sc, Slab* s) {
 
 **Comparison baseline:** GNU libc malloc (ptmalloc2)
 
+**Methodology:**
+- Each benchmark run 10× to assess variance
+- Outlier rejection: discard highest/lowest, average middle 8 runs
+- Statistical significance: Welch's t-test, p < 0.01 threshold
+- Measurement: CLOCK_MONOTONIC for wall time, rdtsc for cycle-accurate timing
+
+**Threats to validity:**
+- GitHub Actions uses shared infrastructure (virtualization overhead)
+- Single hardware platform (AMD EPYC 7763); results may differ on Intel/ARM
+- Workload characteristics: uniform size (128 bytes), high allocation rate
+- malloc configuration: default glibc tuning, not optimized for benchmark
+
+**Reproducibility:** All benchmarks available in `/benchmark_accurate.c`, runnable via GitHub Actions workflow (`.github/workflows/bench.yml`).
+
 ### 5.2 Latency Results
 
 | Metric | temporal-slab | malloc | Improvement |
@@ -770,6 +784,67 @@ Measured overhead: 180ns for complete cycle
 ```
 
 **Comparison:** This is 2-4× cheaper than C++ constructor/destructor overhead for similar RAII patterns, because domain enter/exit uses atomic operations only (no heap allocation on enter/exit).
+
+### 5.7 Workload Characterization: When temporal-slab Helps (and When It Doesn't)
+
+**Ideal workloads for temporal-slab:**
+
+1. **High allocation rate with phase structure** (>10K allocs/sec with clear boundaries)
+   - Web servers: requests per second
+   - Game engines: frames per second
+   - Databases: queries per second
+   - Metric: Allocation rate >> epoch_close() frequency
+
+2. **Correlated lifetimes within phases** (objects allocated together die together)
+   - Request metadata, session tokens, response buffers (all freed at request end)
+   - Frame-local data: particles, collision results, render commands
+   - Metric: >70% of allocations in a phase die together
+
+3. **Lifetime bimodality** (short-lived and long-lived, not uniform)
+   - Short: requests (10-100ms), queries (1-10ms), frames (16ms)
+   - Long: connections (seconds-hours), sessions (minutes-hours)
+   - Mixing these in same malloc heap causes fragmentation; epochs separate them
+
+**Workloads where temporal-slab provides minimal benefit:**
+
+1. **Long-lived uniform lifetimes** (all objects live for hours)
+   - Startup configuration, static lookup tables, connection pools
+   - Epoch grouping doesn't help if nothing ever gets reclaimed
+   - Recommendation: Use malloc or custom bump allocator
+
+2. **Random uncorrelated lifetimes** (objects die independently)
+   - Caches with random eviction (no temporal correlation)
+   - Objects with user-controlled lifetimes (unpredictable)
+   - Metric: <30% lifetime correlation within phases
+   - Result: Epochs provide no temporal locality, overhead without benefit
+
+3. **Large objects (>768 bytes)** or variable sizes
+   - temporal-slab size classes: 64-768 bytes (fixed granularity)
+   - Larger objects fall back to malloc
+   - Variable-size workloads suffer internal fragmentation (96-byte object in 128-byte slot = 33% waste)
+   - Recommendation: Use jemalloc/tcmalloc for variable-size workloads
+
+4. **Low allocation rate (<1K allocs/sec)**
+   - Epoch domain overhead (180ns) is negligible for high-throughput systems
+   - But for low-rate systems, overhead can dominate
+   - Example: Allocating 10 objects over 10 seconds (1 obj/sec) → 180ns overhead on 100ns allocation = 1.8× cost
+   - Recommendation: Use malloc if allocation rate doesn't justify epoch infrastructure
+
+**Complexity analysis:**
+
+| Operation | Best Case | Worst Case | When Worst Case Occurs |
+|-----------|-----------|------------|------------------------|
+| **alloc (fast path)** | O(1) | O(1) | Lock-free CAS, deterministic |
+| **alloc (slow path)** | O(1) | O(n) | n = slabs in partial list (zombie repair scan) |
+| **free** | O(1) | O(1) | Lock-free bitmap CAS, deterministic |
+| **epoch_close** | O(n) | O(n) | n = total slabs across all size classes in epoch |
+| **epoch_advance** | O(1) | O(1) | 10 atomic stores (8 size classes + 2 state changes) |
+
+**epoch_close() scalability concern:**
+
+If an epoch has 10,000 slabs across 8 size classes, `epoch_close()` scans all 10,000. At ~50ns per slab check (memory load + comparison), this is 500µs. For systems with millions of allocations per epoch, `epoch_close()` can take milliseconds.
+
+**Mitigation:** Applications should size epochs appropriately. A web server handling 1M requests/second should not put all requests in one epoch—use per-request domains or rotate epochs every 1,000 requests.
 
 ---
 
