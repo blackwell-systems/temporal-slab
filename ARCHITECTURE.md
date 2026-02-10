@@ -30,9 +30,11 @@ This document describes the allocator's design and its role as a foundation for 
 
 temporal-slab is a **lifetime-aware memory allocator** for fixed-size objects. It provides:
 
-- Lock-free allocation fast path (76ns p99, 166ns p99.9)
+- Lock-free allocation fast path (120ns p99, 340ns p999 - GitHub Actions validated)
 - Bounded RSS under sustained churn (0-2.4% growth vs unbounded malloc drift)
-- Provably safe recycling (FULL-only, no TOCTTOU races)
+- Passive epoch reclamation (no quiescence requirements, async state observation)
+- Conservative deferred recycling (zero overhead in alloc/free paths)
+- Structural observability (phase-level metrics emerge from design)
 - Dual APIs (handle-based and malloc-style)
 - Epoch-scoped RSS reclamation (madvise + epoch_close)
 - Epoch domains (RAII-style scoped lifetimes)
@@ -61,7 +63,7 @@ temporal-slab is well-suited for:
 - **Cache metadata** - Bounded RSS under continuous eviction
 - **Real-time systems** - Packet buffers, message queues (predictable tail latency)
 
-These workloads benefit from bounded RSS (0-2.4% growth) and predictable latency (39-69× better tail latency than malloc) under sustained churn.
+These workloads benefit from bounded RSS (0-2.4% growth) and predictable latency (12-13× better tail latency than malloc, GitHub Actions validated) under sustained churn.
 
 ## Core Allocator Design
 
@@ -89,10 +91,11 @@ SlabAllocator (8 size classes: 64-768 bytes)
 **Key invariants:**
 
 1. **Slabs never unmapped during runtime** - Enables safe stale handle validation, no use-after-free from munmap races
-2. **FULL-only recycling** - Only slabs that were previously full are recycled (provably safe, no TOCTTOU)
+2. **Conservative deferred recycling** - Empty slabs recycled only during epoch_close() (scans both partial and full lists)
 3. **Off-page metadata** - (slab*, slab_id) stored in CachedSlab/CachedNode (survives madvise)
 4. **Generation-checked handles** - 24-bit generation counter prevents ABA (16M reuse budget)
 5. **Bounded RSS** - Cache (32 slabs/class) + overflow (linked list) = known maximum per class
+6. **Passive epoch transitions** - State changes use only atomic stores (no coordination, no quiescence)
 
 ### State Machine
 
@@ -128,7 +131,7 @@ Epoch states:
   [ACTIVE] ← Epoch ID reused (ring wraps at 16)
 ```
 
-**Critical safety property:** Only slabs in FULL state are recycled. PARTIAL slabs are never recycled, eliminating TOCTTOU races where threads hold stale `current_partial` pointers.
+**Critical safety property:** Recycling is deferred to epoch_close() rather than happening in free_obj(). During epoch_close(), empty slabs are collected from both partial and full lists, then recycled in bulk. This eliminates recycling overhead from the allocation/free hot path while maintaining deterministic reclamation timing.
 
 ### Handle Encoding
 
@@ -344,6 +347,78 @@ slab_stats_epoch(alloc, 2, 5, &es);  // Class 2, epoch 5
 
 **See also:** `docs/stats_dump_reference.md` (879 lines, stable contract for external tooling)
 
+### Semantic Attribution (Phase 2.3)
+
+**Label registry for per-phase contention tracking:**
+
+```c
+// Assign human-readable label to epoch
+slab_epoch_set_label(alloc, epoch, "/api/users");
+
+// Per-label contention automatically tracked (when ENABLE_LABEL_CONTENTION=1)
+// Hot path: O(1) label_id lookup, cache-line-friendly attribution arrays
+```
+
+**Architecture:**
+- 16 label slots (bounded cardinality)
+- Compact label_id (0-15) for hot-path indexing
+- Per-label counters: lock_contended, CAS retries (bitmap alloc/free)
+- 128-byte attribution array per size class (single cache line)
+
+**Why this matters:**
+- Identifies which application phases cause allocator contention
+- Zero overhead when disabled (compile-time flag)
+- ~5ns overhead when enabled (TLS label_id lookup + atomic increment)
+- Answers: "Does /api/users cause more bitmap contention than /api/orders?"
+
+### Zombie Partial Repair (Robustness)
+
+**Defense-in-depth against free_count/bitmap divergence:**
+
+```c
+// In alloc_obj_epoch slow path
+while (s = es->partial.head) {
+    if (s->free_count >= 2) break;  // Definitely usable
+    
+    // For free_count == 0 or 1, verify against bitmap
+    if (bitmap_is_full(s)) {
+        atomic_thread_fence(memory_order_acquire);  // Sync with concurrent updates
+        if (bitmap_is_full(s)) {  // Double-check after fence
+            // Zombie detected: move PARTIAL → FULL
+            repair_zombie_partial(s);
+            s = es->partial.head;  // Try next slab
+        }
+    }
+}
+```
+
+**Root cause:** Race condition in concurrent alloc/free could cause free_count to diverge from bitmap state (fixed in lines 1470-1526). Repair mechanism remains as defense-in-depth.
+
+**Impact:** Prevents infinite CAS retry loops if divergence occurs.
+
+### Slowpath Sampling (p9999 Diagnosis)
+
+**Tail latency outlier diagnosis for virtualized environments:**
+
+```c
+// Enable: make CFLAGS="-DENABLE_SLOWPATH_SAMPLING=1 -DSLOWPATH_THRESHOLD_NS=5000"
+
+typedef struct {
+    uint64_t wall_ns;       // Wall-clock time
+    uint64_t cpu_ns;        // Thread CPU time
+    uint32_t reason_flags;  // LOCK_WAIT | NEW_SLAB | ZOMBIE_REPAIR | ...
+} SlowpathSample;
+```
+
+**Distinguishes allocator work from VM scheduling noise:**
+- Sample 1: wall=45µs, cpu=42µs → Real contention (CPU-bound)
+- Sample 2: wall=15ms, cpu=80µs → VM preemption (wall >> cpu)
+
+**Storage:** Lock-free ring buffer (10,000 samples, overwriting oldest)  
+**Overhead:** ~50-100ns per sample, only when allocation exceeds threshold
+
+**Use case:** Debugging CI/CD p99999 spikes from WSL2/virtualization scheduling delays.
+
 ### Layer 3: Eviction Policy (Future Repos)
 
 ```c
@@ -414,10 +489,11 @@ epoch_domain_destroy(request);
 ## Current Implementation Status
 
 **Phase 1: Core allocator** - Production-ready
-- Lock-free fast path (76ns p99, 166ns p99.9)
+- Lock-free fast path (120ns p99, 340ns p999 - GitHub Actions validated)
 - 8 size classes (64-768 bytes)
 - Handle-based and malloc-style APIs
-- Conservative recycling (FULL-only)
+- Passive epoch reclamation (no quiescence requirements)
+- Conservative deferred recycling (zero hot-path overhead)
 
 **Phase 2: RSS reclamation** - Production-ready
 - madvise(MADV_DONTNEED) on empty slabs
