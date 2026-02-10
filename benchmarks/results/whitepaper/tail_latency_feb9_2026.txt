@@ -1,0 +1,39 @@
+Tail Latency Results (GitHub Actions, 100K obj × 1K cycles, 128-byte objects, 5 trials, Feb 9 2026)
+
+Percentile    temporal-slab    system_malloc    Advantage
+p50           40ns             31ns             1.29× slower (trade-off)
+p99           131ns            1,463ns          11.2× better
+p999          371ns            4,418ns          11.9× better
+p9999         3,246ns          7,935ns          2.4× better
+
+RSS & Efficiency:
+
+Metric                                              temporal-slab    system_malloc
+Steady-state RSS growth (constant working set)      0%               0%
+Phase-boundary RSS growth (with epoch_close())      0%               N/A (no epoch API)
+Mixed-workload RSS growth (no epoch boundaries)     1,033%           1,111% (1.08× worse)
+Baseline RSS overhead                               +37%             -
+Space efficiency                                    88.9%            ~85%
+
+Note: Phase-boundary test validates epoch_close() enables perfect slab reuse across epochs 
+(0% growth, 0% variation). Mixed-workload test measures single-phase behavior without epoch 
+boundaries—both allocators grow with expanding working sets.
+
+Risk exchange: +9ns median cost (+29%), +37% baseline RSS to eliminate 1-4µs tail spikes. 
+This is not a performance trade-off—it's tail-risk elimination. A single malloc p99 outlier 
+(1,463ns) costs 36× more than temporal-slab's median allocation (40ns). For latency-sensitive 
+systems, this exchange is decisive.
+
+Test Configuration:
+- Platform: GitHub Actions (ubuntu-latest)
+- CPU: AMD EPYC 7763 (virtualized)
+- Kernel: Linux 6.6.87.2-microsoft-standard-WSL2
+- Compiler: GCC (GitHub Actions default)
+- Date: February 9, 2026
+- Trials: 5 independent runs
+- Objects: 100,000 per cycle
+- Cycles: 1,000
+- Size: 128 bytes (representative workload)
+
+Reproducibility:
+See docs/results.md for detailed methodology and interpretation guidelines.
