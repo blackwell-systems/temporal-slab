@@ -558,4 +558,11 @@ struct SlabAllocator {
   SlabRegistry reg;
 };
 
+/* Internal helper functions needed by TLS cache (exposed for slab_tls_cache.c) */
+#if ENABLE_TLS_CACHE
+void handle_unpack(SlabHandle h, uint32_t* slab_id, uint32_t* gen, uint32_t* slot, uint32_t* cls);
+Slab* reg_lookup_validate(SlabRegistry* r, uint32_t id, uint32_t gen24);
+void* slab_slot_ptr(Slab* s, uint32_t slot_index);
+#endif
+
 #endif /* SLAB_ALLOC_INTERNAL_H */

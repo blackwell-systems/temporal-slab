@@ -1335,14 +1335,37 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
   
   SizeClassAlloc* sc = &a->classes[(size_t)ci];
   
-  /* Check if epoch is accepting allocations.
+  /* Check if epoch is accepting allocations FIRST (before TLS).
+   * CRITICAL: TLS refill must not bypass epoch-closed check, otherwise caches
+   * will hold handles from CLOSING epochs that should be flushed.
    * ACTIVE (0) = accepting, CLOSING (1) = draining.
-   * This is best-effort; may race with epoch_advance(), but that's acceptable. */
-  uint32_t state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_relaxed);
+   * 
+   * Use memory_order_acquire to synchronize with epoch_close()'s release store.
+   * This ensures we observe CLOSING before epoch_close() flushes TLS caches. */
+  uint32_t state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_acquire);
   if (state != EPOCH_ACTIVE) {
     atomic_fetch_add_explicit(&sc->slow_path_epoch_closed, 1, memory_order_relaxed);
     return NULL;
   }
+  
+#if ENABLE_TLS_CACHE
+  /* Skip TLS during refill to prevent infinite recursion.
+   * When tls_refill() calls alloc_obj_epoch(), we must bypass TLS entirely. */
+  extern __thread bool _tls_in_refill;
+  
+  if (!_tls_in_refill) {
+    /* TLS fast path: Check thread-local handle cache first (no atomics, no locks) */
+    void* ptr = tls_try_alloc(a, (uint32_t)ci, epoch, out);
+    if (ptr) return ptr;  /* TLS cache hit - fastest path (~10-15ns) */
+    
+    /* TLS miss: Refill from global allocator, then retry */
+    tls_refill(a, (uint32_t)ci, epoch);
+    ptr = tls_try_alloc(a, (uint32_t)ci, epoch, out);
+    if (ptr) return ptr;  /* Refill succeeded */
+    
+    /* Fall through to global allocator if refill failed (out of memory) */
+  }
+#endif
   
   EpochState* es = get_epoch_state(sc, epoch);  /* Array lookup: &sc->epochs[epoch] */
 
@@ -1745,6 +1768,14 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   /* Bounds check catches handles with invalid version bits or corrupted fields */
   if (slab_id == UINT32_MAX || size_class >= (uint32_t)k_num_classes) return false;
 
+#if ENABLE_TLS_CACHE
+  /* TLS fast path: Cache handle in thread-local stack (no atomics, no locks) */
+  if (tls_try_free(a, size_class, h)) {
+    return true;  /* Cached successfully - fastest free path (~5-10ns) */
+  }
+  /* TLS cache full: Fall through to global free (will flush batch first) */
+#endif
+
   SizeClassAlloc* sc = &a->classes[size_class];
   
   /* Validate through registry: checks generation counter for ABA safety.
@@ -2116,9 +2147,21 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
    * - free_obj() checks epoch state and recycles empty slabs immediately
    * - alloc_obj_epoch() checks epoch state and rejects allocations
    *
-   * Best-effort visibility: threads may briefly allocate before observing state.
-   * This is acceptable—allocation will eventually fail as slabs drain. */
-  atomic_store_explicit(&a->epoch_state[epoch], EPOCH_CLOSING, memory_order_relaxed);
+   * CRITICAL: Use memory_order_release to ensure all threads observe CLOSING
+   * before we flush their TLS caches. With relaxed ordering, threads could
+   * refill caches from this epoch even after flush completes (race condition). */
+  atomic_store_explicit(&a->epoch_state[epoch], EPOCH_CLOSING, memory_order_release);
+  
+#if ENABLE_TLS_CACHE
+  /* TLS Cache: Flush all handles from this epoch across all threads.
+   * 
+   * CRITICAL: Must happen BEFORE slab reclamation scanning to ensure accurate
+   * free_count and empty slab detection. If TLS caches hold handles from this
+   * epoch, those handles represent allocated slots that haven't been freed yet.
+   * 
+   * Thread registry lock ensures no threads modify their TLS caches during flush. */
+  tls_flush_epoch_all_threads(a, epoch);
+#endif
   
   /* Phase 2: Proactively scan for already-empty slabs and recycle them.
    *
