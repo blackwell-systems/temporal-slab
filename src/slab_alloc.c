@@ -51,11 +51,10 @@
 #define RELEASE_LOCK_RANK() ((void)0)
 #endif
 
-/* Lock rank debugging - TLS storage */
+/* Lock rank debugging - TLS storage (stack-based for nested locks) */
 #if ENABLE_LOCK_RANK_DEBUG
-__thread int _lock_rank_highest = 0;
-__thread const char* _lock_rank_highest_name = NULL;
-__thread const char* _lock_rank_highest_location = NULL;
+_Thread_local LockRankEntry _lock_rank_stack[LOCK_RANK_STACK_MAX];
+_Thread_local int _lock_rank_depth = 0;
 #endif
 
 /* Phase 2.3: Hot-path label ID lookup for contention attribution */
@@ -182,7 +181,7 @@ static inline uint32_t mix32(uint64_t x) {
   return (uint32_t)x;
 }
 
-static __thread uint32_t tls_scan_offset = UINT32_MAX;
+static _Thread_local uint32_t tls_scan_offset = UINT32_MAX;
 
 static inline uint32_t get_tls_scan_offset(uint32_t words) {
   if (tls_scan_offset == UINT32_MAX) {
@@ -930,6 +929,7 @@ void allocator_init(SlabAllocator* a) {
     a->classes[i].cache_overflow_head = NULL;
     a->classes[i].cache_overflow_tail = NULL;
     a->classes[i].cache_overflow_len = 0;
+    
   }
 }
 
@@ -950,23 +950,26 @@ void allocator_init(SlabAllocator* a) {
  * - We store slab_id alongside the pointer (off-page) so it survives
  * - This enables generation bumping and registry updates on reuse
  */
-static Slab* cache_pop(SizeClassAlloc* sc, uint32_t* out_slab_id) {
+static Slab* cache_pop(SizeClassAlloc* sc, uint32_t* out_slab_id, bool* out_was_published) {
   LOCK_WITHOUT_PROBE(&sc->cache_lock, LOCK_RANK_CACHE, "sc->cache_lock");
   Slab* s = NULL;
   uint32_t id = UINT32_MAX;
+  bool was_pub = false;
   
   if (sc->cache_size > 0) {
     /* Pop from array cache (fast path).
-     * CachedSlab stores both pointer and ID off-page. */
+     * CachedSlab stores pointer, ID, and was_published off-page. */
     CachedSlab* entry = &sc->slab_cache[--sc->cache_size];
     s = entry->slab;
     id = entry->slab_id;  /* Survived madvise because stored off-page */
+    was_pub = entry->was_published;  /* Also survives madvise */
   } else if (sc->cache_overflow_head) {
     /* Array cache empty, try overflow list (slower, but avoids mmap).
      * CachedNode is a heap-allocated doubly-linked list node. */
     CachedNode* node = sc->cache_overflow_head;
     s = node->slab;
     id = node->slab_id;  /* Survived madvise because stored in node */
+    was_pub = node->was_published;  /* Also survives madvise */
     
     /* Unlink from head of list */
     sc->cache_overflow_head = node->next;
@@ -984,6 +987,7 @@ static Slab* cache_pop(SizeClassAlloc* sc, uint32_t* out_slab_id) {
   UNLOCK_WITH_RANK(&sc->cache_lock);
   
   if (out_slab_id) *out_slab_id = id;
+  if (out_was_published) *out_was_published = was_pub;
   return s;  /* NULL if both cache and overflow are empty */
 }
 
@@ -1008,21 +1012,61 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
    * and allow concurrent allocation/free races. */
   assert_slab_unlinked(s);
   
-  LOCK_WITHOUT_PROBE(&sc->cache_lock, LOCK_RANK_CACHE, "sc->cache_lock");
-  
-  /* Mark slab as no longer on any active list */
+  /* Mark slab as no longer on any active list.
+   * Must happen before madvise because header fields will be zeroed. */
   s->list_id = SLAB_LIST_NONE;
   s->prev = NULL;  /* Defensive: ensure no dangling pointers */
   s->next = NULL;
   
+  /* Snapshot slab_id and was_published from header NOW, before madvise.
+   * After madvise zeros the header, these fields become unreadable.
+   * We must store them off-page in the cache entry. */
+  uint32_t id_snapshot = s->slab_id;
+  bool was_pub_snapshot = s->was_published;
+  
+  /* RSS reclamation: madvise BEFORE making slab reachable via cache.
+   *
+   * CRITICAL ORDERING FIX:
+   * Old code did: lock → insert into cache → unlock → madvise
+   * Race: Another thread could pop, reinitialize, and publish the slab
+   * BEFORE the original thread completes madvise, causing catastrophic
+   * header corruption (free_count=UINT32_MAX, object_count=0).
+   *
+   * New code: madvise → lock → insert into cache → unlock
+   * This eliminates the reuse-before-madvise race entirely.
+   *
+   * Only madvise slabs that were NEVER published to current_partial
+   * (was_published==false). Published slabs may have in-flight lock-free
+   * pointers even after retirement, so they must never be madvised.
+   *
+   * Trade-off: Published slabs keep RSS, but never-published slabs reclaim pages.
+   * Gated by ENABLE_RSS_RECLAMATION compile flag.
+   */
+  #if ENABLE_RSS_RECLAMATION && defined(__linux__)
+  if (!was_pub_snapshot) {
+    atomic_fetch_add_explicit(&sc->madvise_calls, 1, memory_order_relaxed);
+    int ret = madvise(s, SLAB_PAGE_SIZE, MADV_DONTNEED);
+    if (ret == 0) {
+      atomic_fetch_add_explicit(&sc->madvise_bytes, SLAB_PAGE_SIZE, memory_order_relaxed);
+    } else {
+      atomic_fetch_add_explicit(&sc->madvise_failures, 1, memory_order_relaxed);
+    }
+  }
+  #endif
+  
+  /* Now insert into cache. After this point, another thread can pop this slab.
+   * If we madvised above, the header is already zeroed and we rely on the
+   * off-page snapshots (id_snapshot, was_pub_snapshot) for metadata. */
+  LOCK_WITHOUT_PROBE(&sc->cache_lock, LOCK_RANK_CACHE, "sc->cache_lock");
+  
   if (sc->cache_size < sc->cache_capacity) {
     /* Fast path: array cache has space (common case, 32 entries).
-     * Store both slab pointer and slab_id. ID stored off-page survives
-     * madvise zeroing the header. */
+     * Store slab pointer and snapshots (not header fields, which may be zero). */
     sc->slab_cache[sc->cache_size].slab = s;
-    sc->slab_cache[sc->cache_size].slab_id = s->slab_id;
+    sc->slab_cache[sc->cache_size].slab_id = id_snapshot;
+    sc->slab_cache[sc->cache_size].was_published = was_pub_snapshot;
     sc->cache_size++;
-    s->cache_state = SLAB_CACHED;
+    s->cache_state = SLAB_CACHED;  /* Safe: cache_state not in madvised region */
     atomic_fetch_add_explicit(&sc->empty_slab_recycled, 1, memory_order_relaxed);
   } else {
     /* Slow path: array cache full, push to overflow list.
@@ -1036,11 +1080,10 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
       return;
     }
     
-    /* Store slab pointer and ID in heap node.
-     * CRITICAL: Must store slab_id here (off-page) before madvise.
-     * After madvise, s->slab_id will be zeroed, making it unrecoverable. */
+    /* Store slab pointer and snapshots in heap node (not header fields). */
     node->slab = s;
-    node->slab_id = s->slab_id;  /* Read from header now, before it gets zeroed */
+    node->slab_id = id_snapshot;
+    node->was_published = was_pub_snapshot;
     node->prev = sc->cache_overflow_tail;
     node->next = NULL;
     
@@ -1053,34 +1096,11 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
     sc->cache_overflow_tail = node;
     sc->cache_overflow_len++;
     
-    s->cache_state = SLAB_OVERFLOWED;
+    s->cache_state = SLAB_OVERFLOWED;  /* Safe: cache_state not in madvised region */
     atomic_fetch_add_explicit(&sc->empty_slab_overflowed, 1, memory_order_relaxed);
   }
   
   UNLOCK_WITH_RANK(&sc->cache_lock);
-  
-  /* RSS reclamation: madvise AFTER lock release for predictable latency.
-   *
-   * MADV_DONTNEED tells kernel to reclaim physical pages backing this slab.
-   * Effects:
-   * - Physical pages returned to OS (RSS drops immediately)
-   * - Virtual mapping stays intact (safe for handle validation)
-   * - Page contents zeroed (header destroyed, but ID stored off-page)
-   * - Next access causes page fault and zero-fill
-   *
-   * Trade-off: ~5µs zero-fill latency on cache hit vs immediate RSS drop.
-   * Gated by ENABLE_RSS_RECLAMATION compile flag (default: disabled).
-   */
-  #if ENABLE_RSS_RECLAMATION && defined(__linux__)
-  atomic_fetch_add_explicit(&sc->madvise_calls, 1, memory_order_relaxed);
-  int ret = madvise(s, SLAB_PAGE_SIZE, MADV_DONTNEED);
-  if (ret == 0) {
-    atomic_fetch_add_explicit(&sc->madvise_bytes, SLAB_PAGE_SIZE, memory_order_relaxed);
-  } else {
-    atomic_fetch_add_explicit(&sc->madvise_failures, 1, memory_order_relaxed);
-  }
-  /* Non-fatal: If madvise fails, RSS stays high but allocation still works */
-  #endif
 }
 
 /* ------------------------------ Slab allocation ------------------------------ */
@@ -1104,9 +1124,10 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
   uint32_t obj_size = sc->object_size;
 
   /* Try cache first. Avoids mmap syscall if we have recycled slabs available.
-   * cache_pop() returns both slab pointer and slab_id (stored off-page). */
+   * cache_pop() returns slab pointer, slab_id, and was_published (stored off-page). */
   uint32_t cached_id = UINT32_MAX;
-  Slab* s = cache_pop(sc, &cached_id);
+  bool cached_was_published = false;
+  Slab* s = cache_pop(sc, &cached_id, &cached_was_published);
   
   if (s) {
     /* Cache hit! Bump generation to invalidate old handles.
@@ -1134,6 +1155,7 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
     s->cache_state = SLAB_ACTIVE;
     s->epoch_id = epoch_id;
     s->era = atomic_load_explicit(&a->epoch_era[epoch_id], memory_order_acquire);
+    s->was_published = cached_was_published;   /* Restore from off-page cache (survived madvise) */
     s->slab_id = cached_id;  /* Restore ID from cache (survived madvise) */
     atomic_store_explicit(&s->free_count, expected_count, memory_order_relaxed);
     
@@ -1212,6 +1234,7 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
   s->cache_state = SLAB_ACTIVE; /* In use (not cached) */
   s->epoch_id = epoch_id;       /* Temporal grouping: objects from this epoch */
   s->era = a->epoch_era[epoch_id];  /* Monotonic timestamp for observability */
+  s->was_published = false;     /* Fresh slab not yet reachable lock-free */
   s->slab_id = id;              /* Registry ID for handle encoding */
 
   /* Initialize allocation bitmap to all zeros (all slots free) */
@@ -1382,6 +1405,9 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
           /* Publish next slab from partial list (NULL if list is empty).
            * This lets other threads continue on fast path without hitting slow path. */
           Slab* next = es->partial.head;
+          if (next) {
+            next->was_published = true;
+          }
           atomic_store_explicit(&es->current_partial, next, memory_order_release);
         }
         UNLOCK_WITH_RANK(&sc->lock);
@@ -1463,6 +1489,9 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
         
         /* Publish next partial if available */
         Slab* next = es->partial.head;
+        if (next) {
+          next->was_published = true;
+        }
         atomic_store_explicit(&es->current_partial, next, memory_order_release);
       }
     }
@@ -1602,6 +1631,8 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     /* Publish selected slab for lock-free fast path.
      * Release ordering ensures slab initialization is visible before publication. */
     assert(s->list_id == SLAB_LIST_PARTIAL);
+    /* IMPORTANT: mark published before exposing via current_partial */
+    s->was_published = true;
     atomic_store_explicit(&es->current_partial, s, memory_order_release);
 
     UNLOCK_WITH_RANK(&sc->lock);
@@ -1695,6 +1726,9 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
           
           /* Publish next partial if available */
           Slab* next = es->partial.head;
+          if (next) {
+            next->was_published = true;
+          }
           atomic_store_explicit(&es->current_partial, next, memory_order_release);
         }
       }
@@ -1780,19 +1814,23 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
 
   /* Check if slab just became fully empty (all slots free).
    * 
-   * Option C fix: ALWAYS reclaim empty slabs immediately, regardless of epoch state.
-   * This eliminates the "immortal epoch prevents reclamation" pathology.
+   * Protocol C: Zombie-proof empty slab retirement.
+   * This implements the ACTIVE→RETIRED→CACHED state machine:
+   * 1. Unlink from all lists (ACTIVE → RETIRED)
+   * 2. Depublish from current_partial under lock (single-writer invariant)
+   * 3. Mark unreachable (list_id = NONE)
+   * 4. Release lock (linearization point: slab is now unreachable)
+   * 5. Recycle (may madvise/zero header - safe because unreachable)
    * 
-   * Safe because:
-   * - Each slab is independently mmap'd (one mmap per 4KB page)
-   * - madvise(MADV_DONTNEED) zeros pages but preserves mapping
-   * - Re-use is safe (just causes zero-fill fault on next access)
-   * - cache_push() handles madvise and updates RSS reclamation counters
+   * This eliminates zombie states:
+   * - No "unlisted but still published" (Invariant 1 violation)
+   * - No "madvised while reachable" (physical zombie)
+   * - No "full slab stuck on partial" (logical zombie)
    */
   if (new_fc == s->object_count) {
-    LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");  /* Need mutex to mutate lists */
+    LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");
     
-    /* Remove from whichever list it's on (FULL or PARTIAL) */
+    /* Step 1: Unlink from whichever list it's on */
     if (s->list_id == SLAB_LIST_FULL) {
       list_remove(&es->full, s);
     } else if (s->list_id == SLAB_LIST_PARTIAL) {
@@ -1801,54 +1839,34 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
       atomic_fetch_sub_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
     }
     
-    /* Ensure slab is not published to current_partial before recycling.
-     * 
-     * CRITICAL: We MUST successfully unpublish the slab before calling cache_push(),
-     * because cache_push() calls madvise(MADV_DONTNEED) which zeros the slab header.
-     * If the slab is still published in current_partial, other threads could see
-     * the zeroed header (object_count=0) and corrupt the allocator state.
-     * 
-     * Retry logic: If CAS fails (another thread changed current_partial), we cannot
-     * safely recycle this slab yet. The slab stays on the PARTIAL list as an empty
-     * slab, and will be reclaimed later (either by epoch_close() or by another free). */
-    atomic_fetch_add_explicit(&sc->current_partial_cas_attempts, 1, memory_order_relaxed);
-    Slab* expected = s;
-    bool swapped = atomic_compare_exchange_strong_explicit(
-        &es->current_partial, &expected, NULL,
-        memory_order_release, memory_order_relaxed);
-    
-    if (!swapped) {
-      /* CAS failed: another thread changed current_partial (possibly to NULL or a different slab).
-       * We CANNOT call cache_push() because we're not sure if other threads can still
-       * find this slab via current_partial. Leave it on the PARTIAL list for now.
-       * 
-       * This is safe: the slab is empty but valid. Future allocations will skip it
-       * (free_count==object_count check fails), and it will be reclaimed at epoch_close(). */
-      atomic_fetch_add_explicit(&sc->current_partial_cas_failures, 1, memory_order_relaxed);
-      UNLOCK_WITH_RANK(&sc->lock);
-      return true;  /* Free succeeded, slab remains on list */
+    /* Step 2: Depublish from current_partial with STORE under lock (no CAS).
+     * Under lock, we are the single writer, so plain store-if-equal is correct.
+     * This is the key fix: no CAS means no "failed → bailout" path that leaves
+     * slab unlisted but potentially still published. */
+    if (atomic_load_explicit(&es->current_partial, memory_order_relaxed) == s) {
+      atomic_store_explicit(&es->current_partial, NULL, memory_order_release);
     }
     
-    /* CAS succeeded: slab is now unpublished from current_partial.
-     * Safe to recycle: no thread can find this slab via lock-free path anymore.
-     * 
-     * Recycle slab to cache immediately. This triggers madvise(MADV_DONTNEED),
-     * returning physical pages to OS and dropping RSS.
-     * 
-     * Trade-off: Slight latency cost on slab reuse (~5µs zero-fill overhead).
-     * Benefit: RSS drops continuously instead of only at epoch_close() boundaries.
-     */
-    if (s->list_id != SLAB_LIST_NONE) {
-      s->list_id = SLAB_LIST_NONE;
-      sc->total_slabs--;
-      UNLOCK_WITH_RANK(&sc->lock);
-      
-      /* Push to cache. cache_push() calls madvise(), updates madvise_* counters. */
-      cache_push(sc, s);
-      return true;
-    }
+    /* Step 3: Mark unreachable + defensive unlink pointers */
+    s->list_id = SLAB_LIST_NONE;
+    s->prev = NULL;
+    s->next = NULL;
+    
+    /* Step 4: Accounting (do it once, here) */
+    sc->total_slabs--;
+    
+    /* Linearization point: slab is now unreachable from:
+     * - es->partial list (removed)
+     * - es->full list (removed)
+     * - es->current_partial (depublished)
+     * No allocation path can select this slab anymore. */
     
     UNLOCK_WITH_RANK(&sc->lock);
+    
+    /* Step 5: Recycle immediately to cache.
+     * cache_push() will madvise only if was_published==false (never reachable lock-free).
+     * If it *was* published, we still cache it but must not madvise. */
+    cache_push(sc, s);
     return true;
   }
 
@@ -1869,6 +1887,8 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
        * This helps other threads avoid the slow path. If CAS fails, another
        * thread already published a different slab—that's fine. */
       assert(s->list_id == SLAB_LIST_PARTIAL);
+      /* Mark as published even if CAS fails (monotonic safety flag). */
+      s->was_published = true;
       atomic_fetch_add_explicit(&sc->current_partial_cas_attempts, 1, memory_order_relaxed);
       Slab* expected = NULL;
       bool swapped = atomic_compare_exchange_strong_explicit(
@@ -2258,9 +2278,8 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
       
       UNLOCK_WITH_RANK(&sc->lock);
       
-      /* Pass 3: Recycle all collected slabs OUTSIDE lock.
-       * cache_push() will call madvise() if RSS reclamation is enabled.
-       * This is where RSS actually drops—physical pages returned to kernel. */
+      /* Pass 3: Recycle all collected slabs immediately.
+       * cache_push() will skip madvise if slab was ever published lock-free. */
       for (size_t j = 0; j < idx; j++) {
         cache_push(sc, empty_slabs[j]);
       }

@@ -9,6 +9,14 @@
 #include <slab_alloc.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#if ENABLE_LOCK_RANK_DEBUG
+#include <stdio.h>
+#include <stdlib.h>
+#endif
 
 /* Internal configuration */
 #ifndef SLAB_PAGE_SIZE
@@ -16,6 +24,10 @@
                                 * for fast address arithmetic (ptr & ~(PAGE_SIZE-1)).
                                 * Larger pages (64KB on some ARM) increase RSS granularity. */
 #endif
+
+/* Compile-time assertion that SLAB_PAGE_SIZE is power of 2 */
+_Static_assert((SLAB_PAGE_SIZE & (SLAB_PAGE_SIZE - 1)) == 0, 
+               "SLAB_PAGE_SIZE must be power of 2 for fast address masking");
 
 /* Diagnostic instrumentation (compile-time optional)
  * 
@@ -56,32 +68,52 @@
 #define LOCK_RANK_EPOCH_LABEL    40  /* epoch_label_lock (epoch metadata) */
 #define LOCK_RANK_LABEL_REGISTRY 50  /* label_registry.lock (label mapping) */
 
-/* Per-thread state for rank tracking */
-extern __thread int _lock_rank_highest;
-extern __thread const char* _lock_rank_highest_name;
-extern __thread const char* _lock_rank_highest_location;
+/* Per-thread lock rank stack for nested lock tracking */
+#define LOCK_RANK_STACK_MAX 8
+
+typedef struct {
+  int rank;
+  const char* name;
+  const char* location;
+} LockRankEntry;
+
+extern _Thread_local LockRankEntry _lock_rank_stack[LOCK_RANK_STACK_MAX];
+extern _Thread_local int _lock_rank_depth;
 
 /* Rank checking macro - use before pthread_mutex_lock */
 #define CHECK_LOCK_RANK(rank, name, location) do { \
-  if ((rank) < _lock_rank_highest) { \
+  if (_lock_rank_depth >= LOCK_RANK_STACK_MAX) { \
     fprintf(stderr, \
-            "\n*** LOCK RANK VIOLATION ***\n" \
-            "Trying to acquire: %s (rank %d) at %s\n" \
-            "Already holding: %s (rank %d) at %s\n" \
-            "This is a lock order inversion that causes deadlock!\n\n", \
-            (name), (rank), (location), \
-            _lock_rank_highest_name, _lock_rank_highest, _lock_rank_highest_location); \
+            "\n*** LOCK RANK STACK OVERFLOW ***\n" \
+            "Depth %d exceeds max %d at %s\n", \
+            _lock_rank_depth, LOCK_RANK_STACK_MAX, (location)); \
     abort(); \
   } \
-  _lock_rank_highest = (rank); \
-  _lock_rank_highest_name = (name); \
-  _lock_rank_highest_location = (location); \
+  if (_lock_rank_depth > 0) { \
+    int top_rank = _lock_rank_stack[_lock_rank_depth - 1].rank; \
+    if ((rank) <= top_rank) { \
+      fprintf(stderr, \
+              "\n*** LOCK RANK VIOLATION ***\n" \
+              "Trying to acquire: %s (rank %d) at %s\n" \
+              "Already holding: %s (rank %d) at %s\n" \
+              "This is a lock order inversion that causes deadlock!\n\n", \
+              (name), (rank), (location), \
+              _lock_rank_stack[_lock_rank_depth - 1].name, \
+              top_rank, \
+              _lock_rank_stack[_lock_rank_depth - 1].location); \
+      abort(); \
+    } \
+  } \
+  _lock_rank_stack[_lock_rank_depth].rank = (rank); \
+  _lock_rank_stack[_lock_rank_depth].name = (name); \
+  _lock_rank_stack[_lock_rank_depth].location = (location); \
+  _lock_rank_depth++; \
 } while (0)
 
 #define RELEASE_LOCK_RANK() do { \
-  _lock_rank_highest = 0; \
-  _lock_rank_highest_name = NULL; \
-  _lock_rank_highest_location = NULL; \
+  if (_lock_rank_depth > 0) { \
+    _lock_rank_depth--; \
+  } \
 } while (0)
 
 #else
@@ -170,6 +202,11 @@ struct Slab {
    * Useful for correlating allocator state with application logs. */
   uint64_t era;
   
+  /* Track if slab was ever published via current_partial.
+   * If true, skip madvise (threads may have loaded pointer).
+   * If false, safe to madvise (never accessible lock-free). */
+  bool was_published;
+  
   /* Registry ID for portable handle encoding.
    * Handles store this ID instead of raw pointers, enabling validation
    * and ABA protection via generation counters. */
@@ -214,6 +251,7 @@ struct SlabRegistry {
 struct CachedSlab {
   Slab* slab;        /* Virtual address (still mapped after madvise) */
   uint32_t slab_id;  /* Registry ID, survives madvise */
+  bool was_published; /* Track if ever exposed lock-free, survives madvise */
 };
 
 /* Overflow cache node for when array cache fills up.
@@ -226,6 +264,7 @@ typedef struct CachedNode {
   struct CachedNode* next;
   Slab* slab;        /* Virtual address */
   uint32_t slab_id;  /* Registry ID, survives madvise */
+  bool was_published; /* Track if ever exposed lock-free, survives madvise */
 } CachedNode;
 
 /* Intrusive doubly-linked list */
@@ -395,6 +434,8 @@ struct SizeClassAlloc {
   CachedNode* cache_overflow_head;
   CachedNode* cache_overflow_tail;
   size_t cache_overflow_len;      /* Number of nodes in overflow list */
+  
+  /* (Protocol Z retired list removed - using was_published flag instead) */
 };
 
 /* Epoch metadata for debugging and observability.
