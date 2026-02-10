@@ -32,6 +32,32 @@
 #define SLAB_PAGE_SIZE 4096u
 #endif
 
+/* Macro stringification helper for lock timeout diagnostics */
+#define STRINGIFY_HELPER(x) #x
+#define STRINGIFY(x) STRINGIFY_HELPER(x)
+
+/* Lock rank constants (needed for timeout diagnostics even when rank checking is disabled) */
+#ifndef LOCK_RANK_REGISTRY
+#define LOCK_RANK_REGISTRY       10
+#define LOCK_RANK_CACHE          20
+#define LOCK_RANK_SIZE_CLASS     30
+#define LOCK_RANK_EPOCH_LABEL    40
+#define LOCK_RANK_LABEL_REGISTRY 50
+#endif
+
+/* Stub macros for lock rank checking (no-op when ENABLE_LOCK_RANK_DEBUG is off) */
+#ifndef CHECK_LOCK_RANK
+#define CHECK_LOCK_RANK(rank, name, location) ((void)0)
+#define RELEASE_LOCK_RANK() ((void)0)
+#endif
+
+/* Lock rank debugging - TLS storage */
+#if ENABLE_LOCK_RANK_DEBUG
+__thread int _lock_rank_highest = 0;
+__thread const char* _lock_rank_highest_name = NULL;
+__thread const char* _lock_rank_highest_location = NULL;
+#endif
+
 /* Phase 2.3: Hot-path label ID lookup for contention attribution */
 #ifdef ENABLE_LABEL_CONTENTION
 static inline uint8_t current_label_id(SlabAllocator* alloc) {
@@ -51,7 +77,8 @@ static inline uint8_t current_label_id(SlabAllocator* alloc) {
  * Cost: ~2ns best case (trylock succeeds), +5ns if ENABLE_LABEL_CONTENTION.
  */
 #ifdef ENABLE_LABEL_CONTENTION
-#define LOCK_WITH_PROBE(mutex, sc) do { \
+#define LOCK_WITH_PROBE(mutex, sc, rank, name) do { \
+  CHECK_LOCK_RANK(rank, name, __FILE__ ":" #rank); \
   if (pthread_mutex_trylock(mutex) == 0) { \
     atomic_fetch_add_explicit(&(sc)->lock_fast_acquire, 1, memory_order_relaxed); \
     uint8_t lid = current_label_id((sc)->parent_alloc); \
@@ -64,15 +91,48 @@ static inline uint8_t current_label_id(SlabAllocator* alloc) {
   } \
 } while (0)
 #else
-#define LOCK_WITH_PROBE(mutex, sc) do { \
+#define LOCK_WITH_PROBE(mutex, sc, rank, name) do { \
+  CHECK_LOCK_RANK(rank, name, __FILE__ ":" #rank); \
   if (pthread_mutex_trylock(mutex) == 0) { \
     atomic_fetch_add_explicit(&(sc)->lock_fast_acquire, 1, memory_order_relaxed); \
   } else { \
     atomic_fetch_add_explicit(&(sc)->lock_contended, 1, memory_order_relaxed); \
-    pthread_mutex_lock(mutex); \
+    struct timespec timeout; \
+    clock_gettime(CLOCK_REALTIME, &timeout); \
+    timeout.tv_sec += 5; /* 5 second timeout */ \
+    int ret = pthread_mutex_timedlock(mutex, &timeout); \
+    if (ret == ETIMEDOUT) { \
+      fprintf(stderr, "\n*** LOCK TIMEOUT ***\n"); \
+      fprintf(stderr, "Thread %lu stuck waiting for lock: %s (rank %d)\n", \
+              (unsigned long)pthread_self(), (name), (rank)); \
+      fprintf(stderr, "Location: %s\n", __FILE__ ":" STRINGIFY(__LINE__)); \
+      fflush(stderr); \
+      abort(); \
+    } \
   } \
 } while (0)
 #endif
+
+#define LOCK_WITHOUT_PROBE(mutex, rank, name) do { \
+  CHECK_LOCK_RANK(rank, name, __FILE__ ":" #rank); \
+  struct timespec timeout; \
+  clock_gettime(CLOCK_REALTIME, &timeout); \
+  timeout.tv_sec += 5; /* 5 second timeout */ \
+  int ret = pthread_mutex_timedlock(mutex, &timeout); \
+  if (ret == ETIMEDOUT) { \
+    fprintf(stderr, "\n*** LOCK TIMEOUT ***\n"); \
+    fprintf(stderr, "Thread %lu stuck waiting for lock: %s (rank %d)\n", \
+            (unsigned long)pthread_self(), (name), (rank)); \
+    fprintf(stderr, "Location: %s\n", __FILE__ ":" STRINGIFY(__LINE__)); \
+    fflush(stderr); \
+    abort(); \
+  } \
+} while (0)
+
+#define UNLOCK_WITH_RANK(mutex) do { \
+  pthread_mutex_unlock(mutex); \
+  RELEASE_LOCK_RANK(); \
+} while (0)
 
 _Static_assert((SLAB_PAGE_SIZE & (SLAB_PAGE_SIZE - 1)) == 0, "SLAB_PAGE_SIZE must be power of two");
 
@@ -299,7 +359,7 @@ static void reg_destroy(SlabRegistry* r) {
  * Concurrency: Protected by registry lock (cold path, allocation only).
  */
 static uint32_t reg_alloc_id(SlabRegistry* r) {
-  pthread_mutex_lock(&r->lock);
+  LOCK_WITHOUT_PROBE(&r->lock, LOCK_RANK_REGISTRY, "registry.lock");
   
   uint32_t id;
   if (r->free_count > 0) {
@@ -321,7 +381,7 @@ static uint32_t reg_alloc_id(SlabRegistry* r) {
     /* Allocate new metadata array */
     SlabMeta* nm = (SlabMeta*)calloc(new_cap, sizeof(SlabMeta));
     if (!nm) {
-      pthread_mutex_unlock(&r->lock);
+      UNLOCK_WITH_RANK(&r->lock);
       return UINT32_MAX;  /* Out of memory */
     }
     
@@ -336,7 +396,7 @@ static uint32_t reg_alloc_id(SlabRegistry* r) {
     /* Grow free_ids array to match (preserve existing free list) */
     uint32_t* nf = (uint32_t*)calloc(new_cap, sizeof(uint32_t));
     if (!nf) {
-      pthread_mutex_unlock(&r->lock);
+      UNLOCK_WITH_RANK(&r->lock);
       return UINT32_MAX;
     }
     for (size_t i = 0; i < r->free_count; i++) {
@@ -352,7 +412,7 @@ static uint32_t reg_alloc_id(SlabRegistry* r) {
   atomic_store_explicit(&r->metas[id].gen, 1u, memory_order_relaxed);
   atomic_store_explicit(&r->metas[id].ptr, NULL, memory_order_relaxed);
   
-  pthread_mutex_unlock(&r->lock);
+  UNLOCK_WITH_RANK(&r->lock);
   return id;
 }
 
@@ -558,6 +618,22 @@ static void unmap_one_page(void* p) {
   If out_prev_fc is non-NULL, stores previous free_count (for transition detection).
   If out_retries is non-NULL, stores CAS retry count (for contention tracking).
 */
+/* Helper: compute the "full" bitmask for a given word in the allocation bitmap.
+ * 
+ * For all words except possibly the last, a full word is 0xFFFFFFFF (all 32 bits set).
+ * For the last word, only (object_count % 32) bits are valid; higher bits are unused.
+ * 
+ * CRITICAL: Handles edge case where object_count % 32 == 0 (all 32 bits valid).
+ * Without this, (1u << 32) would be undefined behavior, and (1u << 0) - 1 == 0
+ * would incorrectly treat an empty word (0x00000000) as "full".
+ */
+static inline uint32_t full_mask_for_word(uint32_t obj_count, uint32_t w, uint32_t words) {
+  if (w != words - 1u) return 0xFFFFFFFFu;  /* Not last word: all 32 bits valid */
+  uint32_t rem = obj_count & 31u;            /* obj_count % 32 */
+  if (rem == 0u) return 0xFFFFFFFFu;         /* Last word uses all 32 bits */
+  return (1u << rem) - 1u;                   /* Last word uses only 'rem' bits */
+}
+
 /* Lock-free bitmap allocation: find and mark first free slot.
  *
  * Returns slot index on success, UINT32_MAX if slab is full.
@@ -575,6 +651,7 @@ static uint32_t slab_alloc_slot_atomic(Slab* s, SizeClassAlloc* sc, uint32_t* ou
   _Atomic uint32_t* bm = slab_bitmap_ptr(s);
   const uint32_t words = slab_bitmap_words(s->object_count);  /* Bitmap size in 32-bit words */
   uint32_t retries = 0;
+  const uint32_t SPIN_TRIPWIRE = 10000000;  /* 10 million retries = infinite loop */
 
   /* Adaptive scanning: load current mode (sequential vs randomized).
    * Mode switches automatically based on CAS retry rate (0.30 threshold).
@@ -629,6 +706,21 @@ static uint32_t slab_alloc_slot_atomic(Slab* s, SizeClassAlloc* sc, uint32_t* ou
       
       /* CAS failed, another thread modified the bitmap. Retry with updated x. */
       retries++;
+      
+      /* SPIN TRIPWIRE: Detect infinite CAS retry loop (bitmap corruption) */
+      if (retries > SPIN_TRIPWIRE) {
+        fprintf(stderr, "\n*** SPIN TRIPWIRE: slab_alloc_slot_atomic infinite loop ***\n");
+        fprintf(stderr, "Thread %lu stuck after %u retries\n", 
+                (unsigned long)pthread_self(), retries);
+        fprintf(stderr, "Slab: %p, word: %u/%u, object_count: %u\n",
+                (void*)s, w, words, s->object_count);
+        fprintf(stderr, "Current bitmap[%u]: 0x%08x, free_mask: 0x%08x\n",
+                w, x, free_mask);
+        fprintf(stderr, "Slab ID: %u, free_count: %u\n",
+                s->slab_id, atomic_load_explicit(&s->free_count, memory_order_relaxed));
+        fflush(stderr);
+        abort();
+      }
     }
   }
 
@@ -652,6 +744,7 @@ static bool slab_free_slot_atomic(Slab* s, uint32_t idx, uint32_t* out_prev_fc, 
   uint32_t bit = idx % 32u;   /* Which bit within that word */
   uint32_t mask = 1u << bit;  /* Bitmask with only that bit set */
   uint32_t retries = 0;
+  const uint32_t SPIN_TRIPWIRE = 10000000;  /* 10 million retries = infinite loop */
 
   while (1) {  /* Retry loop in case of CAS failure */
     uint32_t x = atomic_load_explicit(&bm[w], memory_order_relaxed);
@@ -679,6 +772,21 @@ static bool slab_free_slot_atomic(Slab* s, uint32_t idx, uint32_t* out_prev_fc, 
     
     /* CAS failed, another thread modified the bitmap. Retry with updated x. */
     retries++;
+    
+    /* SPIN TRIPWIRE: Detect infinite CAS retry loop (bitmap corruption) */
+    if (retries > SPIN_TRIPWIRE) {
+      fprintf(stderr, "\n*** SPIN TRIPWIRE: slab_free_slot_atomic infinite loop ***\n");
+      fprintf(stderr, "Thread %lu stuck after %u retries\n",
+              (unsigned long)pthread_self(), retries);
+      fprintf(stderr, "Slab: %p, word: %u, bit: %u, idx: %u, object_count: %u\n",
+              (void*)s, w, bit, idx, s->object_count);
+      fprintf(stderr, "Current bitmap[%u]: 0x%08x, mask: 0x%08x\n",
+              w, x, mask);
+      fprintf(stderr, "Slab ID: %u, free_count: %u\n",
+              s->slab_id, atomic_load_explicit(&s->free_count, memory_order_relaxed));
+      fflush(stderr);
+      abort();
+    }
   }
 }
 
@@ -843,7 +951,7 @@ void allocator_init(SlabAllocator* a) {
  * - This enables generation bumping and registry updates on reuse
  */
 static Slab* cache_pop(SizeClassAlloc* sc, uint32_t* out_slab_id) {
-  pthread_mutex_lock(&sc->cache_lock);
+  LOCK_WITHOUT_PROBE(&sc->cache_lock, LOCK_RANK_CACHE, "sc->cache_lock");
   Slab* s = NULL;
   uint32_t id = UINT32_MAX;
   
@@ -873,7 +981,7 @@ static Slab* cache_pop(SizeClassAlloc* sc, uint32_t* out_slab_id) {
     free(node);
   }
   
-  pthread_mutex_unlock(&sc->cache_lock);
+  UNLOCK_WITH_RANK(&sc->cache_lock);
   
   if (out_slab_id) *out_slab_id = id;
   return s;  /* NULL if both cache and overflow are empty */
@@ -900,7 +1008,7 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
    * and allow concurrent allocation/free races. */
   assert_slab_unlinked(s);
   
-  pthread_mutex_lock(&sc->cache_lock);
+  LOCK_WITHOUT_PROBE(&sc->cache_lock, LOCK_RANK_CACHE, "sc->cache_lock");
   
   /* Mark slab as no longer on any active list */
   s->list_id = SLAB_LIST_NONE;
@@ -924,7 +1032,7 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
     if (!node) {
       /* Out of memory for overflow node. Skip caching.
        * Slab stays mapped but unusable until allocator shutdown. */
-      pthread_mutex_unlock(&sc->cache_lock);
+      UNLOCK_WITH_RANK(&sc->cache_lock);
       return;
     }
     
@@ -949,7 +1057,7 @@ static void cache_push(SizeClassAlloc* sc, Slab* s) {
     atomic_fetch_add_explicit(&sc->empty_slab_overflowed, 1, memory_order_relaxed);
   }
   
-  pthread_mutex_unlock(&sc->cache_lock);
+  UNLOCK_WITH_RANK(&sc->cache_lock);
   
   /* RSS reclamation: madvise AFTER lock release for predictable latency.
    *
@@ -1012,6 +1120,11 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
      * ensures clean state (prevents stale list pointers, corrupted counts). */
     uint32_t expected_count = slab_object_count(obj_size);
     
+    /* CRITICAL: Handle slot field is only 8 bits (bits [17:10] in handle encoding).
+     * If object_count > 255, handle encoding silently truncates slot index,
+     * causing free_obj() to free wrong slot and corrupt bitmap. */
+    assert(expected_count <= 255 && "handle slot field is 8-bit; object_count must be <=255");
+    
     s->prev = NULL;
     s->next = NULL;
     atomic_store_explicit(&s->magic, SLAB_MAGIC, memory_order_relaxed);
@@ -1063,6 +1176,12 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
    * Formula accounts for: slab header + bitmap + alignment → usable space → object count.
    * Example: 4096B page, 128B objects → 64B header + 4B bitmap → ~3968B usable → 31 objects */
   uint32_t count = slab_object_count(obj_size);
+  
+  /* CRITICAL: Handle slot field is only 8 bits (bits [17:10] in handle encoding).
+   * If object_count > 255, handle encoding silently truncates slot index,
+   * causing free_obj() to free wrong slot and corrupt bitmap. */
+  assert(count <= 255 && "handle slot field is 8-bit; object_count must be <=255");
+  
   if (count == 0) {
     /* Pathological case: object too large to fit even one slot after header.
      * Should never happen with our size classes (64-768 bytes). */
@@ -1251,7 +1370,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
        * prev_fc==1 means there was one free slot before our allocation, now zero.
        * Must move slab from PARTIAL to FULL list and select a new current_partial. */
       if (prev_fc == 1) {
-        LOCK_WITH_PROBE(&sc->lock, sc);  /* Need mutex to mutate lists */
+        LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");  /* Need mutex to mutate lists */
         
         /* Re-check list_id under lock (may have been moved by another thread) */
         if (cur->list_id == SLAB_LIST_PARTIAL) {
@@ -1265,7 +1384,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
           Slab* next = es->partial.head;
           atomic_store_explicit(&es->current_partial, next, memory_order_release);
         }
-        pthread_mutex_unlock(&sc->lock);
+        UNLOCK_WITH_RANK(&sc->lock);
       }
       
       /* Convert slot index to actual memory address.
@@ -1289,7 +1408,11 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     
     /* Fast path failed: slab was full between load and allocation attempt.
      * This is a race—another thread exhausted the slab first.
-     * Null out current_partial so next thread goes to slow path. */
+     * Null out current_partial so next thread goes to slow path.
+     * 
+     * ROBUSTNESS FIX: Also move slab to FULL list if bitmap is truly full.
+     * This prevents "zombie partial" syndrome where free_count divergence
+     * causes prev_fc==1 transition to never fire, leaving full slab on PARTIAL forever. */
     atomic_fetch_add_explicit(&sc->current_partial_full, 1, memory_order_relaxed);
     
     atomic_fetch_add_explicit(&sc->current_partial_cas_attempts, 1, memory_order_relaxed);
@@ -1301,6 +1424,49 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       /* Another thread already nulled it—fine, contention is expected */
       atomic_fetch_add_explicit(&sc->current_partial_cas_failures, 1, memory_order_relaxed);
     }
+    
+    /* Additional robustness: If slab is still on PARTIAL list and bitmap is full,
+     * move it to FULL list now. This ensures we don't depend on prev_fc==1 being
+     * correct forever (handles free_count divergence gracefully). */
+    LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");
+    if (cur->list_id == SLAB_LIST_PARTIAL) {
+      /* Verify bitmap is truly full (with double-check to avoid transient views) */
+      _Atomic uint32_t* bm = slab_bitmap_ptr(cur);
+      uint32_t words = slab_bitmap_words(cur->object_count);
+      bool bitmap_full = true;
+      
+      for (uint32_t i = 0; i < words; i++) {
+        uint32_t x = atomic_load_explicit(&bm[i], memory_order_relaxed);
+        if (x != full_mask_for_word(cur->object_count, i, words)) {
+          bitmap_full = false;
+          break;
+        }
+      }
+      
+      if (bitmap_full) {
+        atomic_thread_fence(memory_order_acquire);
+        for (uint32_t i = 0; i < words; i++) {
+          uint32_t x = atomic_load_explicit(&bm[i], memory_order_relaxed);
+          if (x != full_mask_for_word(cur->object_count, i, words)) {
+            bitmap_full = false;
+            break;
+          }
+        }
+      }
+      
+      if (bitmap_full) {
+        /* Bitmap stably full: move PARTIAL → FULL */
+        list_remove(&es->partial, cur);
+        cur->list_id = SLAB_LIST_FULL;
+        list_push_back(&es->full, cur);
+        atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
+        
+        /* Publish next partial if available */
+        Slab* next = es->partial.head;
+        atomic_store_explicit(&es->current_partial, next, memory_order_release);
+      }
+    }
+    UNLOCK_WITH_RANK(&sc->lock);
   } else if (!cur) {
     /* current_partial was NULL—no slab selected yet, or previous was exhausted.
      * Will proceed to slow path to select a new slab. */
@@ -1311,6 +1477,9 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
    * 
    * Loop structure handles rare race: if slab fills between publish and our
    * allocation attempt, retry instead of failing. */
+  const uint32_t SLOW_PATH_TRIPWIRE = 1000;  /* 1000 retries = something is deeply wrong */
+  uint32_t slow_path_attempts = 0;
+  
   for (;;) {
     /* Re-check epoch state (might have closed while we waited for lock) */
     state = atomic_load_explicit(&a->epoch_state[epoch], memory_order_relaxed);
@@ -1319,20 +1488,115 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     }
     
     atomic_fetch_add_explicit(&sc->slow_path_hits, 1, memory_order_relaxed);
-    LOCK_WITH_PROBE(&sc->lock, sc);  /* Take mutex, track contention */
+    slow_path_attempts++;
+    
+    /* SPIN TRIPWIRE: Detect infinite slow-path retry loop */
+    if (slow_path_attempts > SLOW_PATH_TRIPWIRE) {
+      fprintf(stderr, "\n*** SPIN TRIPWIRE: alloc_obj_epoch slow-path infinite loop ***\n");
+      fprintf(stderr, "Thread %lu stuck after %u slow-path attempts\n",
+              (unsigned long)pthread_self(), slow_path_attempts);
+      fprintf(stderr, "Size class: %d, epoch: %u, state: %u\n",
+              ci, epoch, state);
+      fprintf(stderr, "Partial list length: %u, current_partial: %p\n",
+              es->partial.len, (void*)atomic_load_explicit(&es->current_partial, memory_order_relaxed));
+      fflush(stderr);
+      abort();
+    }
+    
+    /* Try to allocate a new slab if needed (cache or mmap).
+     * CRITICAL: Must call new_slab() BEFORE acquiring sc->lock to avoid
+     * lock rank violation. new_slab() calls cache_pop() which acquires
+     * cache_lock (rank 20), and we need sc->lock (rank 30) after.
+     * Rank ordering requires: cache_lock → sc->lock, never reversed. */
+    Slab* new_s = NULL;
+    
+    LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");  /* Take mutex, track contention */
 
-    /* Try to get a slab from the partial list for this epoch.
-     * If list is empty, allocate a new slab (may hit cache or call mmap). */
+    /* Try to get a slab from the partial list for this epoch. */
     Slab* s = es->partial.head;
+    
+    /* ZOMBIE PARTIAL REPAIR: If head slab is actually full, move it to FULL list
+     * Check both free_count and bitmap to catch divergence cases */
+    while (s) {
+      uint32_t fc = atomic_load_explicit(&s->free_count, memory_order_relaxed);
+      
+      /* Quick check: if free_count >= 2, slab is definitely not full */
+      if (fc >= 2) break;
+      
+      /* If free_count == 0 or == 1, verify against bitmap to catch divergence.
+       * 
+       * CRITICAL: Use full_mask_for_word() to avoid UB when object_count % 32 == 0.
+       * Double-check with memory fence to reduce false positives from transient views. */
+      _Atomic uint32_t* bm = slab_bitmap_ptr(s);
+      uint32_t words = slab_bitmap_words(s->object_count);
+      bool bitmap_full = true;
+      
+      for (uint32_t i = 0; i < words; i++) {
+        uint32_t x = atomic_load_explicit(&bm[i], memory_order_relaxed);
+        uint32_t expected_full = full_mask_for_word(s->object_count, i, words);
+        if (x != expected_full) {
+          bitmap_full = false;
+          break;
+        }
+      }
+      
+      /* Double-check with acquire fence to synchronize with concurrent bitmap updates */
+      if (bitmap_full) {
+        atomic_thread_fence(memory_order_acquire);
+        bitmap_full = true;  /* Reset and re-scan */
+        for (uint32_t i = 0; i < words; i++) {
+          uint32_t x = atomic_load_explicit(&bm[i], memory_order_relaxed);
+          uint32_t expected_full = full_mask_for_word(s->object_count, i, words);
+          if (x != expected_full) {
+            bitmap_full = false;
+            break;
+          }
+        }
+      }
+      
+      if (!bitmap_full) break;  /* Slab has free slots, use it */
+      
+      /* Bitmap is stably full - move to FULL list.
+       * DO NOT mutate free_count here: if there's divergence, the bug is in
+       * allocation/free paths. Forcing free_count=0 under contention makes it worse. */
+      fprintf(stderr, "\n*** REPAIRING zombie partial slab %p (free_count=%u, bitmap full) ***\n", 
+              (void*)s, fc);
+      fflush(stderr);
+      
+      list_remove(&es->partial, s);
+      s->list_id = SLAB_LIST_FULL;
+      list_push_back(&es->full, s);
+      atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
+      
+      s = es->partial.head;  /* Try next partial slab */
+    }
     if (!s) {
-      s = new_slab(a, sc, epoch);  /* Cache hit or mmap + setup */
-      if (!s) {
-        pthread_mutex_unlock(&sc->lock);
+      /* No partial slab available. Release lock, allocate new slab, reacquire lock.
+       * This avoids holding sc->lock while calling new_slab() → cache_pop() → cache_lock.
+       * Small race window: another thread might add a slab to partial list while
+       * we're unlocked, but that's fine—we'll just have one extra slab. */
+      UNLOCK_WITH_RANK(&sc->lock);
+      
+      new_s = new_slab(a, sc, epoch);  /* Cache hit or mmap + setup */
+      if (!new_s) {
         return NULL;  /* Out of memory */
       }
-      s->list_id = SLAB_LIST_PARTIAL;
-      list_push_back(&es->partial, s);
-      sc->total_slabs++;  /* Lifetime slab counter */
+      
+      LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");  /* Reacquire */
+      
+      /* Check again if partial list is still empty (another thread might have added one) */
+      s = es->partial.head;
+      if (!s) {
+        /* Still empty, use our newly allocated slab */
+        s = new_s;
+        s->list_id = SLAB_LIST_PARTIAL;
+        list_push_back(&es->partial, s);
+        sc->total_slabs++;  /* Lifetime slab counter */
+        new_s = NULL;  /* Ownership transferred to list */
+      } else {
+        /* Race: another thread added a slab while we were unlocked.
+         * Use their slab, and we'll cache our new_s after releasing the lock. */
+      }
     }
 
     /* Publish selected slab for lock-free fast path.
@@ -1340,7 +1604,13 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     assert(s->list_id == SLAB_LIST_PARTIAL);
     atomic_store_explicit(&es->current_partial, s, memory_order_release);
 
-    pthread_mutex_unlock(&sc->lock);
+    UNLOCK_WITH_RANK(&sc->lock);
+    
+    /* If we allocated a slab but didn't need it (race condition), recycle it.
+     * cache_push() will return it to the cache for future use. */
+    if (new_s) {
+      cache_push(sc, new_s);
+    }
 
     /* Allocate from the slab we just published.
      * Should almost always succeed since we just picked/created this slab. */
@@ -1351,6 +1621,36 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     if (idx == UINT32_MAX) {
       /* Race: slab filled between our publish and allocation attempt.
        * Loop back and try again with a different slab. */
+      
+      /* DIAGNOSTIC: Print slab invariants when allocation fails */
+      uint32_t fc = atomic_load_explicit(&s->free_count, memory_order_relaxed);
+      fprintf(stderr, "\n*** SLOW-PATH ALLOC FAILED: slab appears full ***\n");
+      fprintf(stderr, "Thread %lu, attempt %u\n", 
+              (unsigned long)pthread_self(), slow_path_attempts);
+      fprintf(stderr, "Slab: %p, object_count: %u, free_count: %u\n",
+              (void*)s, s->object_count, fc);
+      fprintf(stderr, "List state: list_id=%d, on partial list, len=%u\n",
+              s->list_id, es->partial.len);
+      
+      /* Check if bitmap is truly full (diagnostic output).
+       * Use full_mask_for_word() to avoid UB when object_count % 32 == 0. */
+      _Atomic uint32_t* bm = slab_bitmap_ptr(s);
+      uint32_t words = slab_bitmap_words(s->object_count);
+      uint32_t full_words = 0;
+      for (uint32_t i = 0; i < words; i++) {
+        uint32_t x = atomic_load_explicit(&bm[i], memory_order_relaxed);
+        uint32_t expected_full = full_mask_for_word(s->object_count, i, words);
+        if (x == expected_full) {
+          full_words++;
+        }
+      }
+      fprintf(stderr, "Bitmap: %u/%u words appear full\n", full_words, words);
+      
+      if (full_words == words && fc != 0) {
+        fprintf(stderr, "*** DIVERGENCE: bitmap full but free_count=%u (should be 0) ***\n", fc);
+      }
+      fflush(stderr);
+      
       continue;
     }
     
@@ -1378,20 +1678,27 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       atomic_fetch_sub_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
     }
 
-    /* Check if we caused 1->0 transition */
-    if (prev_fc == 1) {
-      LOCK_WITH_PROBE(&sc->lock, sc);  /* Phase 2.2: Trylock probe (hot path) */
+    /* Check if slab is now full. We check the *actual* final free_count rather than
+     * relying solely on prev_fc==1, to handle cases where free_count diverged from
+     * bitmap state (e.g., due to concurrent operations or stale handle frees). */
+    uint32_t final_fc = atomic_load_explicit(&s->free_count, memory_order_acquire);
+    if (final_fc == 0 || prev_fc == 1) {
+      LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");  /* Phase 2.2: Trylock probe (hot path) */
       if (s->list_id == SLAB_LIST_PARTIAL) {
-        atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
-        list_remove(&es->partial, s);
-        s->list_id = SLAB_LIST_FULL;
-        list_push_back(&es->full, s);
-        
-        /* Publish next partial if available */
-        Slab* next = es->partial.head;
-        atomic_store_explicit(&es->current_partial, next, memory_order_release);
+        /* Double-check free_count under lock to avoid spurious transitions */
+        final_fc = atomic_load_explicit(&s->free_count, memory_order_relaxed);
+        if (final_fc == 0) {
+          atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
+          list_remove(&es->partial, s);
+          s->list_id = SLAB_LIST_FULL;
+          list_push_back(&es->full, s);
+          
+          /* Publish next partial if available */
+          Slab* next = es->partial.head;
+          atomic_store_explicit(&es->current_partial, next, memory_order_release);
+        }
       }
-      pthread_mutex_unlock(&sc->lock);
+      UNLOCK_WITH_RANK(&sc->lock);
     }
 
     void* p = slab_slot_ptr(s, idx);
@@ -1483,7 +1790,7 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
    * - cache_push() handles madvise and updates RSS reclamation counters
    */
   if (new_fc == s->object_count) {
-    LOCK_WITH_PROBE(&sc->lock, sc);  /* Need mutex to mutate lists */
+    LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");  /* Need mutex to mutate lists */
     
     /* Remove from whichever list it's on (FULL or PARTIAL) */
     if (s->list_id == SLAB_LIST_FULL) {
@@ -1494,18 +1801,38 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
       atomic_fetch_sub_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
     }
     
-    /* Ensure slab is not published to current_partial.
-     * Another thread might be loading it right now—nulling is best-effort. */
+    /* Ensure slab is not published to current_partial before recycling.
+     * 
+     * CRITICAL: We MUST successfully unpublish the slab before calling cache_push(),
+     * because cache_push() calls madvise(MADV_DONTNEED) which zeros the slab header.
+     * If the slab is still published in current_partial, other threads could see
+     * the zeroed header (object_count=0) and corrupt the allocator state.
+     * 
+     * Retry logic: If CAS fails (another thread changed current_partial), we cannot
+     * safely recycle this slab yet. The slab stays on the PARTIAL list as an empty
+     * slab, and will be reclaimed later (either by epoch_close() or by another free). */
     atomic_fetch_add_explicit(&sc->current_partial_cas_attempts, 1, memory_order_relaxed);
     Slab* expected = s;
     bool swapped = atomic_compare_exchange_strong_explicit(
         &es->current_partial, &expected, NULL,
         memory_order_release, memory_order_relaxed);
+    
     if (!swapped) {
+      /* CAS failed: another thread changed current_partial (possibly to NULL or a different slab).
+       * We CANNOT call cache_push() because we're not sure if other threads can still
+       * find this slab via current_partial. Leave it on the PARTIAL list for now.
+       * 
+       * This is safe: the slab is empty but valid. Future allocations will skip it
+       * (free_count==object_count check fails), and it will be reclaimed at epoch_close(). */
       atomic_fetch_add_explicit(&sc->current_partial_cas_failures, 1, memory_order_relaxed);
+      UNLOCK_WITH_RANK(&sc->lock);
+      return true;  /* Free succeeded, slab remains on list */
     }
     
-    /* Recycle slab to cache immediately. This triggers madvise(MADV_DONTNEED),
+    /* CAS succeeded: slab is now unpublished from current_partial.
+     * Safe to recycle: no thread can find this slab via lock-free path anymore.
+     * 
+     * Recycle slab to cache immediately. This triggers madvise(MADV_DONTNEED),
      * returning physical pages to OS and dropping RSS.
      * 
      * Trade-off: Slight latency cost on slab reuse (~5µs zero-fill overhead).
@@ -1514,14 +1841,14 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
     if (s->list_id != SLAB_LIST_NONE) {
       s->list_id = SLAB_LIST_NONE;
       sc->total_slabs--;
-      pthread_mutex_unlock(&sc->lock);
+      UNLOCK_WITH_RANK(&sc->lock);
       
       /* Push to cache. cache_push() calls madvise(), updates madvise_* counters. */
       cache_push(sc, s);
       return true;
     }
     
-    pthread_mutex_unlock(&sc->lock);
+    UNLOCK_WITH_RANK(&sc->lock);
     return true;
   }
 
@@ -1529,7 +1856,7 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
    * prev_fc==0 means slab was full before our free, now it has one free slot.
    * Must move slab from FULL to PARTIAL list so it can be allocated from again. */
   if (prev_fc == 0) {
-    LOCK_WITH_PROBE(&sc->lock, sc);  /* Need mutex to mutate lists */
+    LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");  /* Need mutex to mutate lists */
     
     /* Re-check list membership under lock (defensive against races) */
     if (s->list_id == SLAB_LIST_FULL) {
@@ -1551,7 +1878,7 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
         atomic_fetch_add_explicit(&sc->current_partial_cas_failures, 1, memory_order_relaxed);
       }
     }
-    pthread_mutex_unlock(&sc->lock);
+    UNLOCK_WITH_RANK(&sc->lock);
   }
 
   return true;
@@ -1594,7 +1921,7 @@ void allocator_destroy(SlabAllocator* a) {
   for (size_t i = 0; i < k_num_classes; i++) {
     SizeClassAlloc* sc = &a->classes[i];
 
-    pthread_mutex_lock(&sc->lock);
+    LOCK_WITHOUT_PROBE(&sc->lock, LOCK_RANK_SIZE_CLASS, "sc->lock");
 
     /* Destroy all per-epoch state */
     if (sc->epochs) {
@@ -1627,11 +1954,11 @@ void allocator_destroy(SlabAllocator* a) {
     
     sc->total_slabs = 0;
 
-    pthread_mutex_unlock(&sc->lock);
+    UNLOCK_WITH_RANK(&sc->lock);
     pthread_mutex_destroy(&sc->lock);
 
     /* Drain slab cache (now storing CachedSlab entries) */
-    pthread_mutex_lock(&sc->cache_lock);
+    LOCK_WITHOUT_PROBE(&sc->cache_lock, LOCK_RANK_CACHE, "sc->cache_lock");
     for (size_t j = 0; j < sc->cache_size; j++) {
 #if ENABLE_DIAGNOSTIC_COUNTERS
       /* Decrement committed_bytes before munmap for accurate cleanup tracking */
@@ -1655,7 +1982,7 @@ void allocator_destroy(SlabAllocator* a) {
     sc->cache_overflow_tail = NULL;
     sc->cache_overflow_len = 0;
     
-    pthread_mutex_unlock(&sc->cache_lock);
+    UNLOCK_WITH_RANK(&sc->cache_lock);
     pthread_mutex_destroy(&sc->cache_lock);
   }
   
@@ -1854,7 +2181,7 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
      * Pass 3: Recycle outside lock (call cache_push, which does madvise)
      *
      * This minimizes lock hold time—no syscalls inside critical section. */
-    LOCK_WITH_PROBE(&sc->lock, sc);
+    LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");
     
     /* Pass 1: Count empty slabs for array allocation */
     size_t empty_count = 0;
@@ -1895,7 +2222,7 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
         if (!empty_slabs) {
           /* Malloc failed. Skip recycling for this size class.
            * Memory stays allocated but epoch still marked CLOSING. */
-          pthread_mutex_unlock(&sc->lock);
+          UNLOCK_WITH_RANK(&sc->lock);
           return;
         }
       }
@@ -1929,7 +2256,7 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
         cur = next;
       }
       
-      pthread_mutex_unlock(&sc->lock);
+      UNLOCK_WITH_RANK(&sc->lock);
       
       /* Pass 3: Recycle all collected slabs OUTSIDE lock.
        * cache_push() will call madvise() if RSS reclamation is enabled.
@@ -1944,7 +2271,7 @@ void epoch_close(SlabAllocator* a, EpochId epoch) {
       }
     } else {
       /* No empty slabs found, just release lock */
-      pthread_mutex_unlock(&sc->lock);
+      UNLOCK_WITH_RANK(&sc->lock);
     }
   }
   
@@ -1993,7 +2320,7 @@ void slab_epoch_set_label(SlabAllocator* a, EpochId epoch, const char* label) {
   EpochMetadata* meta = &a->epoch_meta[epoch];
   
   /* Phase 2.3: Assign or reuse label ID (bounded cardinality) */
-  pthread_mutex_lock(&a->label_registry.lock);
+  LOCK_WITHOUT_PROBE(&a->label_registry.lock, LOCK_RANK_LABEL_REGISTRY, "label_registry.lock");
   
   uint8_t label_id = 0;  /* Default: unlabeled */
   
@@ -2014,14 +2341,14 @@ void slab_epoch_set_label(SlabAllocator* a, EpochId epoch, const char* label) {
   
   /* If registry full, label_id remains 0 (unlabeled / other bucket) */
   
-  pthread_mutex_unlock(&a->label_registry.lock);
+  UNLOCK_WITH_RANK(&a->label_registry.lock);
   
   /* Update epoch metadata (no lock needed, rarely written) */
-  pthread_mutex_lock(&a->epoch_label_lock);
+  LOCK_WITHOUT_PROBE(&a->epoch_label_lock, LOCK_RANK_EPOCH_LABEL, "epoch_label_lock");
   strncpy(meta->label, label, sizeof(meta->label) - 1);
   meta->label[sizeof(meta->label) - 1] = '\0';  /* Ensure null termination */
   meta->label_id = label_id;  /* Phase 2.3: Store stable ID */
-  pthread_mutex_unlock(&a->epoch_label_lock);
+  UNLOCK_WITH_RANK(&a->epoch_label_lock);
 }
 
 void slab_epoch_inc_refcount(SlabAllocator* a, EpochId epoch) {
