@@ -1536,6 +1536,58 @@ Passive reclamation eliminates coordination overhead:
 
 The cost is deferred reclamation: empty slabs stay allocated until `epoch_close()` is called. But this cost is predictable and application-controlled, unlike GC pauses or background reclamation threads.
 
+**Deterministic Phase-Aligned Reclamation:**
+
+Passive reclamation's real power emerges when combined with **epoch domains**—RAII-style scoped lifetimes that map epochs to application phases:
+
+```c
+// Web server handling a request
+void handle_request(Request* req) {
+    epoch_domain_t* domain = epoch_domain_enter(alloc, "request-handler");
+    // All allocations go to this domain's epoch
+    
+    Response* resp = parse_and_process(req);  // Many allocations
+    send_response(resp);
+    
+    epoch_domain_exit(domain);  // Triggers epoch_close() automatically
+    // RSS drops HERE, deterministically, after request completes
+}
+```
+
+**The determinism comes from three properties:**
+
+1. **Phase boundaries are structural moments in the application** (request ends, frame renders, transaction commits)
+2. **Epoch domains automatically call `epoch_close()` on exit** (no manual cleanup tracking)
+3. **Passive reclamation ensures no coordination overhead** (threads discover CLOSING asynchronously)
+
+This creates **observable, predictable RSS behavior**:
+
+```
+T=0ms:   Request arrives, domain created (epoch 5)
+T=5ms:   Request processing (RSS grows as allocations happen)
+T=50ms:  Response sent, domain exits → epoch_close(5) called
+T=51ms:  RSS drops (empty slabs from epoch 5 recycled)
+         ↑ Deterministic timing: always happens right after response sent
+```
+
+**Contrast with non-deterministic schemes:**
+
+| Approach | When RSS Drops | Predictability |
+|----------|----------------|----------------|
+| **malloc** | Whenever free() returns empty chunk | Depends on fragmentation, allocator heuristics |
+| **GC** | When heap pressure triggers collection | Unpredictable, can happen mid-request |
+| **Background threads** | When reclamation thread wakes up | Periodic, not aligned with phases |
+| **Passive + Domains (temporal-slab)** | When domain exits (phase boundary) | **Deterministic: aligned with application structure** |
+
+**Why this matters for production systems:**
+
+- **Capacity planning:** RSS peaks at phase boundaries, not randomly during processing
+- **Debugging:** Memory issues happen at structural boundaries (easier to reason about)
+- **Performance:** No surprise GC pauses during latency-sensitive operations
+- **Monitoring:** RSS metrics correlate with application-level events (requests, transactions)
+
+The passive reclamation mechanism (no quiescence) enables this determinism—if `epoch_close()` required waiting for grace periods, you couldn't guarantee RSS drops happen immediately after phase boundaries.
+
 **Epoch closing with epoch_close():**
 
 temporal-slab provides `epoch_close(alloc, epoch_id)` for explicit epoch reclamation:
