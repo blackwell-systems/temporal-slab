@@ -27,7 +27,7 @@ epoch_domain_exit(request);
 // Result: deterministic timing, no fragmentation, bounded RSS
 ```
 
-**The key insight:** General-purpose allocators try to **infer** lifetimes from frees, heuristics, or tracing. temporal-slab makes lifetimes **explicit**, **phase-aligned**, and **deterministic**.
+General-purpose allocators try to **infer** lifetimes from frees, heuristics, or tracing. temporal-slab makes lifetimes **explicit**, **phase-aligned**, and **deterministic**.
 
 This gives you:
 - Predictable tail latency (no emergent pathological states)
