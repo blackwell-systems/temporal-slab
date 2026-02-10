@@ -44,6 +44,68 @@ _Static_assert((SLAB_PAGE_SIZE & (SLAB_PAGE_SIZE - 1)) == 0,
 #define ENABLE_DIAGNOSTIC_COUNTERS 0  /* Default: disabled for production */
 #endif
 
+/* Slowpath tail latency sampling (compile-time optional)
+ * 
+ * ENABLE_SLOWPATH_SAMPLING instruments slow allocations to distinguish:
+ *   - Real allocator work (wall_time ≈ cpu_time)
+ *   - WSL2/VM scheduling noise (wall_time >> cpu_time)
+ * 
+ * Records samples above threshold with wall-time, CPU-time, and reason flags.
+ * Useful for diagnosing p9999/p99999 outliers in virtualized environments.
+ * 
+ * Overhead: ~50-100ns per slow sample (rare in normal operation).
+ * 
+ * Usage:
+ *   make CFLAGS="-DENABLE_SLOWPATH_SAMPLING=1 -DSLOWPATH_THRESHOLD_NS=5000"
+ */
+#ifndef ENABLE_SLOWPATH_SAMPLING
+#define ENABLE_SLOWPATH_SAMPLING 0  /* Default: disabled */
+#endif
+
+#ifndef SLOWPATH_THRESHOLD_NS
+#define SLOWPATH_THRESHOLD_NS 5000  /* Sample allocations > 5µs */
+#endif
+
+#define SLOWPATH_MAX_SAMPLES 10000  /* Ring buffer size */
+
+#if ENABLE_SLOWPATH_SAMPLING
+
+/* Slowpath sample reason flags (bitfield) */
+#define SLOWPATH_LOCK_WAIT    (1u << 0)  /* Blocked on sc->lock */
+#define SLOWPATH_NEW_SLAB     (1u << 1)  /* Called new_slab/mmap */
+#define SLOWPATH_ZOMBIE_REPAIR (1u << 2)  /* Zombie slab repair */
+#define SLOWPATH_CACHE_OVERFLOW (1u << 3) /* Cache overflow list */
+#define SLOWPATH_CAS_RETRY    (1u << 4)  /* Excessive bitmap CAS retries */
+
+/* Single slowpath sample */
+typedef struct {
+    uint64_t wall_ns;      /* Wall-clock time (CLOCK_MONOTONIC) */
+    uint64_t cpu_ns;       /* Thread CPU time (CLOCK_THREAD_CPUTIME_ID) */
+    uint32_t size_class;   /* Which size class */
+    uint32_t reason_flags; /* Bitfield of SLOWPATH_* reasons */
+    uint32_t retries;      /* CAS retry count if applicable */
+    uint32_t padding;      /* Align to 32 bytes */
+} SlowpathSample;
+
+/* Global ring buffer for samples (lock-free, overwriting) */
+typedef struct {
+    SlowpathSample samples[SLOWPATH_MAX_SAMPLES];
+    _Atomic uint32_t write_idx;  /* Monotonic write index */
+    uint32_t padding[15];        /* Cache line isolation */
+} SlowpathSampler;
+
+#endif /* ENABLE_SLOWPATH_SAMPLING */
+
+#if ENABLE_SLOWPATH_SAMPLING
+/* Slowpath sampling functions */
+void slowpath_record_sample(SlabAllocator* a, uint64_t wall_ns, uint64_t cpu_ns,
+                            uint32_t size_class, uint32_t reason_flags, uint32_t retries);
+void slowpath_timing_start(uint64_t* out_wall_start, uint64_t* out_cpu_start);
+void slowpath_timing_end(SlabAllocator* a, uint64_t wall_start, uint64_t cpu_start,
+                        uint32_t size_class, uint32_t reason_flags, uint32_t retries);
+void slowpath_print_samples(SlabAllocator* a);
+#endif
+
 /* Thread-local handle cache (compile-time optional)
  * 
  * ENABLE_TLS_CACHE adds per-thread handle caches to eliminate atomic operations
@@ -589,6 +651,11 @@ struct SlabAllocator {
   /* Slab registry maps slab_id to (Slab*, generation) pairs.
    * Enables portable handle encoding and ABA protection for safe recycling. */
   SlabRegistry reg;
+  
+#if ENABLE_SLOWPATH_SAMPLING
+  /* Slowpath sampling for tail latency diagnosis (WSL2/VM detection) */
+  SlowpathSampler slowpath_sampler;
+#endif
 };
 
 /* Internal helper functions needed by TLS cache (exposed for slab_tls_cache.c) */
