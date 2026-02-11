@@ -1120,13 +1120,13 @@ The allocator automatically switches to randomized scanning when retry rate exce
 |------------------|---------------|--------|----------------|
 | **Steady-state (constant working set)** | 0% growth | 0% growth | Both allocators stable when size fixed |
 | **Phase-boundary (with epoch_close())** | **0% growth** | N/A | epoch_close() enables perfect slab reuse |
-| **Mixed (no epoch boundaries)** | 1,033% growth | 1,111% growth | Without epochs, similar fragmentation |
+| **Mixed (no epoch boundaries)** | 1,027% growth | 1,109% growth | Without epochs, similar fragmentation |
 
 **Key findings:**
 
 1. **With epoch boundaries:** temporal-slab achieves 0% RSS growth across 1,000 cycles. Memory is deterministically reclaimed at phase boundaries via `epoch_close()`, enabling perfect slab reuse across epochs.
 
-2. **Without epoch boundaries:** temporal-slab exhibits 1,033% growth (similar to malloc's 1,111%). This demonstrates that **epoch structure is the key innovation**. Without explicit phase boundaries, temporal-slab behaves like a standard allocator.
+2. **Without epoch boundaries:** temporal-slab exhibits 1,027% growth (similar to malloc's 1,109%). This demonstrates that **epoch structure is the key innovation**. Without explicit phase boundaries, temporal-slab behaves like a standard allocator.
 
 3. **Baseline overhead:** temporal-slab has +37% higher baseline RSS (metadata, slab headers, bitmap). This is the cost of deterministic reclamation infrastructure.
 
