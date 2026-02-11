@@ -367,6 +367,13 @@ struct Slab {
    * Handles store this ID instead of raw pointers, enabling validation
    * and ABA protection via generation counters. */
   uint32_t slab_id;
+  
+  /* Lock-free empty queue for continuous recycling (Phase 2.2).
+   * When a slab becomes empty, it's pushed to es->empty_queue_head
+   * for harvest during slowpath allocation. This decouples recycling
+   * (making slabs reusable) from reclamation (madvise + RSS drops). */
+  _Atomic uint32_t empty_queued;     /* 0=not queued, 1=queued for harvest */
+  _Atomic(Slab*) empty_next;         /* Stack link for empty queue */
 };
 
 /* Slab registry metadata stored off-page.
@@ -450,6 +457,11 @@ typedef struct EpochState {
    * Enables O(1) query of reclaimable memory without scanning the list.
    * Incremented when a slab becomes empty, decremented when it gets its first allocation. */
   _Atomic uint32_t empty_partial_count;
+  
+  /* Lock-free empty slab queue for continuous recycling (Phase 2.2).
+   * MPSC stack: multiple free threads push, single alloc thread harvests.
+   * Harvested during slowpath allocation (under sc->lock) and pushed to cache. */
+  _Atomic(Slab*) empty_queue_head;   /* Top of stack */
 } EpochState;
 
 /* Label registry for semantic attribution in observability.

@@ -879,6 +879,9 @@ void allocator_init(SlabAllocator* a) {
       list_init(&a->classes[i].epochs[e].full);
       atomic_store_explicit(&a->classes[i].epochs[e].current_partial, NULL, memory_order_relaxed);
       atomic_store_explicit(&a->classes[i].epochs[e].empty_partial_count, 0, memory_order_relaxed);
+      
+      /* Phase 2.2: Initialize empty queue for continuous recycling */
+      atomic_store_explicit(&a->classes[i].epochs[e].empty_queue_head, NULL, memory_order_relaxed);
     }
 
     /* Initialize performance counters */
@@ -1160,6 +1163,10 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
     s->slab_id = cached_id;  /* Restore ID from cache (survived madvise) */
     atomic_store_explicit(&s->free_count, expected_count, memory_order_relaxed);
     
+    /* Initialize empty queue fields (Phase 2.2 continuous recycling) */
+    atomic_store_explicit(&s->empty_queued, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->empty_next, NULL, memory_order_relaxed);
+    
     /* Clear allocation bitmap.
      * Each bit represents one slot: 0=free, 1=allocated.
      * Start with all zeros (all slots free). */
@@ -1237,6 +1244,10 @@ static Slab* new_slab(SlabAllocator* a, SizeClassAlloc* sc, uint32_t epoch_id) {
   s->era = a->epoch_era[epoch_id];  /* Monotonic timestamp for observability */
   s->was_published = false;     /* Fresh slab not yet reachable lock-free */
   s->slab_id = id;              /* Registry ID for handle encoding */
+  
+  /* Initialize empty queue fields (Phase 2.2 continuous recycling) */
+  atomic_store_explicit(&s->empty_queued, 0, memory_order_relaxed);
+  atomic_store_explicit(&s->empty_next, NULL, memory_order_relaxed);
 
   /* Initialize allocation bitmap to all zeros (all slots free) */
   _Atomic uint32_t* bm = slab_bitmap_ptr(s);
@@ -1606,6 +1617,69 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     
     LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");  /* Take mutex, track contention */
 
+    /* NEW (Phase 2.2): Harvest empty queue for continuous recycling.
+     * 
+     * Drain the lock-free empty queue and recycle confirmed-empty slabs.
+     * This happens on slowpath (already holding sc->lock), so no additional
+     * lock overhead. Empty slabs become globally reusable without waiting
+     * for epoch_close().
+     * 
+     * Why this works:
+     * - Empty signal is one-way (free_count can only increase on reuse)
+     * - Harvest under sc->lock ensures safe unlink from lists
+     * - current_partial clear prevents lock-free access to recycled slab
+     * - cache_push() makes slab available to ALL threads (cross-thread recycling)
+     */
+    Slab* empty_head = atomic_exchange_explicit(&es->empty_queue_head, NULL, memory_order_acquire);
+    if (empty_head) {
+      Slab* e = empty_head;
+      while (e) {
+        Slab* next = atomic_load_explicit(&e->empty_next, memory_order_relaxed);
+        
+        /* Verify slab is still empty (free_count could have changed if reused) */
+        uint32_t fc = atomic_load_explicit(&e->free_count, memory_order_acquire);
+        if (fc == e->object_count) {
+          /* Still empty! Safe to recycle. Unlink from wherever it is. */
+          if (e->list_id == SLAB_LIST_PARTIAL) {
+            list_remove(&es->partial, e);
+          } else if (e->list_id == SLAB_LIST_FULL) {
+            list_remove(&es->full, e);
+          }
+          e->list_id = SLAB_LIST_NONE;
+          
+          /* Clear current_partial if it points to this slab (prevents lock-free access) */
+          Slab* curp = atomic_load_explicit(&es->current_partial, memory_order_relaxed);
+          if (curp == e) {
+            atomic_store_explicit(&es->current_partial, NULL, memory_order_release);
+          }
+          
+          sc->total_slabs--;
+          
+          /* Decrement empty counter */
+          uint32_t empty_cnt = atomic_load_explicit(&es->empty_partial_count, memory_order_relaxed);
+          if (empty_cnt > 0) {
+            atomic_fetch_sub_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
+          }
+          
+          /* Reset queued flag for next empty transition */
+          atomic_store_explicit(&e->empty_queued, 0, memory_order_relaxed);
+          atomic_store_explicit(&e->empty_next, NULL, memory_order_relaxed);
+          
+          /* Push to global cache for cross-thread reuse (THE RECYCLING RENDEZVOUS).
+           * Must release sc->lock before cache_push (lock rank: cache_lock < sc->lock). */
+          UNLOCK_WITH_RANK(&sc->lock);
+          cache_push(sc, e);
+          LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");
+        } else {
+          /* Slab became non-empty again (race with allocation). Clear queued flag. */
+          atomic_store_explicit(&e->empty_queued, 0, memory_order_relaxed);
+          atomic_store_explicit(&e->empty_next, NULL, memory_order_relaxed);
+        }
+        
+        e = next;
+      }
+    }
+
     /* Try to get a slab from the partial list for this epoch. */
     Slab* s = es->partial.head;
     
@@ -1898,37 +1972,51 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
 
   /* Check if slab just became fully empty (all slots free).
    * 
-   * SAFETY: Do NOT immediately recycle empty slabs!
-   * Other threads may still hold handles to slots in this slab.
-   * Recycling would invalidate those handles (generation mismatch).
+   * NEW RECYCLING MODEL (Phase 2.2 - Continuous Recycling):
+   * Signal empty transition to lock-free queue for harvest during slowpath.
+   * This decouples recycling (making slabs globally reusable) from reclamation
+   * (madvise + deterministic RSS drops via epoch_close).
    * 
-   * Instead: Keep empty slabs on the partial list until epoch_close()
-   * or explicit cleanup. This ensures all outstanding handles remain valid.
-   * 
-   * The empty_partial_count tracks these for potential trimming during
-   * epoch_close() when it's safe (no outstanding allocations from that epoch).
+   * Key insight: Without continuous recycling, "never close" policy causes
+   * catastrophic slowpath convoy (100% mutex hits, 1959 µs mean latency).
+   * Empty queue enables allocator health independent of epoch lifecycle.
    */
   if (new_fc == s->object_count) {
-    /* Slab is now fully empty. Two cases:
-     * 1. Was on FULL list → move to PARTIAL (so it can be reused)
-     * 2. Was on PARTIAL list → already correct, just increment empty counter
-     */
+    /* Slab just became empty! Push to empty queue for harvest.
+     * Use atomic exchange to ensure single enqueue (idempotent). */
+    uint32_t was_queued = atomic_exchange_explicit(&s->empty_queued, 1, memory_order_acq_rel);
+    if (was_queued == 0) {
+      /* First thread to mark empty: push onto epoch's empty queue (lock-free MPSC stack) */
+      Slab* old_head = atomic_load_explicit(&es->empty_queue_head, memory_order_relaxed);
+      do {
+        atomic_store_explicit(&s->empty_next, old_head, memory_order_relaxed);
+      } while (!atomic_compare_exchange_weak_explicit(&es->empty_queue_head, &old_head, s,
+                                                        memory_order_release, memory_order_relaxed));
+    }
+    
+    /* FULL→PARTIAL transition (if needed) remains for allocation correctness.
+     * Slabs on FULL list can't be selected for allocation, so we must move them. */
     if (s->list_id == SLAB_LIST_FULL) {
       LOCK_WITH_PROBE(&sc->lock, sc, LOCK_RANK_SIZE_CLASS, "sc->lock");
       
-      /* Move from full→partial */
-      list_remove(&es->full, s);
-      list_push_back(&es->partial, s);
-      s->list_id = SLAB_LIST_PARTIAL;
-      
-      /* Track as empty partial */
-      atomic_fetch_add_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
+      /* Double-check under lock (free_count may have changed due to concurrent allocation) */
+      uint32_t fc_now = atomic_load_explicit(&s->free_count, memory_order_acquire);
+      if (fc_now == s->object_count && s->list_id == SLAB_LIST_FULL) {
+        list_remove(&es->full, s);
+        list_push_back(&es->partial, s);
+        s->list_id = SLAB_LIST_PARTIAL;
+        atomic_fetch_add_explicit(&sc->list_move_full_to_partial, 1, memory_order_relaxed);
+      }
       
       UNLOCK_WITH_RANK(&sc->lock);
-    } else if (s->list_id == SLAB_LIST_PARTIAL) {
-      /* Already on partial list, just became fully empty */
-      atomic_fetch_add_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
     }
+    
+    /* Increment empty counter for observability */
+    atomic_fetch_add_explicit(&es->empty_partial_count, 1, memory_order_relaxed);
+    
+#if ENABLE_DIAGNOSTIC_COUNTERS
+    atomic_fetch_add_explicit(&sc->empty_slabs, 1, memory_order_relaxed);
+#endif
     
     return true;
   }
