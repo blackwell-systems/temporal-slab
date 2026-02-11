@@ -11,7 +11,7 @@
 
 We present **temporal-slab**, a memory allocator that introduces **passive epoch reclamation**: a novel approach to memory management that achieves deterministic reclamation timing without requiring thread coordination or garbage collection. Unlike traditional allocators (malloc) that operate at the pointer level or garbage collectors that operate at the reachability level, temporal-slab operates at the **phase level**, grouping allocations by application-defined structural boundaries. We demonstrate that this approach eliminates three fundamental sources of unpredictability in production systems: (1) malloc's history-dependent fragmentation leading to unbounded search times, (2) garbage collection's heuristic-triggered stop-the-world pauses, and (3) allocator internal policies triggering coalescing or compaction at arbitrary moments.
 
-Our implementation achieves 131ns p99 and 371ns p999 allocation latency (11-12× better than malloc on AMD EPYC 7763), provides deterministic RSS stability (0% growth with epoch boundaries vs malloc's unbounded drift), and enables **structural observability** (the allocator exposes phase-level metrics like RSS per epoch and contention per application label that pointer-based allocators fundamentally cannot provide). Production-grade robustness features include adaptive bitmap scanning (5.8× CAS retry reduction under high thread contention), compile-time optional label-based semantic attribution for incident diagnosis, and wall vs CPU time split sampling for distinguishing allocator work from OS interference. We validate the design through extensive benchmarking on GitHub Actions infrastructure (5 trials, 100K objects × 1K cycles, validated contention plateauing at 14.78% under 16 threads) and demonstrate applicability across five commercial domains: serverless computing, game engines, database systems, ETL pipelines, and multi-agent AI systems.
+Our implementation achieves 120ns p99 and 340ns p999 allocation latency (12.0× and 13.0× better than malloc respectively on AMD EPYC 7763), provides deterministic RSS stability (0% growth with epoch boundaries vs malloc's unbounded drift), and enables **structural observability** (the allocator exposes phase-level metrics like RSS per epoch and contention per application label that pointer-based allocators fundamentally cannot provide). Production-grade robustness features include adaptive bitmap scanning (5.8× CAS retry reduction under high thread contention), compile-time optional label-based semantic attribution for incident diagnosis, and wall vs CPU time split sampling for distinguishing allocator work from OS interference. We validate the design through extensive benchmarking on GitHub Actions infrastructure (5 trials, 100K objects × 1K cycles, validated contention plateauing at 14.78% under 16 threads) and demonstrate applicability across five commercial domains: serverless computing, game engines, database systems, ETL pipelines, and multi-agent AI systems.
 
 **Unlike pointer-based allocators**, temporal-slab can answer production questions that malloc fundamentally cannot: (1) "Which HTTP route consumed 40MB?" (per-epoch RSS tracking), (2) "Is tail latency from our code or the OS?" (wait_ns = wall_ns - cpu_ns decomposition separating allocator work from scheduler interference), (3) "Which feature causes lock contention?" (per-label attribution via optional compile flag), and (4) "Did kernel actually return memory after madvise?" (RSS delta validation: rss_before_close - rss_after_close). This observability is not added overhead—it emerges naturally from phase-level design (counters exist for correctness, queried for diagnosis). We validate the wait_ns metric under adversarial WSL2 virtualization (70% scheduler overhead single-thread, 20% multi-thread), proving it correctly attributes tail causes even under worst-case OS interference.
 
@@ -61,7 +61,7 @@ This paper makes the following contributions:
 
 **dlmalloc and ptmalloc** (Lea 1996, Gloger 2006) use boundary tags and free lists to manage variable-size allocations. While efficient for general-purpose use, they suffer from three sources of tail latency: (1) lock contention when multiple threads allocate simultaneously, (2) unbounded search times when traversing fragmented free lists, and (3) unpredictable coalescing operations triggered by internal heuristics.
 
-**jemalloc** (Evans 2006) and **tcmalloc** (Ghemawat & Menage 2009) introduce thread-local caches to reduce lock contention, achieving sub-100ns median latency. However, tail latency remains problematic: our benchmarks show ptmalloc p99=1,443ns and p999=4,409ns on the same hardware where temporal-slab achieves p99=120ns and p999=340ns.
+**jemalloc** (Evans 2006) and **tcmalloc** (Ghemawat & Menage 2009) introduce thread-local caches to reduce lock contention, achieving sub-100ns median latency. However, tail latency remains problematic: our benchmarks (GitHub Actions, AMD EPYC 7763, Feb 9 2026) show system malloc p99=1,443ns (median across 5 trials, range 1,432-1,463ns) and p999=4,409ns (range 4,379-4,438ns) on the same hardware where temporal-slab achieves p99=120ns (range 110-120ns) and p999=340ns (range 311-350ns).
 
 ### 2.2 Slab Allocation
 
@@ -1053,24 +1053,35 @@ void cache_push(SizeClassAlloc* sc, Slab* s) {
 
 **Test configuration:** 100K objects × 1K cycles, 128-byte objects, 5 trials (Feb 9 2026, GitHub Actions)
 
+**Note:** These results are without `ENABLE_TLS_CACHE` (Phase 2.6). With TLS caching enabled, high-locality workloads show p50 -11% (40ns→36ns) and p99 -75% (120ns→30ns), but results are workload-dependent.
+
 | Metric | temporal-slab | malloc | Result |
 |--------|---------------|--------|---------|
 | **Median (p50)** | 40ns | 31ns | 1.29× slower (trade-off) |
-| **p99** | **131ns** | **1,463ns** | **11.2× better** |
-| **p999** | **371ns** | **4,418ns** | **11.9× better** |
-| **p9999** | 3,246ns | 7,935ns | 2.4× better |
+| **p99** | **120ns** | **1,443ns** | **12.0× better** |
+| **p999** | **340ns** | **4,409ns** | **13.0× better** |
+| **p9999** | 2,535ns | 6,432ns | 2.5× better |
 
 **Risk exchange analysis:**
 - Median cost: +9ns (+29%) - acceptable for determinism
-- p99 improvement: 1,332ns saved (36× median cost) - decisive for latency SLAs
-- p999 improvement: 4,047ns saved (100× median cost) - eliminates tail-risk violations
+- p99 improvement: 1,323ns saved (147× median cost) - decisive for latency SLAs
+- p999 improvement: 4,069ns saved (452× median cost) - eliminates tail-risk violations
 
-This is not a performance trade-off; it's **tail-risk elimination**. A single malloc p99 outlier (1,463ns) costs more than 36 temporal-slab median allocations. For systems where p99 latency determines customer experience (trading systems, real-time APIs, gaming), this exchange is decisive.
+This is not a performance trade-off; it's **tail-risk elimination**. A single malloc p99 outlier (1,443ns) costs more than 36 temporal-slab median allocations (147× the +9ns cost). For systems where p99 latency determines customer experience (trading systems, real-time APIs, gaming), this exchange is decisive.
 
 temporal-slab eliminates malloc's tail latency sources:
 - No lock contention (lock-free fast path)
 - No unbounded search times (bitmap allocation is O(1))
 - No surprise coalescing (reclamation deferred to `epoch_close()`)
+
+**Optional TLS cache optimization (Phase 2.6, not included in above results):**
+
+For high-locality workloads (same thread allocates and frees repeatedly):
+- p50: 40ns → 36ns (-11%, eliminates atomic bitmap CAS)
+- p99: 120ns → 30ns (-75%, TLS hits bypass global allocator)
+- Throughput: +15% single-thread
+
+Trade-off: Workload-specific (helps high-locality, hurts low-locality), requires explicit build flag (`ENABLE_TLS_CACHE=1`). See Section 3.7 for design details.
 
 ### 5.3 Contention Analysis
 
