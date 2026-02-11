@@ -1036,9 +1036,10 @@ void cache_push(SizeClassAlloc* sc, Slab* s) {
 **Comparison baseline:** GNU libc malloc (ptmalloc2)
 
 **Methodology:**
-- Each benchmark run 10× to assess variance
-- Outlier rejection: discard highest/lowest, average middle 8 runs
-- Statistical significance: Welch's t-test, p < 0.01 threshold
+- Single-threaded latency: 10 trials × (100K objects × 1K cycles)
+- Median reported across trials (ranges provided for reproducibility)
+- Outlier handling: No rejection (report full ranges for transparency)
+- Statistical significance: Coefficient of variation <10% validates repeatability
 - Measurement: CLOCK_MONOTONIC for wall time, rdtsc for cycle-accurate timing
 
 **Threats to validity:**
@@ -1051,9 +1052,9 @@ void cache_push(SizeClassAlloc* sc, Slab* s) {
 
 ### 5.2 Latency Results
 
-**Test configuration:** 100K objects × 1K cycles, 128-byte objects, 5 trials (Feb 9 2026, GitHub Actions)
+**Test configuration:** Single-threaded latency benchmark, 100K objects × 1K cycles, 128-byte objects, 10 trials (Feb 9 2026, GitHub Actions ubuntu-latest, AMD EPYC 7763)
 
-**Note:** These results are without `ENABLE_TLS_CACHE` (Phase 2.6). With TLS caching enabled, high-locality workloads show p50 -11% (40ns→36ns) and p99 -75% (120ns→30ns), but results are workload-dependent.
+**Note:** These results are without `ENABLE_TLS_CACHE` (Phase 2.6 didn't exist during measurement). With TLS caching enabled, high-locality workloads show p50 -11% (40ns→36ns) and p99 -75% (120ns→30ns), but results are workload-dependent.
 
 | Metric | temporal-slab | malloc | Result |
 |--------|---------------|--------|---------|
