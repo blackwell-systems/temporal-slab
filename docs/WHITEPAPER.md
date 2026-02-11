@@ -45,13 +45,17 @@ This paper makes the following contributions:
 
 3. **Conservative deferred recycling:** Elimination of recycling overhead from allocation/free hot paths by deferring all reclamation to explicit `epoch_close()` calls.
 
-4. **Adaptive contention management:** Reactive bitmap scanning mode controller that automatically switches between cache-friendly sequential scanning and contention-spreading randomized scanning based on observed CAS retry rates (0.30 enable / 0.10 disable thresholds), achieving 5.8× reduction in retry rates under 16-thread load.
+4. **Lock-free epoch-partitioned slabs:** Temporal isolation via per-epoch slab segregation, enabling zero cross-thread interference during allocation (threads in different epochs never contend on the same data structures).
 
-5. **Production-grade robustness features:** Zombie partial slab repair (defense-in-depth against metadata divergence), semantic attribution via bounded label registry (compile-time optional per-phase contention tracking), and slowpath sampling (wall vs CPU time split for distinguishing allocator work from OS interference in virtualized environments).
+5. **Portable ABA-safe handles:** Registry-based generation tracking provides use-after-free protection on all platforms without architecture-specific pointer tagging or DWCAS requirements.
 
-6. **Implementation validation:** Comprehensive benchmarking showing 12-13× tail latency improvement over malloc, with validated contention scaling behavior (plateaus at 14.8% lock contention under 8-16 threads, sub-linear CAS retry scaling to 1.19% at 16 threads, 10 trials per thread count on GitHub Actions infrastructure).
+6. **Adaptive contention management:** Reactive bitmap scanning mode controller that automatically switches between cache-friendly sequential scanning and contention-spreading randomized scanning based on observed CAS retry rates (0.30 enable / 0.10 disable thresholds), achieving 5.8× reduction in retry rates under 16-thread load.
 
-7. **Commercial applicability analysis:** Concrete evaluation of how the design maps to five production domains, with working reference implementations.
+7. **Production-grade robustness features:** Zombie partial slab repair (defense-in-depth against metadata divergence), semantic attribution via bounded label registry (compile-time optional per-phase contention tracking), and slowpath sampling (wall vs CPU time split for distinguishing allocator work from OS interference in virtualized environments).
+
+8. **Implementation validation:** Comprehensive benchmarking showing 12-13× tail latency improvement over malloc, with validated contention scaling behavior (plateaus at 14.8% lock contention under 8-16 threads, sub-linear CAS retry scaling to 1.19% at 16 threads, 10 trials per thread count on GitHub Actions infrastructure).
+
+9. **Commercial applicability analysis:** Concrete evaluation of how the design maps to five production domains, with working reference implementations.
 
 ---
 
@@ -95,7 +99,11 @@ temporal-slab's epoch domains provide region-like RAII semantics but add: (1) au
 
 #### 3.1.1 Epochs
 
-An **epoch** is a temporal allocation group identified by a ring index (0-15). Allocations made in epoch N reside in slabs specific to that epoch, isolated from allocations in epoch N+1. Epochs have two states:
+An **epoch** is a temporal allocation group identified by a ring index (0-15). Allocations made in epoch N reside in slabs specific to that epoch, isolated from allocations in epoch N+1.
+
+**Temporal isolation guarantee:** Threads allocating in different epochs never contend on the same slab data structures. Thread A in epoch 5 and Thread B in epoch 7 access disjoint `current_partial` pointers and slab lists, eliminating cross-epoch interference entirely. Contention only occurs when threads share the same active epoch.
+
+Epochs have two states:
 
 - **ACTIVE (0):** Accepting new allocations
 - **CLOSING (1):** Rejecting new allocations, passively draining
@@ -310,7 +318,14 @@ No grace periods. No quiescent states. No coordination overhead.
 
 ### 3.6 Handle Encoding and ABA Protection
 
-temporal-slab uses **portable handles** instead of raw pointers:
+temporal-slab uses **portable handles** instead of raw pointers, solving the cross-platform ABA problem without architecture-specific assumptions:
+
+**Why not raw pointers?**
+- x86-64 pointer tagging: Unreliable (relies on unused high bits, breaks on some OSes)
+- ARM pointer authentication: Platform-specific (PAC not available on all chips)
+- DWCAS (double-width CAS): Expensive (128-bit atomic operations, not universal)
+
+**Handle-based solution works everywhere** (x86, ARM, RISC-V, any C11-compliant platform):
 
 ```
 Handle layout (64-bit):

@@ -192,6 +192,59 @@ The epoch parameter **is** the attribution. No sampling, no backtraces, no profi
 
 ---
 
+## Architectural Advantages
+
+### Lock-Free Epoch Partitioning
+
+**Temporal isolation property:** Threads in different epochs never contend.
+
+```
+Thread A allocating in epoch 5 → accesses current_partial[size_class][5]
+Thread B allocating in epoch 7 → accesses current_partial[size_class][7]
+```
+
+No shared state. No cross-epoch contention. Scalability by design.
+
+**Why this matters:**
+- Web server: 100 concurrent requests → up to 100 active epochs → zero interference
+- Game engine: Render thread (epoch 3) and physics thread (epoch 5) → never block each other
+- Database: Read transaction (epoch 2) and write transaction (epoch 8) → independent slabs
+
+Contention only occurs when threads share the same active epoch (same phase), which is the natural workload pattern.
+
+### Portable ABA-Safe Handles
+
+**The cross-platform problem:** ABA protection requires generation tracking, but pointer-based solutions are platform-specific:
+
+- **x86-64 pointer tagging:** Unreliable (unused high bits, breaks on some OSes)
+- **ARM PAC (Pointer Authentication):** Platform-specific (not all chips)
+- **DWCAS (double-width CAS):** Expensive (128-bit atomics, not universal)
+
+**temporal-slab solution:** Registry-based generation tracking
+
+```c
+Handle (64-bit):
+  [63:42] slab_id (22 bits) - registry index
+  [41:18] generation (24 bits) - ABA protection (wraps after 16M reuses)
+  [17:0]  slot + size_class + version
+
+SlabRegistry:
+  metas[slab_id].ptr → Slab*
+  metas[slab_id].gen → 24-bit counter
+```
+
+**Validation on every access:**
+```c
+Slab* s = reg_lookup_validate(registry, handle.slab_id, handle.generation);
+if (!s) return NULL;  // Stale handle from recycled slab
+```
+
+**Cross-platform guarantee:** Works on any C11-compliant platform (x86, ARM, RISC-V, MIPS) without architecture-specific assembly or pointer tricks.
+
+**Use-after-free protection:** Handles from recycled slabs fail validation (generation mismatch), preventing corruption even under race conditions.
+
+---
+
 ## The Production-Grade Additions
 
 ### 4. Adaptive Contention Management
