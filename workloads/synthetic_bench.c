@@ -1,19 +1,31 @@
 /*
  * synthetic_bench.c - Canonical benchmark harness for temporal-slab allocator
  *
- * Parameterized workload generator with 5 built-in patterns designed to
- * demonstrate allocator behavior in Grafana dashboards.
+ * Parameterized workload generator with 6 built-in patterns designed to
+ * demonstrate allocator behavior and Phase 2.0-2.5 observability features.
  *
- * Compile:
+ * Features (updated Feb 10 2026):
+ * - Phase 2.2 contention metrics (lock_contention_pct, cas_retry_rate, scan_mode)
+ * - Phase 2.4 RSS delta tracking (rss_delta_mb computed from before/after)
+ * - Phase 2.5 slowpath sampling (optional ENABLE_SLOWPATH_SAMPLING, wait_ns metric)
+ * - New PATTERN_CONTENTION (8-thread stress test for adaptive scanning validation)
+ *
+ * Compile (basic):
  *   cd /home/blackwd/code/ZNS-Slab/src
  *   make slab_lib.o
  *   gcc -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include \
  *       -DENABLE_RSS_RECLAMATION=1 ../workloads/synthetic_bench.c slab_lib.o \
  *       -o ../workloads/synthetic_bench
  *
+ * Compile (with slowpath sampling):
+ *   gcc -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include \
+ *       -DENABLE_RSS_RECLAMATION=1 -DENABLE_SLOWPATH_SAMPLING=1 \
+ *       ../workloads/synthetic_bench.c slab_lib.o -o ../workloads/synthetic_bench
+ *
  * Usage:
  *   ./synthetic_bench --allocator=tslab --pattern=burst --duration_s=60
  *   ./synthetic_bench --allocator=malloc --pattern=steady --duration_s=60
+ *   ./synthetic_bench --allocator=tslab --pattern=contention --threads=8 --duration_s=30
  */
 
 #define _GNU_SOURCE
@@ -40,6 +52,7 @@ typedef enum {
     PATTERN_LEAK,
     PATTERN_HOTSPOT,
     PATTERN_KERNEL,
+    PATTERN_CONTENTION,
 } WorkloadPattern;
 
 typedef enum {
@@ -429,6 +442,18 @@ static void apply_pattern_preset(BenchConfig* cfg, WorkloadPattern pattern) {
         cfg->free_policy = FREE_POLICY_WITHIN_REQ;
         cfg->epoch_policy = EPOCH_POLICY_PER_REQ;
         break;
+    
+    case PATTERN_CONTENTION:
+        /* Multi-threaded stress: demonstrate adaptive scanning + Phase 2.2 metrics */
+        cfg->threads = 8;
+        cfg->req_rate = 10000;
+        cfg->objs_min = 50;
+        cfg->objs_max = 50;
+        cfg->size = 128;
+        cfg->free_policy = FREE_POLICY_WITHIN_REQ;
+        cfg->epoch_policy = EPOCH_POLICY_BATCH;
+        cfg->batch_size = 100;
+        break;
     }
 }
 
@@ -440,7 +465,7 @@ static void print_usage(const char* prog) {
     printf("Usage: %s [OPTIONS]\n\n", prog);
     printf("Options:\n");
     printf("  --allocator=<tslab|malloc>     Backend allocator (default: tslab)\n");
-    printf("  --pattern=<burst|steady|leak|hotspot|kernel>\n");
+    printf("  --pattern=<burst|steady|leak|hotspot|kernel|contention>\n");
     printf("                                 Workload pattern (default: burst)\n");
     printf("  --duration_s=N                 Run duration in seconds (default: 60)\n");
     printf("  --threads=N                    Number of worker threads (default: 1)\n");
@@ -457,7 +482,8 @@ static void print_usage(const char* prog) {
     printf("Pattern presets:\n");
     printf("  burst:   RSS sawtooth, madvise spikes\n");
     printf("  steady:  RSS plateau, stable cache reuse\n");
-    printf("  leak:    Epoch age/refcount anomalies\n");
+    printf("  leak:       Epoch age/refcount anomalies\n");
+    printf("  contention: Multi-threaded stress (8T, adaptive scanning)\n");
     printf("  hotspot: Per-class hotspots\n");
     printf("  kernel:  Strong madvise→RSS correlation\n");
 }
@@ -514,6 +540,8 @@ static bool parse_args(int argc, char** argv, BenchConfig* cfg) {
                 apply_pattern_preset(cfg, PATTERN_HOTSPOT);
             } else if (strcmp(optarg, "kernel") == 0) {
                 apply_pattern_preset(cfg, PATTERN_KERNEL);
+            } else if (strcmp(optarg, "contention") == 0) {
+                apply_pattern_preset(cfg, PATTERN_CONTENTION);
             } else {
                 fprintf(stderr, "Unknown pattern: %s\n", optarg);
                 return false;
@@ -692,6 +720,41 @@ int main(int argc, char** argv) {
                 fprintf(f, "  \"benchmark_objects_freed\": %lu,\n", ws.objects_freed);
                 fprintf(f, "  \"benchmark_objects_leaked\": %lu,\n", ws.objects_leaked);
                 
+                /* Phase 2.5: Slowpath sampling (optional) */
+#ifdef ENABLE_SLOWPATH_SAMPLING
+                ThreadStats ts = slab_stats_thread();
+                if (ts.alloc_samples > 0) {
+                    uint64_t avg_wall = ts.alloc_wall_ns_sum / ts.alloc_samples;
+                    uint64_t avg_cpu = ts.alloc_cpu_ns_sum / ts.alloc_samples;
+                    uint64_t avg_wait = ts.alloc_wait_ns_sum / ts.alloc_samples;
+                    fprintf(f, "  \"slowpath_sampling\": {\n");
+                    fprintf(f, "    \"enabled\": true,\n");
+                    fprintf(f, "    \"samples\": %lu,\n", ts.alloc_samples);
+                    fprintf(f, "    \"avg_wall_ns\": %lu,\n", avg_wall);
+                    fprintf(f, "    \"avg_cpu_ns\": %lu,\n", avg_cpu);
+                    fprintf(f, "    \"avg_wait_ns\": %lu,\n", avg_wait);
+                    fprintf(f, "    \"max_wall_ns\": %lu,\n", ts.alloc_wall_ns_max);
+                    fprintf(f, "    \"max_cpu_ns\": %lu,\n", ts.alloc_cpu_ns_max);
+                    fprintf(f, "    \"max_wait_ns\": %lu,\n", ts.alloc_wait_ns_max);
+                    if (ts.repair_count > 0) {
+                        uint64_t avg_repair_cpu = ts.repair_cpu_ns_sum / ts.repair_count;
+                        uint64_t avg_repair_wait = ts.repair_wait_ns_sum / ts.repair_count;
+                        fprintf(f, "    \"repair_count\": %lu,\n", ts.repair_count);
+                        fprintf(f, "    \"avg_repair_cpu_ns\": %lu,\n", avg_repair_cpu);
+                        fprintf(f, "    \"avg_repair_wait_ns\": %lu,\n", avg_repair_wait);
+                        fprintf(f, "    \"repair_reason_full_bitmap\": %lu,\n", ts.repair_reason_full_bitmap);
+                        fprintf(f, "    \"repair_reason_list_mismatch\": %lu\n", ts.repair_reason_list_mismatch);
+                    } else {
+                        fprintf(f, "    \"repair_count\": 0\n");
+                    }
+                    fprintf(f, "  },\n");
+                } else {
+                    fprintf(f, "  \"slowpath_sampling\": {\"enabled\": true, \"samples\": 0},\n");
+                }
+#else
+                fprintf(f, "  \"slowpath_sampling\": {\"enabled\": false},\n");
+#endif
+                
                 /* Per-class stats */
                 fprintf(f, "  \"classes\": [\n");
                 for (uint32_t cls = 0; cls < 8; cls++) {
@@ -724,7 +787,25 @@ int main(int argc, char** argv) {
                     fprintf(f, "      \"total_full_slabs\": %u,\n", cs.total_full_slabs);
                     fprintf(f, "      \"recycle_rate_pct\": %.2f,\n", cs.recycle_rate_pct);
                     fprintf(f, "      \"net_slabs\": %lu,\n", cs.net_slabs);
-                    fprintf(f, "      \"estimated_rss_bytes\": %lu\n", cs.estimated_rss_bytes);
+                    fprintf(f, "      \"estimated_rss_bytes\": %lu,\n", cs.estimated_rss_bytes);
+                    
+                    /* Phase 2.2: Contention metrics */
+                    uint64_t total_lock_ops = cs.lock_fast_acquire + cs.lock_contended;
+                    if (total_lock_ops > 0) {
+                        double contention_rate = 100.0 * cs.lock_contended / total_lock_ops;
+                        fprintf(f, "      \"lock_contention_pct\": %.2f,\n", contention_rate);
+                        fprintf(f, "      \"lock_fast_acquire\": %lu,\n", cs.lock_fast_acquire);
+                        fprintf(f, "      \"lock_contended\": %lu,\n", cs.lock_contended);
+                    }
+                    if (cs.bitmap_alloc_attempts > 0) {
+                        double cas_retry_rate = (double)cs.bitmap_alloc_cas_retries / cs.bitmap_alloc_attempts;
+                        fprintf(f, "      \"cas_retry_rate\": %.4f,\n", cas_retry_rate);
+                        fprintf(f, "      \"bitmap_alloc_cas_retries\": %lu,\n", cs.bitmap_alloc_cas_retries);
+                        fprintf(f, "      \"bitmap_alloc_attempts\": %lu,\n", cs.bitmap_alloc_attempts);
+                    }
+                    fprintf(f, "      \"scan_mode\": %u,\n", cs.scan_mode);
+                    fprintf(f, "      \"scan_adapt_checks\": %u,\n", cs.scan_adapt_checks);
+                    fprintf(f, "      \"scan_adapt_switches\": %u\n", cs.scan_adapt_switches);
                     fprintf(f, "    }%s\n", (cls < 7) ? "," : "");
                 }
                 fprintf(f, "  ],\n");
@@ -751,6 +832,12 @@ int main(int argc, char** argv) {
                         fprintf(f, "      \"label\": \"%s\",\n", es.label);
                         fprintf(f, "      \"rss_before_close\": %lu,\n", es.rss_before_close);
                         fprintf(f, "      \"rss_after_close\": %lu,\n", es.rss_after_close);
+                        /* Phase 2.4: RSS delta analysis */
+                        if (es.rss_before_close > 0 && es.rss_after_close > 0) {
+                            uint64_t rss_delta_bytes = (es.rss_before_close > es.rss_after_close) ? 
+                                (es.rss_before_close - es.rss_after_close) : 0;
+                            fprintf(f, "      \"rss_delta_mb\": %.2f,\n", rss_delta_bytes / (1024.0 * 1024.0));
+                        }
                         fprintf(f, "      \"partial_slab_count\": %u,\n", es.partial_slab_count);
                         fprintf(f, "      \"full_slab_count\": %u,\n", es.full_slab_count);
                         fprintf(f, "      \"estimated_rss_bytes\": %lu,\n", es.estimated_rss_bytes);
