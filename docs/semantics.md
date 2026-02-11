@@ -634,7 +634,28 @@ epoch_close(alloc, 5);  // Close old epoch 5 (not epoch 0)
 
 ## Future Work
 
-### Not Yet Implemented
+### Phase 2 Observability (COMPLETE as of 2026-02-11)
+
+1. **Domain labels** (Phase 2.3 semantic attribution) - ✅ COMPLETE
+   - Status: slab_epoch_set_label API implemented and validated
+   - Wired to stats_dump JSON output, Prometheus metrics, Grafana dashboard
+
+2. **Epoch-close telemetry** (Phase 2.1) - ✅ COMPLETE
+   - Status: epoch_close_calls, scanned_slabs, recycled_slabs counters implemented
+   
+3. **Contention observability** (Phase 2.2) - ✅ COMPLETE
+   - Status: Lock contention, CAS retry tracking, scan mode metrics
+   
+4. **RSS delta tracking** (Phase 2.4) - ✅ COMPLETE
+   - Status: rss_before_close, rss_after_close correlation
+   
+5. **Slowpath sampling** (Phase 2.5) - ✅ COMPLETE
+   - Status: wait_ns metric, zombie repair timing, adversarial validation
+
+6. **TLS handle cache** (Phase 2.6) - ✅ COMPLETE
+   - Status: Optional ENABLE_TLS_CACHE flag, 4.0× p99 improvement validated
+
+### Not Yet Implemented (Phase 3+)
 
 1. **Handle indirection + munmap()** (Phase 3)
    - Current: Virtual memory stays mapped, madvise releases physical pages
@@ -644,14 +665,6 @@ epoch_close(alloc, 5);  // Close old epoch 5 (not epoch 0)
 2. **NUMA-aware domain placement** (Phase 4)
    - Current: Single allocator for all threads
    - Future: Per-NUMA-node allocators with cross-node free
-
-3. **Domain labels** (Phase 2.3 semantic attribution)
-   - Current: Implemented (slab_epoch_set_label API)
-   - Status: Wired to stats_dump JSON output
-
-4. **Epoch-close telemetry** (Phase 2.1)
-   - Current: Not implemented
-   - Future: epoch_close_calls, scanned_slabs, recycled_slabs counters
 
 ---
 
@@ -666,5 +679,5 @@ epoch_close(alloc, 5);  // Close old epoch 5 (not epoch 0)
 ---
 
 **Maintainer:** blackwd  
-**Version:** 1.0 (canonical reference)  
-**Last reviewed:** 2026-02-07
+**Version:** 1.1 (canonical reference, Phase 2.0-2.6 complete)  
+**Last reviewed:** 2026-02-11
