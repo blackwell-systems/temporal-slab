@@ -1,17 +1,19 @@
-# temporal-slab: Passive Epoch Reclamation for Deterministic Phase-Aligned Memory Management
+# temporal-slab: Lifecycle-Structured Memory Management with Continuous Recycling and Explicit Reclamation
 
 **Author:** Dayna Blackwell (Independent Researcher)  
 **Contact:** dayna@blackwell-systems.com  
 **Date:** February 2026  
-**Version:** 1.0
+**Version:** 2.0 (Phase 2.2 - Revised Edition)
 
 ---
 
 ## Abstract
 
-We present **temporal-slab**, a memory allocator that introduces **passive epoch reclamation**: a novel approach to memory management that achieves deterministic reclamation timing without requiring thread coordination or garbage collection. Unlike traditional allocators (malloc) that operate at the pointer level or garbage collectors that operate at the reachability level, temporal-slab operates at the **phase level**, grouping allocations by application-defined structural boundaries. We demonstrate that this approach eliminates three fundamental sources of unpredictability in production systems: (1) malloc's history-dependent fragmentation leading to unbounded search times, (2) garbage collection's heuristic-triggered stop-the-world pauses, and (3) allocator internal policies triggering coalescing or compaction at arbitrary moments.
+We present **temporal-slab**, a lifecycle-structured memory allocator that organizes memory by semantic phase rather than spatial locality or pointer reachability. Unlike traditional allocators that manage memory at the pointer level (malloc) or garbage collectors that operate at the reachability level, temporal-slab operates at the **phase level**, grouping allocations by application-defined structural boundaries such as requests, frames, or transactions.
 
-Our implementation achieves 120ns p99 and 340ns p999 allocation latency (12.0× and 13.0× better than malloc respectively on AMD EPYC 7763), with optional thread-local caching improving this to 105ns p99 and 269ns p999 (13.7× and 16.4× better). The design provides deterministic RSS stability (0% growth with epoch boundaries vs malloc's unbounded drift) and enables **structural observability** (the allocator exposes phase-level metrics like RSS per epoch and contention per application label that pointer-based allocators fundamentally cannot provide). Production-grade robustness features include adaptive bitmap scanning (sub-linear CAS retry scaling: 1.19% at 16 threads), compile-time optional label-based semantic attribution for incident diagnosis, and wall vs CPU time split sampling for distinguishing allocator work from OS interference. We validate the design through extensive benchmarking on GitHub Actions infrastructure (10 trials × 4 thread counts, validated contention plateauing at 14.8% under 8-16 threads with 4.8% coefficient of variation) and demonstrate applicability across five commercial domains: serverless computing, game engines, database systems, ETL pipelines, and multi-agent AI systems.
+The key refinement introduced in Phase 2.2 is a strict separation between **continuous recycling** (required for allocator liveness and reuse stability) and **explicit reclamation** (optional, policy-driven RSS return to the OS). This separation eliminates hidden liveness dependencies while preserving deterministic reclamation timing. Empirical evaluation under adversarial long-lived epoch workloads demonstrates a 38× reduction in mean latency and a 4,096× reduction in maximum latency compared to deferred-only recycling, validating the necessity of continuous slab reuse independent of epoch closure.
+
+The allocator achieves 120ns p99 and 340ns p999 allocation latency (12.0× and 13.0× better than malloc respectively on AMD EPYC 7763), with optional thread-local caching improving this to 105ns p99 and 269ns p999 (13.7× and 16.4× better). Production-style HTTP benchmarking validates competitive performance against modern allocators (mimalloc, tcmalloc, jemalloc) under sustained request workloads (48-55 µs mean latency). The design provides deterministic RSS stability (0% growth with epoch boundaries vs malloc's unbounded drift) and enables **structural observability** (the allocator exposes phase-level metrics like RSS per epoch and contention per application label that pointer-based allocators fundamentally cannot provide). Production-grade robustness features include adaptive bitmap scanning (sub-linear CAS retry scaling: 1.19% at 16 threads), compile-time optional label-based semantic attribution for incident diagnosis, and wall vs CPU time split sampling for distinguishing allocator work from OS interference. We validate the design through extensive benchmarking on GitHub Actions infrastructure (10 trials × 4 thread counts, validated contention plateauing at 14.8% under 8-16 threads with 4.8% coefficient of variation) and demonstrate applicability across five commercial domains: serverless computing, game engines, database systems, ETL pipelines, and multi-agent AI systems.
 
 **Unlike pointer-based allocators**, temporal-slab can answer production questions that malloc fundamentally cannot: (1) "Which HTTP route consumed 40MB?" (per-epoch RSS tracking), (2) "Is tail latency from our code or the OS?" (wait_ns = wall_ns - cpu_ns decomposition separating allocator work from scheduler interference), (3) "Which feature causes lock contention?" (per-label attribution via optional compile flag), and (4) "Did kernel actually return memory after madvise?" (RSS delta validation: rss_before_close - rss_after_close). This observability is not added overhead—it emerges naturally from phase-level design (counters exist for correctness, queried for diagnosis). We validate the wait_ns metric under adversarial WSL2 virtualization (70% scheduler overhead single-thread, 20% multi-thread), proving it correctly attributes tail causes even under worst-case OS interference.
 
@@ -43,7 +45,7 @@ This paper makes the following contributions:
 
 2. **Deterministic phase-aligned cleanup:** Combining passive reclamation with RAII-style epoch domains to guarantee RSS drops happen at application-defined structural boundaries.
 
-3. **Conservative deferred recycling:** Elimination of recycling overhead from allocation/free hot paths by deferring all reclamation to explicit `epoch_close()` calls.
+3. **Continuous recycling, explicit reclamation:** Slab reuse is performed continuously to preserve allocator health under sustained load, while memory reclamation (e.g., `madvise`) remains explicitly controlled via `epoch_close()`. This decouples throughput stability from reclamation policy and prevents slow-path convoy under long-lived epochs.
 
 4. **Lock-free epoch-partitioned slabs:** Temporal isolation via per-epoch slab segregation, enabling zero cross-thread interference during allocation (threads in different epochs never contend on the same data structures).
 
@@ -231,60 +233,176 @@ uint32_t slab_alloc_slot_atomic(Slab* s, uint32_t* out_retries) {
 
 **Adaptive scanning:** Under high contention (CAS retry rate >30%), the allocator switches from sequential scanning (0,1,2,...) to randomized starting offsets (hash(thread_id) % words) to spread threads across the bitmap.
 
-### 3.4 Conservative Deferred Recycling
+### 3.4 Continuous Recycling, Explicit Reclamation
 
-**Key design decision:** `free_obj()` never recycles slabs. When a slab becomes empty, it simply:
-1. Moves from FULL → PARTIAL (if it was on FULL list)
-2. Increments `empty_partial_count` (tracking counter)
-3. Returns immediately
+**Key design refinement (Phase 2.2):**
+Slab *recycling* (making empty slabs reusable) is continuous and health-preserving.
+Slab *reclamation* (returning memory to the OS) remains explicit and schedulable via `epoch_close()`.
 
-Actual recycling happens in `epoch_close()`:
+Earlier designs deferred both recycling and reclamation to `epoch_close()`. Production-style benchmarking revealed that coupling recycling to epoch closure can create allocator health degradation under long-lived epochs. The refined design separates these concerns.
+
+---
+
+#### 3.4.1 Continuous Recycling
+
+When a slab becomes empty during `free_obj()`, it is immediately made eligible for reuse without waiting for `epoch_close()`.
+
+The mechanism:
+
+1. On free, when `free_count == object_count`, the slab is detected as empty.
+2. The slab is pushed to a lock-free multi-producer stack (`empty_queue`) for its size class.
+3. During allocation slow-path (under existing `sc->lock`), the allocator harvests slabs from this queue and returns them to the reusable cache.
+
+Conceptually:
 
 ```c
-void epoch_close(SlabAllocator* a, EpochId epoch) {
-    // Phase 1: Mark CLOSING (reject new allocations)
-    atomic_store(&a->epoch_state[epoch], EPOCH_CLOSING, memory_order_release);
-    
-    // Phase 2: Flush TLS caches (if enabled)
-    #if ENABLE_TLS_CACHE
-    tls_flush_epoch_all_threads(a, epoch);
-    #endif
-    
-    // Phase 3: Scan BOTH partial and full lists for empty slabs
-    for (size_t i = 0; i < 8; i++) {  // 8 size classes
-        SizeClassAlloc* sc = &a->classes[i];
-        EpochState* es = &sc->epochs[epoch];
-        
-        LOCK(&sc->lock);
-        
-        // Scan partial list
-        for (Slab* s = es->partial.head; s; s = s->next) {
-            if (s->free_count == s->object_count) {
-                collect_for_recycling(s);
-            }
-        }
-        
-        // Scan full list
-        for (Slab* s = es->full.head; s; s = s->next) {
-            if (s->free_count == s->object_count) {
-                collect_for_recycling(s);
-            }
-        }
-        
-        UNLOCK(&sc->lock);
-        
-        // Phase 4: Recycle collected slabs (outside lock)
-        for (each collected slab) {
-            cache_push(sc, slab);  // May madvise() if never published
-        }
-    }
+// In free path:
+if (new_free == s->object_count) {
+    empty_queue_push(sc, s);   // Lock-free signal
 }
 ```
 
-**Why this works:**
-- Zero overhead in allocation/free hot paths (no recycling checks)
-- Deterministic timing (only happens when application calls `epoch_close()`)
-- Bulk operation (amortizes locking cost across many slabs)
+```c
+// In alloc slow path (under existing lock):
+harvest_empty_queue(sc);       // Reclaim empty slabs into cache
+```
+
+Properties:
+
+* No additional mutex acquisition beyond existing slow-path locking.
+* No global coordination.
+* O(1) signaling cost on the free path.
+* Prevents slab starvation and slow-path lock convoy.
+
+This guarantees that empty slabs remain reusable even if an epoch remains open indefinitely.
+
+---
+
+#### 3.4.2 Explicit Reclamation (`epoch_close()`)
+
+`epoch_close()` no longer performs primary recycling. Instead, it performs **explicit reclamation**:
+
+* Marks the epoch as closing.
+* Flushes TLS caches (if enabled).
+* Identifies slabs that are both empty and safe to reclaim.
+* Optionally issues `madvise()` or equivalent OS memory release operations.
+
+Revised intent:
+
+```c
+void epoch_close(SlabAllocator* a, EpochId epoch) {
+    atomic_store(&a->epoch_state[epoch], EPOCH_CLOSING);
+
+    // Flush TLS caches (optional)
+    tls_flush_epoch_all_threads(a, epoch);
+
+    // Identify reclaimable slabs
+    for each size class:
+        collect_empty_slabs_for_reclamation();
+
+    // Reclaim memory (madvise / return to OS)
+    for each collected slab:
+        reclaim_memory(slab);
+}
+```
+
+Important distinction:
+
+* **Recycling** → ensures allocator throughput and stability.
+* **Reclamation** → controls RSS and OS memory footprint.
+
+Recycling is continuous.
+Reclamation is explicit.
+
+---
+
+#### 3.4.3 Why Decoupling Was Necessary
+
+Production-style HTTP benchmarking under a "never close" epoch policy revealed a pathological behavior in the earlier deferred-only design:
+
+* Empty slabs accumulated on per-thread lists.
+* They were not reusable by other threads.
+* No recycling occurred without `epoch_close()`.
+* All threads began allocating new slabs from the global pool.
+* Slow-path lock convoy emerged.
+* Mean latency increased by 38\u00d7 (51 \u00b5s → 1,959 \u00b5s).
+* Tail latencies reached millisecond-scale spikes (max: 1.07 seconds).
+
+This was not a correctness failure, but a liveness/throughput degradation caused by coupling slab reuse to epoch sweeps.
+
+The refined design eliminates this dependency:
+
+* Slab reuse no longer requires epoch boundaries.
+* `epoch_close()` becomes optional for allocator health.
+* Epochs remain useful for controlled reclamation and observability.
+* Long-lived epochs are now safe.
+
+This refinement preserves the original thesis while strengthening operational robustness.
+
+---
+
+#### 3.4.4 Resulting Lifecycle Model
+
+The allocator now follows a three-layer lifecycle:
+
+| Concern     | Mechanism             | Trigger     |
+| ----------- | --------------------- | ----------- |
+| Allocation  | Bitmap fast path      | Every alloc |
+| Recycling   | Empty queue + harvest | Continuous  |
+| Reclamation | `epoch_close()`       | Explicit    |
+
+This separation ensures:
+
+* Stable throughput without mandatory epoch sweeps
+* Deterministic reclamation when desired
+* No hidden coordination requirements
+* No grace-period style synchronization
+
+---
+
+#### 3.4.5 Empirical Validation of Continuous Recycling
+
+To validate the necessity of continuous recycling, we conducted production-style HTTP benchmarking under a "never close" epoch policy. This configuration intentionally stresses the allocator by keeping epochs open indefinitely, preventing any `epoch_close()` invocations.
+
+**Experimental Setup:**
+
+* Workload: 1,200 HTTP requests (4 concurrent workers)
+* Request-scoped allocations (225 objects/request, ~52 KB/request)
+* Allocator configured with `TSLAB_EPOCH_POLICY=never`
+* No epoch advancement or closure
+
+**Comparison:**
+1. Deferred-only recycling (pre-Phase 2.2): Recycling exclusively via `epoch_close()`
+2. Continuous recycling (Phase 2.2): Lock-free empty queue + harvest
+
+**Results:**
+
+| Metric | Deferred-Only | Continuous | Improvement |
+|--------|--------------|------------|-------------|
+| Mean latency | 1,959 \u00b5s | 51 \u00b5s | **38\u00d7 faster** |
+| p99 latency | 524 \u00b5s | 65 \u00b5s | 8.1\u00d7 faster |
+| Max latency | 1,074 ms | 262 \u00b5s | **4,096\u00d7 reduction** |
+| Requests > 1ms | 4 (0.33%) | 0 (0%) | **Tail elimination** |
+
+**Analysis:**
+
+Without continuous recycling, the allocator exhibited slow-path lock convoy. Empty slabs accumulated on per-thread lists but were not reusable globally. All threads began allocating new slabs from the global pool under mutex, causing 100% slowpath hit rate and serialization across 4 workers.
+
+Continuous recycling eliminates this pathology by making empty slabs immediately reusable without requiring `epoch_close()`. The lock-free empty queue enables O(1) signaling on the free path, with harvesting amortized across slowpath allocation (under existing `sc->lock`).
+
+**Key finding**: Recycling is a **liveness requirement** for allocator health. Reclamation remains a **policy choice** for RSS control.
+
+See Figure 1 for visual comparison of latency distributions.
+
+---
+
+#### 3.4.6 Figure 1: Latency Distribution Comparison
+
+![Phase 2.2 Histogram Comparison](figure_phase22_histogram_comparison.png)
+
+**Figure 1:** Request latency histograms under "never close" epoch policy (1,200 HTTP requests, 4 worker threads). **Left:** Deferred-only recycling exhibits catastrophic tail degradation with 4 requests exceeding 1ms (max: 1.07 seconds). **Right:** Continuous recycling (Phase 2.2) eliminates multi-millisecond tails entirely (max: 262 µs). The 4,096× reduction in maximum latency demonstrates that continuous slab reuse is necessary to prevent slow-path lock convoy under long-lived epochs.
+
+---
 
 ### 3.5 Passive Reclamation: No Quiescence Required
 
@@ -1185,50 +1303,65 @@ Measured overhead: 180ns for complete cycle
 
 **Comparison:** This is 2-4× cheaper than C++ constructor/destructor overhead for similar RAII patterns, because domain enter/exit uses atomic operations only (no heap allocation on enter/exit).
 
-### 5.7 Workload Characterization: When temporal-slab Helps (and When It Doesn't)
+### 5.7 When Temporal-Slab Provides Minimal Benefit
 
-**Ideal workloads for temporal-slab:**
+temporal-slab is not a universal performance accelerator. Its advantages emerge under specific workload characteristics. In the following scenarios, benefits may be limited or absent:
 
-1. **High allocation rate with phase structure** (>10K allocs/sec with clear boundaries)
-   - Web servers: requests per second
-   - Game engines: frames per second
-   - Databases: queries per second
-   - Metric: Allocation rate >> epoch_close() frequency
+#### 1. Throughput-Dominated, Latency-Insensitive Workloads
 
-2. **Correlated lifetimes within phases** (objects allocated together die together)
-   - Request metadata, session tokens, response buffers (all freed at request end)
-   - Frame-local data: particles, collision results, render commands
-   - Metric: >70% of allocations in a phase die together
+Applications where median throughput is the primary objective and tail latency is not constrained (e.g., offline batch processing) may prefer allocators optimized for raw fast-path speed. Allocators such as mimalloc or tcmalloc may deliver lower p50 latency under steady-state churn.
 
-3. **Lifetime bimodality** (short-lived and long-lived, not uniform)
-   - Short: requests (10-100ms), queries (1-10ms), frames (16ms)
-   - Long: connections (seconds-hours), sessions (minutes-hours)
-   - Mixing these in same malloc heap causes fragmentation; epochs separate them
+temporal-slab intentionally trades small median overhead for bounded tail behavior and explicit lifecycle control.
 
-**Workloads where temporal-slab provides minimal benefit:**
+---
 
-1. **Long-lived uniform lifetimes** (all objects live for hours)
-   - Startup configuration, static lookup tables, connection pools
-   - Epoch grouping doesn't help if nothing ever gets reclaimed
-   - Recommendation: Use malloc or custom bump allocator
+#### 2. Workloads Without Phase Structure
 
-2. **Random uncorrelated lifetimes** (objects die independently)
-   - Caches with random eviction (no temporal correlation)
-   - Objects with user-controlled lifetimes (unpredictable)
-   - Metric: <30% lifetime correlation within phases
-   - Result: Epochs provide no temporal locality, overhead without benefit
+temporal-slab's reclamation advantages require meaningful phase boundaries (request, frame, transaction, epoch). If an application has:
 
-3. **Large objects (>768 bytes)** or variable sizes
-   - temporal-slab size classes: 64-768 bytes (fixed granularity)
-   - Larger objects fall back to malloc
-   - Variable-size workloads suffer internal fragmentation (96-byte object in 128-byte slot = 33% waste)
-   - Recommendation: Use jemalloc/tcmalloc for variable-size workloads
+* No natural lifecycle grouping,
+* Highly interleaved long-lived and short-lived allocations,
+* Or effectively infinite object lifetimes,
 
-4. **Low allocation rate (<1K allocs/sec)**
-   - Epoch domain overhead (180ns) is negligible for high-throughput systems
-   - But for low-rate systems, overhead can dominate
-   - Example: Allocating 10 objects over 10 seconds (1 obj/sec) → 180ns overhead on 100ns allocation = 1.8× cost
-   - Recommendation: Use malloc if allocation rate doesn't justify epoch infrastructure
+then epoch-based reclamation provides little structural benefit over high-quality general-purpose allocators.
+
+---
+
+#### 3. Extremely Small Allocation Batches
+
+When allocations per phase are extremely small (e.g., <10 objects), fixed epoch management overhead may dominate. In such cases, the relative cost of entering/exiting domains can exceed allocation cost.
+
+---
+
+#### 4. Misaligned Epoch Policy
+
+Although recycling is continuous (Section 3.4), reclamation cost is paid at `epoch_close()`. If an application calls `epoch_close()` at excessively fine granularity (e.g., per-object), reclamation cost can dominate request latency.
+
+Proper policy selection is essential:
+
+* High-frequency epochs → lower RSS, higher per-request overhead
+* Batched epochs → lower overhead, delayed reclamation
+
+This is a tuning trade-off, not an allocator instability.
+
+---
+
+#### 5. Applications Requiring Maximum Cross-Thread Cache Sharing
+
+Some allocators aggressively share and rebalance memory across threads using central caches. temporal-slab's per-epoch, per-class model prioritizes locality and deterministic behavior over aggressive global pooling. In extremely cross-thread-heavy workloads with no phase alignment, central-cache allocators may show stronger median throughput.
+
+---
+
+#### Summary
+
+temporal-slab provides maximal benefit when:
+
+* Tail latency predictability matters,
+* Memory lifecycle boundaries exist,
+* Reclamation timing must be schedulable,
+* Observability is operationally valuable.
+
+It provides limited advantage in purely throughput-oriented, phase-less workloads.
 
 **Complexity analysis:**
 
@@ -1971,6 +2104,21 @@ typedef struct {
 
 void slab_stats_size_class(SlabAllocator* a, uint32_t class_idx, SizeClassStats* out);
 ```
+
+---
+
+## Design Evolution Note (Phase 2.2)
+
+During production-style HTTP benchmarking, we observed that coupling slab reuse exclusively to `epoch_close()` could create slow-path lock pressure under long-lived epochs. While this did not affect correctness, it introduced throughput degradation when epochs were intentionally held open.
+
+To address this, Phase 2.2 decoupled:
+
+* **Recycling** (making empty slabs reusable) from
+* **Reclamation** (returning memory to the OS).
+
+Recycling is now continuous via a lock-free empty-slab signaling mechanism harvested during slow-path allocation. `epoch_close()` remains responsible solely for explicit reclamation and lifecycle control.
+
+This refinement preserves the core theoretical model while strengthening allocator liveness under extended epochs. All theoretical claims regarding tail-latency flattening and phase-aligned reclamation remain valid.
 
 ---
 
