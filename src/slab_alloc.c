@@ -1327,7 +1327,7 @@ static inline SlabHandle encode_handle(Slab* slab, SlabRegistry* reg, uint32_t s
  * If out is non-NULL, writes a portable handle encoding (slab_id, generation, slot, class).
  */
 void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle* out) {
-#ifdef ENABLE_SLOWPATH_SAMPLING
+#if ENABLE_SLOWPATH_SAMPLING
   /* Phase 2.5: Probabilistic end-to-end sampling (1/1024)
    * Wall vs CPU time split detects WSL2/virtualization interference */
   bool sample = ((++tls_sample_ctr & SAMPLE_RATE_MASK) == 0);
@@ -1650,7 +1650,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       /* Bitmap is stably full - move to FULL list.
        * DO NOT mutate free_count here: if there's divergence, the bug is in
        * allocation/free paths. Forcing free_count=0 under contention makes it worse. */
-#ifdef ENABLE_SLOWPATH_SAMPLING
+#if ENABLE_SLOWPATH_SAMPLING
       struct timespec repair_wall0, repair_cpu0, repair_wall1, repair_cpu1;
       clock_gettime(CLOCK_MONOTONIC, &repair_wall0);
       clock_gettime(CLOCK_THREAD_CPUTIME_ID, &repair_cpu0);
@@ -1670,7 +1670,7 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       list_push_back(&es->full, s);
       atomic_fetch_add_explicit(&sc->list_move_partial_to_full, 1, memory_order_relaxed);
       
-#ifdef ENABLE_SLOWPATH_SAMPLING
+#if ENABLE_SLOWPATH_SAMPLING
       clock_gettime(CLOCK_MONOTONIC, &repair_wall1);
       clock_gettime(CLOCK_THREAD_CPUTIME_ID, &repair_cpu1);
       

@@ -23,7 +23,7 @@ int main() {
     
     printf("All allocations succeeded\n\n");
     
-#ifdef ENABLE_SLOWPATH_SAMPLING
+#if ENABLE_SLOWPATH_SAMPLING
     ThreadStats stats = slab_stats_thread();
     printf("=== Slowpath Sampling Results ===\n");
     printf("Expected samples: ~%d (100K / 1024)\n", 100000 / 1024);
