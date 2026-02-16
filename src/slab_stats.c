@@ -3,7 +3,7 @@
 #include <string.h>
 
 /* Phase 2.5: TLS storage for slowpath sampling */
-#ifdef ENABLE_SLOWPATH_SAMPLING
+#if ENABLE_SLOWPATH_SAMPLING
 __thread ThreadStats tls_stats = {0};
 __thread uint64_t tls_sample_ctr = 0;
 #endif
@@ -253,7 +253,7 @@ void slab_stats_epoch(SlabAllocator* alloc, uint32_t size_class, EpochId epoch, 
 }
 
 /* Phase 2.5: Thread-local sampling statistics */
-#ifdef ENABLE_SLOWPATH_SAMPLING
+#if ENABLE_SLOWPATH_SAMPLING
 ThreadStats slab_stats_thread(void) {
   return tls_stats;
 }

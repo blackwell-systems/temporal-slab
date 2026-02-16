@@ -45,7 +45,7 @@
  * - wall ≈ cpu: Real allocator work (locks, CAS storms, repairs)
  * - High repair_count: Invariant violations (publication races, stale views)
  */
-#ifdef ENABLE_SLOWPATH_SAMPLING
+#if ENABLE_SLOWPATH_SAMPLING
 
 typedef struct {
   /* End-to-end allocation sampling */

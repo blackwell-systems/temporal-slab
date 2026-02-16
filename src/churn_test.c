@@ -242,7 +242,7 @@ int main(int argc, char** argv) {
     printf("\nCSV written to: %s\n", csv_path);
   }
   
-#ifdef ENABLE_SLOWPATH_SAMPLING
+#if ENABLE_SLOWPATH_SAMPLING
   /* Phase 2.5: Report probabilistic sampling statistics */
   ThreadStats stats = slab_stats_thread();
   if (stats.alloc_samples > 0) {
