@@ -20,7 +20,7 @@ TSAN_FLAGS = -O1 -g -std=c11 -pthread -Wall -Wextra -pedantic -I../include -DENA
 
 TLS_OBJ ?=
 
-all: smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump synthetic_bench
+all: smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper test_epochs domain_usage stats_dump synthetic_bench
 
 # ThreadSanitizer builds for data race detection
 tsan: tsan_test
@@ -55,8 +55,8 @@ epoch_domain.o: epoch_domain.c
 	$(CC) $(CFLAGS) -c epoch_domain.c -o epoch_domain.o
 
 # Smoke tests executable
-smoke_tests: smoke_tests.c slab_lib.o $(TLS_OBJ)
-	$(CC) $(CFLAGS) smoke_tests.c slab_lib.o $(TLS_OBJ) -o smoke_tests
+smoke_tests: smoke_tests.c slab_lib.o slab_stats.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) smoke_tests.c slab_lib.o slab_stats.o $(TLS_OBJ) -o smoke_tests
 
 # Accurate benchmark executable
 benchmark_accurate: benchmark_accurate.c slab_lib.o $(TLS_OBJ)
@@ -77,6 +77,16 @@ churn_test: churn_test.c slab_lib.o $(TLS_OBJ)
 # Malloc wrapper test executable
 test_malloc_wrapper: test_malloc_wrapper.c slab_lib.o $(TLS_OBJ)
 	$(CC) $(CFLAGS) test_malloc_wrapper.c slab_lib.o $(TLS_OBJ) -o test_malloc_wrapper
+
+# Epoch functionality tests
+test_epochs: test_epochs.c slab_lib.o slab_stats.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) test_epochs.c slab_lib.o slab_stats.o $(TLS_OBJ) -o test_epochs
+
+test_epoch_close: test_epoch_close.c slab_lib.o slab_stats.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) test_epoch_close.c slab_lib.o slab_stats.o $(TLS_OBJ) -o test_epoch_close
+
+test_epoch_metadata: test_epoch_metadata.c slab_lib.o slab_stats.o $(TLS_OBJ)
+	$(CC) $(CFLAGS) test_epoch_metadata.c slab_lib.o slab_stats.o $(TLS_OBJ) -o test_epoch_metadata
 
 # Domain usage examples
 domain_usage: ../examples/domain_usage.c slab_lib.o epoch_domain.o $(TLS_OBJ)
@@ -102,6 +112,6 @@ synthetic_bench: ../workloads/synthetic_bench.c slab_lib.o slab_stats.o $(TLS_OB
 	$(CC) $(CFLAGS) ../workloads/synthetic_bench.c slab_lib.o slab_stats.o $(TLS_OBJ) -o ../workloads/synthetic_bench
 
 clean:
-	rm -f smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper domain_usage stats_dump slab_lib.c slab_lib.o epoch_domain.o slab_stats.o benchmark_threads_tsan slab_lib_tsan.o tsan_test ../workloads/synthetic_bench
+	rm -f smoke_tests benchmark_accurate benchmark_threads soak_test churn_test test_malloc_wrapper test_epochs test_epoch_close test_epoch_metadata domain_usage stats_dump slab_lib.c slab_lib.o epoch_domain.o slab_stats.o benchmark_threads_tsan slab_lib_tsan.o slab_stats_tsan.o tsan_test ../workloads/synthetic_bench
 
 .PHONY: all clean
