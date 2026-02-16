@@ -28,45 +28,51 @@ int main(void) {
   memset(p2, 0xBB, 128);
   
   printf("  PASS: Allocated in two different epochs\n");
-  
+
   printf("\nTest 2: Epoch lifetime separation...\n");
-  
+
   #define OBJECTS_PER_EPOCH 1000
   SlabHandle handles_e0[OBJECTS_PER_EPOCH];
   SlabHandle handles_e1[OBJECTS_PER_EPOCH];
-  
-  /* Allocate batch in epoch 0 */
+
+  /* Allocate batch in current epoch (e1 from previous test) */
+  EpochId current_epoch = epoch_current(a);
+  printf("  Current epoch: %u\n", current_epoch);
+
   for (int i = 0; i < OBJECTS_PER_EPOCH; i++) {
-    void* p = alloc_obj_epoch(a, 128, 0, &handles_e0[i]);
-    assert(p && "epoch 0 batch allocation failed");
+    void* p = alloc_obj_epoch(a, 128, current_epoch, &handles_e0[i]);
+    assert(p && "epoch batch allocation failed");
     *(int*)p = i;
   }
-  
-  /* Advance and allocate batch in epoch 1 */
+
+  /* Advance to next epoch and allocate another batch */
   epoch_advance(a);
+  EpochId next_epoch = epoch_current(a);
+  printf("  Advanced to epoch: %u\n", next_epoch);
+
   for (int i = 0; i < OBJECTS_PER_EPOCH; i++) {
-    void* p = alloc_obj_epoch(a, 128, 1, &handles_e1[i]);
-    assert(p && "epoch 1 batch allocation failed");
+    void* p = alloc_obj_epoch(a, 128, next_epoch, &handles_e1[i]);
+    assert(p && "next epoch batch allocation failed");
     *(int*)p = i + 10000;
   }
   
   uint64_t rss_before_free = read_rss_bytes_linux();
   printf("  RSS with both epochs: %.2f MiB\n", rss_before_free / (1024.0 * 1024.0));
-  
-  /* Free entire epoch 0 (simulates epoch expiration) */
+
+  /* Free entire first batch (simulates epoch expiration) */
   for (int i = 0; i < OBJECTS_PER_EPOCH; i++) {
     bool ok = free_obj(a, handles_e0[i]);
-    assert(ok && "free_obj for epoch 0 failed");
+    assert(ok && "free_obj for first batch failed");
   }
-  
+
   uint64_t rss_after_free = read_rss_bytes_linux();
-  printf("  RSS after freeing epoch 0: %.2f MiB\n", rss_after_free / (1024.0 * 1024.0));
+  printf("  RSS after freeing first batch: %.2f MiB\n", rss_after_free / (1024.0 * 1024.0));
   printf("  RSS delta: %.2f MiB\n", (rss_after_free - rss_before_free) / (1024.0 * 1024.0));
-  
-  /* Epoch 1 objects should still be valid */
+
+  /* Second batch objects should still be valid */
   for (int i = 0; i < OBJECTS_PER_EPOCH; i++) {
     bool ok = free_obj(a, handles_e1[i]);
-    assert(ok && "free_obj for epoch 1 failed");
+    assert(ok && "free_obj for second batch failed");
   }
   
   printf("  PASS: Epochs isolated correctly\n");
@@ -75,20 +81,26 @@ int main(void) {
   for (uint32_t i = 0; i < 20; i++) {
     EpochId e = epoch_current(a);
     printf("  Epoch %u (should wrap at 16)\n", e);
-    
+
     SlabHandle h;
-    void* p = alloc_obj_epoch(a, 64, e % 16, &h);
-    assert(p && "allocation in wrapped epoch failed");
+    void* p = alloc_obj_epoch(a, 64, e, &h);
+    assert(p && "allocation in current epoch failed");
     free_obj(a, h);
-    
+
     epoch_advance(a);
   }
   printf("  PASS: Epoch wrapping works correctly\n");
   
   printf("\nTest 4: Mixed epoch malloc API...\n");
-  void* m0 = slab_malloc_epoch(a, 100, 0);
-  void* m1 = slab_malloc_epoch(a, 100, 1);
-  assert(m0 && m1 && "malloc_epoch failed");
+  EpochId e_test4 = epoch_current(a);
+  void* m0 = slab_malloc_epoch(a, 100, e_test4);
+  assert(m0 && "malloc_epoch for first allocation failed");
+
+  epoch_advance(a);
+  EpochId e_test4_next = epoch_current(a);
+  void* m1 = slab_malloc_epoch(a, 100, e_test4_next);
+  assert(m1 && "malloc_epoch for second allocation failed");
+
   slab_free(a, m0);
   slab_free(a, m1);
   printf("  PASS: malloc_epoch works\n");
