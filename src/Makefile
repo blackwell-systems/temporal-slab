@@ -1,7 +1,18 @@
 CC = gcc
-CFLAGS = -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include -I../../drainability-profiler/include -DENABLE_RSS_RECLAMATION=1
-LDFLAGS = -L../../drainability-profiler -ldrainprof
-TSAN_FLAGS = -O1 -g -std=c11 -pthread -Wall -Wextra -pedantic -I../include -I../../drainability-profiler/include -DENABLE_RSS_RECLAMATION=1 -fsanitize=thread
+CFLAGS = -O3 -std=c11 -pthread -Wall -Wextra -pedantic -I../include -DENABLE_RSS_RECLAMATION=1
+LDFLAGS =
+TSAN_FLAGS = -O1 -g -std=c11 -pthread -Wall -Wextra -pedantic -I../include -DENABLE_RSS_RECLAMATION=1 -fsanitize=thread
+
+# Optional drainability profiler integration (disabled by default)
+# To enable: make ENABLE_DRAINPROF=1 DRAINPROF_PATH=/path/to/drainability-profiler
+ifdef ENABLE_DRAINPROF
+  ifndef DRAINPROF_PATH
+    DRAINPROF_PATH = ../../drainability-profiler
+  endif
+  CFLAGS += -DENABLE_DRAINPROF -I$(DRAINPROF_PATH)/include
+  LDFLAGS += -L$(DRAINPROF_PATH) -ldrainprof
+  TSAN_FLAGS += -DENABLE_DRAINPROF -I$(DRAINPROF_PATH)/include
+endif
 
 # Optional features (add to CFLAGS as needed):
 #
