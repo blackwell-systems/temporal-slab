@@ -26,6 +26,12 @@
 #include <time.h>
 #include <unistd.h>
 #include <assert.h>
+#include <drainprof.h>
+
+/* ------------------------------ Drainability Profiler ------------------------------ */
+
+/* Global profiler instance (NULL = profiling disabled, non-NULL = profiling enabled) */
+drainprof* g_profiler = NULL;
 
 /* ------------------------------ Config ------------------------------ */
 
@@ -1488,7 +1494,12 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
       /* Track live bytes (bytes allocated to live objects) for leak detection */
       atomic_fetch_add_explicit(&sc->live_bytes, sc->object_size, memory_order_relaxed);
 #endif
-      
+
+      /* Drainability profiler: Track allocation in epoch */
+      if (g_profiler) {
+        DRAINPROF_ALLOC_REGISTER(g_profiler, epoch, (uintptr_t)p, size);
+      }
+
       RECORD_SAMPLE();
       return p;  /* Fast path success! */
     }
@@ -1801,12 +1812,17 @@ void* alloc_obj_epoch(SlabAllocator* a, uint32_t size, EpochId epoch, SlabHandle
     if (out) {
       *out = encode_handle(s, &a->reg, idx, (uint32_t)ci);
     }
-    
+
 #if ENABLE_DIAGNOSTIC_COUNTERS
     /* Track live bytes for slow path allocation success */
     atomic_fetch_add_explicit(&sc->live_bytes, sc->object_size, memory_order_relaxed);
 #endif
-    
+
+    /* Drainability profiler: Track allocation in epoch */
+    if (g_profiler) {
+      DRAINPROF_ALLOC_REGISTER(g_profiler, epoch, (uintptr_t)p, size);
+    }
+
     RECORD_SAMPLE();
     return p;
   }
@@ -1882,12 +1898,18 @@ bool free_obj(SlabAllocator* a, SlabHandle h) {
   if (retries > 0) {
     atomic_fetch_add_explicit(&sc->bitmap_free_cas_retries, retries, memory_order_relaxed);
   }
-  
+
 #if ENABLE_DIAGNOSTIC_COUNTERS
   /* Track live bytes decrement (only reached after successful free at line 1444) */
   atomic_fetch_sub_explicit(&sc->live_bytes, sc->object_size, memory_order_relaxed);
 #endif
-  
+
+  /* Drainability profiler: Track deallocation from epoch */
+  if (g_profiler) {
+    void* ptr = slab_slot_ptr(s, slot);
+    drainprof_alloc_deregister(g_profiler, epoch, (uintptr_t)ptr);
+  }
+
   uint32_t new_fc = prev_fc + 1;  /* New free_count after our free */
 
   /* Check if slab just became fully empty (all slots free).
@@ -2151,7 +2173,12 @@ void epoch_advance(SlabAllocator* a) {
    * Mark ACTIVE to accept allocations. On wraparound, this overwrites CLOSING
    * state from 16 rotations ago (epoch 0 after 15→0 wrap). */
   atomic_store_explicit(&a->epoch_state[new_epoch], EPOCH_ACTIVE, memory_order_relaxed);
-  
+
+  /* Drainability profiler: Track new epoch opening */
+  if (g_profiler) {
+    drainprof_granule_open(g_profiler, new_epoch);
+  }
+
   /* Stamp monotonic era for observability.
    * Helps distinguish "epoch 5 at era 100" from "epoch 5 at era 116" after wraparound.
    * Useful for correlating allocator events with application logs. */
@@ -2209,7 +2236,12 @@ void epoch_advance(SlabAllocator* a) {
  */
 void epoch_close(SlabAllocator* a, EpochId epoch) {
   if (!a || epoch >= a->epoch_count) return;
-  
+
+  /* Drainability profiler: Track epoch closing (measures drainability) */
+  if (g_profiler) {
+    drainprof_granule_close(g_profiler, epoch);
+  }
+
   /* Capture start time for latency telemetry.
    * Helps answer "how long does epoch_close take?" for capacity planning. */
   struct timespec start_ts;
