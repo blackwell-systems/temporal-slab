@@ -4,7 +4,21 @@ LDFLAGS =
 TSAN_FLAGS = -O1 -g -std=c11 -pthread -Wall -Wextra -pedantic -I../include -DENABLE_RSS_RECLAMATION=1 -fsanitize=thread
 
 # Optional drainability profiler integration (disabled by default)
+# Instruments the allocator to measure Drainability Satisfaction Rate (DSR):
+# the fraction of epochs that are fully drained (no live allocations) when closed.
+# Helps detect structural memory leaks where individual objects are freed but
+# long-lived allocations pin entire epochs, preventing reclamation.
+#
 # To enable: make ENABLE_DRAINPROF=1 DRAINPROF_PATH=/path/to/drainability-profiler
+#
+# Modes:
+#   - PRODUCTION: < 2ns overhead per allocation, tracks DSR and peak epoch usage
+#   - DIAGNOSTIC: ~25ns overhead, identifies allocation sites causing pinning
+#
+# Zero overhead when disabled (compiled out via preprocessor).
+#
+# See: https://github.com/blackwell-systems/drainability-profiler
+# Integration validated via CI: drainability-profiler/.github/workflows/tslab-integration.yml
 ifdef ENABLE_DRAINPROF
   ifndef DRAINPROF_PATH
     DRAINPROF_PATH = ../../drainability-profiler

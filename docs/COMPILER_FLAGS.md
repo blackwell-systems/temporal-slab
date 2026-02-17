@@ -10,6 +10,7 @@ This document lists all compile-time configuration flags for the ZNS-Slab alloca
   - [ENABLE_RSS_RECLAMATION](#enable_rss_reclamation)
   - [ENABLE_DIAGNOSTIC_COUNTERS](#enable_diagnostic_counters)
   - [ENABLE_LOCK_RANK_DEBUG](#enable_lock_rank_debug)
+  - [ENABLE_DRAINPROF](#enable_drainprof)
 - [Tuning Parameters](#tuning-parameters)
   - [SLAB_PAGE_SIZE](#slab_page_size)
 - [Build Examples](#build-examples)
@@ -218,6 +219,105 @@ make CFLAGS="-DENABLE_LOCK_RANK_DEBUG=1 -I../include"
 
 ---
 
+### ENABLE_DRAINPROF
+
+**Purpose**: Integrates the drainability profiler to measure Drainability Satisfaction Rate (DSR) - the fraction of epochs that are fully drained (no live allocations) when closed.
+
+**Default**: `0` (disabled)
+
+**Overhead**:
+- **Production mode**: < 2ns per allocation (atomic increment/decrement)
+- **Diagnostic mode**: ~25ns per allocation (per-allocation tracking with source locations)
+- Memory: ~32 bytes per open epoch (production), proportional to pinned allocations (diagnostic)
+
+**When to use**:
+- **Production mode**: Always-on monitoring to detect structural memory leaks
+  - Measure DSR over time to catch regression
+  - Low enough overhead for production use
+- **Diagnostic mode**: Time-bounded investigation when DSR drops
+  - Identifies exact allocation sites (file:line) pinning epochs
+  - Provides actionable information for fixing structural leaks
+
+**When NOT to use**:
+- Benchmarks comparing raw allocation performance
+- Workloads where < 2ns overhead matters (extremely latency-sensitive)
+
+**What it detects**:
+- **Structural memory leaks**: Individual objects freed, but epochs can't be reclaimed because one long-lived allocation pins the entire epoch
+- Traditional leak detectors (Valgrind, ASan) miss these because objects ARE freed
+- Example: 999/1000 objects freed, but 1 remaining prevents epoch reclamation
+
+**Behavior**:
+- Instruments four lifecycle points:
+  1. `epoch_advance()` → `drainprof_granule_open()`
+  2. `alloc_obj_epoch()` → `drainprof_alloc_register()`
+  3. `free_obj()` → `drainprof_alloc_deregister()`
+  4. `epoch_close()` → `drainprof_granule_close()`
+- Lock-free atomic operations on hot path (production mode)
+- Zero overhead when disabled (compiled out via preprocessor)
+
+**Metrics provided**:
+- **DSR (Drainability Satisfaction Rate)**: drainable_closes / total_closes
+  - 1.0 (100%): Perfect drainability
+  - 0.5 (50%): Half of epochs pinned
+  - 0.0 (0%): Every epoch has live allocations
+- Peak open epochs, allocation/deallocation counts
+- Diagnostic mode: Per-site pinning reports with source locations
+
+**Build example**:
+```bash
+# Requires drainability-profiler library
+# Clone from: https://github.com/blackwell-systems/drainability-profiler
+
+cd drainability-profiler && make
+cd ../temporal-slab/src
+
+# Production mode (always-on monitoring)
+make ENABLE_DRAINPROF=1 DRAINPROF_PATH=../../drainability-profiler
+
+# Diagnostic mode (set in application code):
+# drainprof_config config = { .mode = DRAINPROF_DIAGNOSTIC, ... };
+# g_profiler = drainprof_create_with_config(&config);
+```
+
+**Example usage**:
+```c
+#ifdef ENABLE_DRAINPROF
+#include <drainprof.h>
+
+// Global profiler instance
+drainprof* g_profiler = NULL;
+
+void init_profiler(void) {
+    g_profiler = drainprof_create();  // Production mode
+}
+
+void check_drainability(void) {
+    drainprof_snapshot_t snap;
+    drainprof_snapshot(g_profiler, &snap);
+
+    printf("DSR: %.2f%% (%lu drainable / %lu total)\n",
+           snap.dsr * 100.0, snap.drainable_closes, snap.total_closes);
+
+    if (snap.dsr < 0.90) {
+        fprintf(stderr, "WARNING: Low DSR - investigate structural leaks\n");
+    }
+}
+#endif
+```
+
+**Integration validation**:
+- Validated via CI in drainability-profiler repository
+- P-sweep test: Confirms DSR = 1.0 - p for controlled violation rates
+- Diagnostic test: Verifies allocation site identification
+
+**Related projects**:
+- **drainability-profiler**: https://github.com/blackwell-systems/drainability-profiler
+- **Integration tests**: `drainability-profiler/examples/temporal-slab/`
+- **Research paper**: [doi.org/10.5281/zenodo.18653776](https://doi.org/10.5281/zenodo.18653776)
+
+---
+
 ## Tuning Parameters
 
 ### SLAB_PAGE_SIZE
@@ -274,6 +374,14 @@ make CFLAGS="-DENABLE_SLOWPATH_SAMPLING \
              -O3 -g -I../include"
 ```
 
+### Drainability Monitoring Build (Production)
+```bash
+# Requires drainability-profiler library built first
+make ENABLE_DRAINPROF=1 \
+     DRAINPROF_PATH=../../drainability-profiler \
+     CFLAGS="-O3 -I../include"
+```
+
 ---
 
 ## Quick Reference Table
@@ -285,6 +393,7 @@ make CFLAGS="-DENABLE_SLOWPATH_SAMPLING \
 | `ENABLE_RSS_RECLAMATION` | 0 | ~1-5µs/epoch | Memory-constrained systems |
 | `ENABLE_DIAGNOSTIC_COUNTERS` | 0 | ~1-2% | RSS debugging |
 | `ENABLE_LOCK_RANK_DEBUG` | 0 | ~5-10% | Deadlock detection (dev) |
+| `ENABLE_DRAINPROF` | 0 | <2ns prod, ~25ns diag | Structural leak detection |
 | `SLAB_PAGE_SIZE` | 4096 | Varies | Platform-specific tuning |
 
 ---
@@ -298,6 +407,7 @@ make CFLAGS="-DENABLE_SLOWPATH_SAMPLING \
 | RSS Reclamation | All features | - | May conflict with perf testing |
 | Diagnostic Counters | All features | - | Development only |
 | Lock Rank Debug | All features | - | Development only |
+| Drainprof | All features | - | Production mode safe; diagnostic for investigation |
 
 ---
 
@@ -306,10 +416,12 @@ make CFLAGS="-DENABLE_SLOWPATH_SAMPLING \
 - **TLS Cache**: `docs/TLS_CACHE_DESIGN.md`
 - **Slowpath Sampling**: `workloads/README_SLOWPATH_SAMPLING.md`
 - **RSS Tracking**: `docs/RSS_INSTRUMENTATION_SUMMARY.md`
+- **Drainability Profiler**: https://github.com/blackwell-systems/drainability-profiler
+- **Drainprof Integration**: https://github.com/blackwell-systems/drainability-profiler/tree/main/examples/temporal-slab
 - **Build System**: `README.md` (root)
 - **Testing**: `workloads/README.md`
 
 ---
 
-**Last updated**: 2025-02-10  
-**Allocator version**: ZNS-Slab v0.3 (epoch-based, TLS-cache, adaptive-bypass)
+**Last updated**: 2026-02-16
+**Allocator version**: ZNS-Slab v0.3 (epoch-based, TLS-cache, adaptive-bypass, drainprof-instrumented)
