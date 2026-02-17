@@ -1,0 +1,110 @@
+name: Drainability Validation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  psweep-validation:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout temporal-slab
+      uses: actions/checkout@v3
+      with:
+        path: temporal-slab
+
+    - name: Checkout drainability-profiler
+      uses: actions/checkout@v3
+      with:
+        repository: blackwell-systems/drainability-profiler
+        path: drainability-profiler
+
+    - name: Build libdrainprof
+      run: |
+        cd drainability-profiler
+        make clean
+        make
+        ls -lh libdrainprof.a libdrainprof.so
+
+    - name: Build temporal-slab with instrumentation
+      run: |
+        cd temporal-slab/src
+        make clean
+        make slab_lib.o epoch_domain.o slab_stats.o
+
+    - name: Build p-sweep validation test
+      run: |
+        cd temporal-slab
+        gcc -O2 -std=c11 -pthread -Wall -Wextra -pedantic \
+          -Iinclude -I../drainability-profiler/include \
+          -DENABLE_RSS_RECLAMATION=1 \
+          tests/tslab_psweep_validation.c \
+          src/slab_lib.o src/epoch_domain.o src/slab_stats.o \
+          -L../drainability-profiler -ldrainprof \
+          -o tests/tslab_psweep_validation
+
+    - name: Build diagnostic validation test
+      run: |
+        cd temporal-slab
+        gcc -O2 -std=c11 -pthread -Wall -Wextra -pedantic \
+          -Iinclude -I../drainability-profiler/include \
+          -DENABLE_RSS_RECLAMATION=1 \
+          tests/tslab_diagnostic_validation.c \
+          src/slab_lib.o src/epoch_domain.o src/slab_stats.o \
+          -L../drainability-profiler -ldrainprof \
+          -o tests/tslab_diagnostic_validation
+
+    - name: Run p-sweep validation (Phase 1.2)
+      run: |
+        cd temporal-slab
+        echo "=== Phase 1.2: P-Sweep Validation ==="
+        ./tests/tslab_psweep_validation | tee psweep_results.txt
+
+    - name: Run diagnostic validation (Phase 1.3)
+      run: |
+        cd temporal-slab
+        echo "=== Phase 1.3: Diagnostic Mode Validation ==="
+        ./tests/tslab_diagnostic_validation | tee diagnostic_results.txt
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: drainability-validation-results
+        path: |
+          temporal-slab/psweep_results.txt
+          temporal-slab/diagnostic_results.txt
+
+    - name: Check validation status
+      run: |
+        cd temporal-slab
+        PSWEEP_OK=0
+        DIAG_OK=0
+
+        if grep -q "VALIDATION SUCCESS" psweep_results.txt; then
+          echo "✓ P-sweep validation passed"
+          PSWEEP_OK=1
+        else
+          echo "✗ P-sweep validation failed"
+        fi
+
+        if grep -q "VALIDATION SUCCESS" diagnostic_results.txt; then
+          echo "✓ Diagnostic validation passed"
+          DIAG_OK=1
+        else
+          echo "✗ Diagnostic validation failed"
+        fi
+
+        if [ $PSWEEP_OK -eq 1 ] && [ $DIAG_OK -eq 1 ]; then
+          echo ""
+          echo "=== ALL VALIDATIONS PASSED ==="
+          exit 0
+        else
+          echo ""
+          echo "=== VALIDATION FAILURES DETECTED ==="
+          exit 1
+        fi
