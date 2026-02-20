@@ -1,5 +1,7 @@
 # temporal-slab
 
+**Part of the [Drainability Project](https://github.com/blackwell-systems/drainability)** – Theory, measurement tools, and validation for structural memory leaks
+
 **Research implementation validating the drainability framework for coarse-grained memory reclamation.**
 
 temporal-slab is a lifetime-aware slab allocator that demonstrates epoch-based allocation routing can achieve bounded RSS under sustained churn by enforcing structural drainability. It provides deterministic memory reclamation at application-defined phase boundaries.
