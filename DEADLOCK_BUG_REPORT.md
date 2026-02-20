@@ -216,5 +216,5 @@ Both wrap `pthread_mutex_lock()`.
 
 ## Contact
 
-Reproduced by Claude Code during CI debugging session (2026-02-09).
+Reproduced during CI debugging session (2026-02-09).
 Original issue: GitHub Actions contention test hanging for 6+ hours.
